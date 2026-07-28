@@ -112,7 +112,14 @@ class Throttled:
                 return r
             if r.status_code in (429, 503):
                 # Being rate limited. Back off hard rather than hammering.
-                back = float(r.headers.get("Retry-After", 2 * (attempt + 1)))
+                # MusicBrainz sends `Retry-After: 0` on a 503, so trusting the
+                # header alone means retrying with no backoff at all — exactly
+                # the behaviour that gets a client blocked. Floor it.
+                try:
+                    hinted = float(r.headers.get("Retry-After", 0))
+                except ValueError:
+                    hinted = 0.0
+                back = max(hinted, 2.0 * (attempt + 1))
                 print(f"    throttled ({r.status_code}), sleeping {back:.0f}s", flush=True)
                 time.sleep(back)
                 continue
