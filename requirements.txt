@@ -1,0 +1,6 @@
+duckdb>=1.5
+requests>=2.32
+plotly>=6.0
+streamlit>=1.40
+pandas>=2.2
+python-dotenv>=1.0

@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# Personal data — NEVER commit. The Spotify export is private listening history.
+# ---------------------------------------------------------------------------
+Spotify Extended Streaming History/
+my_spotify_data.zip
+*.zip
+data/
+output/
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.json
+.cache/
+.env
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# OS / editor
+# ---------------------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+
+# ---------------------------------------------------------------------------
+# Explicit allowlist — tracked config that would otherwise be caught by *.json
+# ---------------------------------------------------------------------------
+!.streamlit/config.toml
