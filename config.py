@@ -41,6 +41,34 @@ TAG_TRENDS_PARQUET = DATA_DIR / "tag_trends.parquet"
 # A "real listen" per the project spec. Anything shorter is a skip or a scrub.
 MIN_MS_PLAYED = 30_000
 
+# --- Analysis parameters ----------------------------------------------------
+# What a featured credit is worth relative to the album artist's 1.0. Stage 3
+# computes BOTH variants and stores them side by side, so the dashboard can
+# toggle without re-running anything. 0.0 reproduces the spec's original
+# album-artist-only behaviour exactly.
+CREDIT_VARIANTS = {"album_artist_only": 0.0, "with_features": 0.5}
+DEFAULT_VARIANT = "with_features"
+
+# Cap on genres per artist. Ye carries 58 tags; splitting his time evenly
+# across all of them would give each 1/58 while a two-tag artist gives each a
+# half, systematically burying well-tagged artists. Tags are weighted by
+# MusicBrainz vote count and capped here.
+TOP_N_TAGS_PER_ARTIST = 8
+
+ROLLING_WINDOW_MONTHS = 3      # smoothing applied before anything is plotted
+SLOPE_WINDOW_MONTHS = 12       # trailing window for the trend slope
+
+# A tag is "flat" unless its trailing-year slope moves its own share by more
+# than this fraction. Relative rather than absolute, so a 2% tag and a 30% tag
+# are judged on the same footing.
+TREND_REL_THRESHOLD = 0.15
+
+# Floor on a tag's trailing-year share before it is classified at all. Relative
+# change is meaningless against a near-zero denominator: a genre drifting from
+# 0.05% to 0.3% scores "+540% a year" off a 0.3pp move and swamps the ranking.
+# Anything below this is classed 'negligible' rather than rising or declining.
+MIN_SHARE_FOR_TREND = 0.005  # 0.5% of a month's listening
+
 # Fields that must never reach a derived artifact.
 DROPPED_FIELDS = ("ip_addr",)
 
