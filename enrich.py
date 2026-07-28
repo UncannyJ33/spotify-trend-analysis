@@ -209,14 +209,33 @@ def resolve_via_musicbrainz(http: Throttled, name: str) -> dict:
                 "matched_name": None, "n_candidates": 0}
 
     target = normalise(name)
-    exact = None
-    for c in candidates:
-        names = [c.get("name", "")] + [
-            a.get("name", "") for a in c.get("aliases", []) or []
-        ]
-        if any(normalise(n) == target for n in names):
-            exact = c
-            break
+
+    def match_rank(c: dict) -> tuple | None:
+        """Rank an exact match, or None if it does not match at all.
+
+        Taking the FIRST exact match is wrong: MusicBrainz sorts by its own
+        score, and an obscure artist carrying the name as an *alias* can outrank
+        the artist whose actual name it is. Searching "Wale" puts percussionist
+        "Reg Wale" first at score 100 (alias match) ahead of the US rapper Wale
+        at 82 — and the rapper is the one with tags. Preferring a primary-name
+        match over an alias match settles it; tags and score break ties.
+        """
+        primary = normalise(c.get("name", "")) == target
+        alias = any(
+            normalise(a.get("name", "")) == target
+            for a in (c.get("aliases") or [])
+        )
+        if not (primary or alias):
+            return None
+        n_tags = len(c.get("tags") or [])
+        return (primary, n_tags > 0, c.get("score") or 0, n_tags)
+
+    ranked = sorted(
+        ((match_rank(c), c) for c in candidates),
+        key=lambda pair: pair[0] or (),
+        reverse=True,
+    )
+    exact = next((c for rank, c in ranked if rank is not None), None)
 
     if exact is None:
         top = candidates[0]
