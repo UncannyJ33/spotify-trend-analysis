@@ -76,17 +76,22 @@ def build_color_map(ranked_tags: list[str], mode: str = "light",
 
 
 def _base_layout(fig: go.Figure, mode: str, title: str, *,
-                 height: int = 460, ylabel: str = "", xlabel: str = "") -> go.Figure:
+                 height: int = 460, ylabel: str = "", xlabel: str = "",
+                 legend: bool = False) -> go.Figure:
     t = THEME[mode]
+    # A horizontal legend sits above the plot, so the top margin has to hold the
+    # title AND the legend row or the two collide.
+    top = 84 if legend else 52
     fig.update_layout(
-        title=dict(text=title, font=dict(size=15, color=t["text"], family=FONT), x=0),
+        title=dict(text=title, font=dict(size=15, color=t["text"], family=FONT),
+                   x=0, y=1, yanchor="top", pad=dict(t=14)),
         height=height,
         paper_bgcolor=t["surface"],
         plot_bgcolor=t["surface"],
         font=dict(family=FONT, color=t["text_secondary"], size=12),
-        margin=dict(l=56, r=24, t=52, b=44),
+        margin=dict(l=56, r=24, t=top, b=44),
         hoverlabel=dict(font_family=FONT, font_size=12),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01,
                     xanchor="left", x=0, font=dict(size=11)),
     )
     axis = dict(showgrid=True, gridcolor=t["grid"], gridwidth=1,
@@ -150,8 +155,9 @@ def stacked_area_top_tags(df: pd.DataFrame, ranked_tags: list[str], *,
 
     label = "3-month rolling mean" if smoothed else "raw monthly"
     fig = _base_layout(fig, mode, f"Share of listening time by genre — {label}",
-                       height=480, ylabel="share of listening (%)")
+                       height=500, ylabel="share of listening (%)", legend=True)
     fig.update_layout(hovermode="x unified")
+    fig.update_yaxes(ticksuffix="%", rangemode="tozero")
     return fig
 
 
@@ -236,6 +242,13 @@ def rising_declining(df: pd.DataFrame, *, mode: str = "light",
                        xlabel="change in share (percentage points per year)")
     fig.update_yaxes(showgrid=False)
     fig.add_vline(x=0, line_width=1, line_color=t["axis"])
+
+    # `textposition="outside"` writes past the end of the bar, and Plotly does
+    # not grow the axis to fit it: the longest label was being clipped at the
+    # right edge and the leftmost one collided with the category labels. Pad the
+    # range symmetrically so both ends have room for the text.
+    lim = float(d["pp"].abs().max())
+    fig.update_xaxes(range=[-lim * 1.45, lim * 1.45])
     return fig
 
 

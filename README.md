@@ -39,9 +39,12 @@ Place the export at `./Spotify Extended Streaming History/`, or point
 | Stage | Command | Output |
 |-------|---------|--------|
 | 1. Ingest | `.venv/bin/python ingest.py` | `data/plays_raw.parquet`, `data/plays.parquet` |
+| 1b. Credits | `.venv/bin/python credits.py` | `data/track_credits.parquet` |
 | 2. Enrich | `.venv/bin/python enrich.py` | `data/artist_tags.parquet`, `.cache/` |
 | 3. Analyse | `.venv/bin/python analyze.py` | `data/tag_trends.parquet` |
 | 4. Dashboard | `.venv/bin/streamlit run app.py` | interactive |
+
+Run them in that order. Only Stage 2 touches the network.
 
 ### Stage 1 — Ingest and normalize
 
@@ -66,6 +69,72 @@ break arbitrarily and idempotency silently stops holding.
 the play *end* time, an identical `(ts, ms_played, track)` triple cannot be two
 distinct listens, so full-row duplicates are collapsed. Rows sharing that
 identity but differing in other metadata are kept, and the count is reported.
+
+### Stage 1b — Track credits
+
+The export's only artist field is the **album** artist, so featured performers
+are credited nowhere. That hides about **28% of listening time**: 681 performers
+appear solely inside track titles and 407 never appear as an album artist at all.
+`credits.py` parses `(feat. X)` / `(with X)` out of the title and records one row
+per performer with a `credit_type`.
+
+No weights are stored. Stage 3 decides what a feature is worth at query time, so
+album-artist-only is simply the weight-0 case and remains available.
+
+It only catches features named in the *title* — features living solely in
+Spotify's track metadata stay invisible. This is a floor, not a fix. Run
+`credits.py --review` to eyeball what the regex extracted.
+
+### Stage 2 — Genre enrichment
+
+One MusicBrainz search per artist yields both the MBID and a tag vector. Tags are
+filtered against MusicBrainz's canonical genre vocabulary (~2,180 terms, fetched
+once) because raw search tags carry noise like `usa`, `english`, `2010s` and
+`gen z` alongside real genres.
+
+Two deviations from the original plan, both forced by the APIs:
+
+- ListenBrainz's `bulk-tag-lookup` is keyed on **recording** MBIDs, not artist
+  MBIDs, so it cannot consume an artist resolution. Using it would mean resolving
+  every track to a recording MBID first — the per-track explosion this design set
+  out to avoid.
+- The search must query `artist:"X" OR alias:"X"`. Searching the name alone
+  silently loses every renamed artist: "Kanye West" returns a tribute band,
+  because the entry is now "Ye" with the old name demoted to an alias.
+
+Resolution is strict — an exact normalised match against name or alias, never a
+guess — and everything else lands on a review list. Names are folded on accents,
+case and stylisation so `A$AP Rocky` and `ASAP Rocky` collapse together.
+
+**Resumable by design.** Each resolution is appended to `.cache/*.jsonl` and
+fsynced, so an interrupted run resumes exactly where it stopped and a quarterly
+re-run only spends requests on artists it has never seen. MusicBrainz is
+throttled to roughly 1 req/sec with a descriptive User-Agent; a 503 is answered
+with a real backoff, since MusicBrainz sends `Retry-After: 0` and trusting it
+means no backoff at all.
+
+### Stage 3 — Analysis
+
+Share of listening time per tag per month, weighted by `ms_played`, under two
+normalised weightings: a play's time splits across its performers, then each
+artist's share splits across their genres by MusicBrainz vote count, capped at 8.
+
+The cap matters. Ye carries 58 tags; splitting evenly would give each 1/58 while
+a two-tag artist gives each a half, systematically burying well-tagged artists.
+
+Trend classification gates on absolute size before computing relative change.
+Without that floor a genre sitting at a fraction of a percent posts "+540% a
+year" off a 0.3pp move and swamps the rankings.
+
+### Stage 4 — Output surfaces
+
+Every chart lives in `figures.py` as a function returning a Plotly figure; the
+dashboard and the report both import from it, so chart code is never written
+twice. The static HTML report is deliberately deferred until the dashboard has
+been used and it is clear which charts are worth keeping.
+
+Colour is anchored to the canonical global genre ranking rather than to list
+position, so filtering out one genre never repaints the ones still on screen.
 
 ## Known data flaws
 
