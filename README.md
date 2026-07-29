@@ -98,9 +98,26 @@ Two deviations from the original plan, both forced by the APIs:
   MBIDs, so it cannot consume an artist resolution. Using it would mean resolving
   every track to a recording MBID first — the per-track explosion this design set
   out to avoid.
-- The search must query `artist:"X" OR alias:"X"`. Searching the name alone
-  silently loses every renamed artist: "Kanye West" returns a tribute band,
-  because the entry is now "Ye" with the old name demoted to an alias.
+- The search must query `artist:"X" OR alias:"X"`, and rank the candidates
+  rather than taking the first exact match. Searching the name alone silently
+  loses every renamed artist — "Kanye West" returns a tribute band, because the
+  entry is now "Ye" with the old name demoted to an alias. And an obscure
+  artist holding the name as an *alias* can outrank the artist whose name it
+  actually is: "Wale" returned a percussionist at score 100 ahead of the US
+  rapper at 82. A primary-name match therefore beats an alias match.
+
+Artists that resolve to an MBID but carry no tags are backfilled from their
+**release-group** tags, which are frequently populated even when the artist
+page is not.
+
+**Spotify is not used as a fallback**, despite being the obvious candidate. Its
+artist endpoint used to return a `genres` array and no longer does:
+`/v1/artists/{id}` answers 200 with `genres`, `popularity` and `followers` all
+absent (verified against Drake, Taylor Swift, Metallica and ArrDee), batch
+`/v1/artists` and `/top-tracks` answer 403, and search never carried genres.
+There is no genre data left there to fall back to. ListenBrainz's metadata
+lookup would serve, but returns 401 without an Authorization header — the
+no-auth guarantee covers only the `labs` host.
 
 Resolution is strict — an exact normalised match against name or alias, never a
 guess — and everything else lands on a review list. Names are folded on accents,

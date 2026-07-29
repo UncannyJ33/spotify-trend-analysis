@@ -44,8 +44,7 @@ import config
 
 MB_SEARCH_URL = "https://musicbrainz.org/ws/2/artist"
 MB_GENRES_URL = "https://musicbrainz.org/ws/2/genre/all"
-SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_ARTIST_SEARCH_URL = "https://api.spotify.com/v1/search"
+MB_RELEASE_GROUP_URL = "https://musicbrainz.org/ws/2/release-group"
 
 # MusicBrainz asks for a descriptive agent with contact details and throttles
 # anonymous clients to one request per second. Exceed it and they block you.
@@ -261,47 +260,42 @@ def resolve_via_musicbrainz(http: Throttled, name: str) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Spotify fallback (optional; only fills gaps MusicBrainz left)
+# Backfill for artists MusicBrainz resolved but never tagged
 # --------------------------------------------------------------------------
+#
+# The plan here was Spotify's artist endpoint, which used to expose `genres`.
+# It no longer does: as of this writing `/v1/artists/{id}` returns 200 with
+# `genres`, `popularity` and `followers` all absent (verified against Drake,
+# Taylor Swift, Metallica and ArrDee), batch `/v1/artists` and `top-tracks`
+# answer 403, and search results never carried genres to begin with. There is
+# no genre data left to fall back to, so that path was removed rather than
+# left in place to silently find nothing.
+#
+# ListenBrainz's metadata lookup would work but answers 401 without an
+# Authorization header — the no-auth guarantee covers only the `labs` host.
+#
+# What does work, with no auth and the infrastructure already here: an artist's
+# RELEASE GROUPS are frequently tagged even when the artist page is not.
+# Tion Wayne carries no artist tags but his release groups yield dance, hip
+# hop, uk garage, drill and uk drill.
 
 
-def spotify_token() -> str | None:
-    cid, secret = os.getenv("SPOTIFY_CLIENT_ID"), os.getenv("SPOTIFY_CLIENT_SECRET")
-    if not (cid and secret):
-        return None
-    r = requests.post(
-        SPOTIFY_TOKEN_URL,
-        data={"grant_type": "client_credentials"},
-        auth=(cid, secret),
-        timeout=30,
+def tags_from_release_groups(http: Throttled, mbid: str) -> list[dict]:
+    """Aggregate tag votes across everything the artist released."""
+    r = http.get(
+        MB_RELEASE_GROUP_URL,
+        params={"artist": mbid, "inc": "tags", "fmt": "json", "limit": 100},
     )
-    if r.status_code != 200:
-        print(f"  ! Spotify auth failed ({r.status_code})")
-        return None
-    return r.json().get("access_token")
-
-
-def resolve_via_spotify(token: str, name: str) -> dict | None:
-    """Spotify still exposes `genres` on the artist object. Fallback only."""
-    r = requests.get(
-        SPOTIFY_ARTIST_SEARCH_URL,
-        headers={"Authorization": f"Bearer {token}"},
-        params={"q": name, "type": "artist", "limit": 5},
-        timeout=30,
-    )
-    if r.status_code != 200:
-        return None
-    items = r.json().get("artists", {}).get("items", [])
-    target = normalise(name)
-    for it in items:
-        if normalise(it.get("name", "")) == target and it.get("genres"):
-            return {
-                "artist_name": name, "status": "resolved", "source": "spotify",
-                "mbid": None, "score": None, "matched_name": it["name"],
-                "n_candidates": len(items),
-                "tags": [{"tag": g.casefold(), "count": 1} for g in it["genres"]],
-            }
-    return None
+    if r is None or r.status_code != 200:
+        return []
+    totals: dict[str, int] = {}
+    for rg in r.json().get("release-groups", []):
+        for t in rg.get("tags") or []:
+            name = (t.get("name") or "").casefold()
+            if name:
+                totals[name] = totals.get(name, 0) + (t.get("count") or 1)
+    return [{"tag": k, "count": v} for k, v in
+            sorted(totals.items(), key=lambda kv: -kv[1])]
 
 
 # --------------------------------------------------------------------------
@@ -448,6 +442,8 @@ def main() -> None:
                     help="rebuild outputs and print the summary; no network calls")
     ap.add_argument("--retry-errors", action="store_true",
                     help="re-attempt names previously cached as error/not_found")
+    ap.add_argument("--no-backfill", action="store_true",
+                    help="skip the release-group pass for untagged artists")
     args = ap.parse_args()
 
     config.ensure_dirs()
@@ -490,17 +486,9 @@ def main() -> None:
             eta = len(todo) * MB_MIN_INTERVAL / 60
             print(f"Resolving {len(todo):,} artists via MusicBrainz "
                   f"(~{eta:.0f} min at {MB_MIN_INTERVAL}s/req). Ctrl-C is safe.\n")
-            token = spotify_token()
-            if token:
-                print("Spotify fallback: enabled\n")
-
             try:
                 for i, name in enumerate(todo, 1):
                     rec = resolve_via_musicbrainz(http, name)
-                    if token and (rec["status"] != "resolved" or not rec["tags"]):
-                        alt = resolve_via_spotify(token, name)
-                        if alt:
-                            rec = alt
                     append_cache(rec)
                     cache[name] = rec
                     if i % 25 == 0 or i == len(todo):
@@ -510,6 +498,40 @@ def main() -> None:
                               f"resolved so far: {done:,}", flush=True)
             except KeyboardInterrupt:
                 print("\nInterrupted — progress is cached, re-run to resume.\n")
+
+        # Second pass: artists that resolved to a real MBID but carry no tags.
+        # `backfilled` marks a record as already attempted so a re-run does not
+        # spend requests re-checking artists whose releases are also untagged.
+        if not args.no_backfill:
+            gaps = [
+                n for n, r in cache.items()
+                if r.get("status") == "resolved" and r.get("mbid")
+                and not r.get("tags") and not r.get("backfilled")
+            ]
+            if gaps:
+                print(f"\nBackfilling {len(gaps):,} untagged artists from release "
+                      f"groups (~{len(gaps) * MB_MIN_INTERVAL / 60:.0f} min).\n")
+                try:
+                    for i, name in enumerate(gaps, 1):
+                        rec = dict(cache[name])
+                        tags = tags_from_release_groups(http, rec["mbid"])
+                        rec["tags"] = tags
+                        rec["backfilled"] = True
+                        if tags:
+                            rec["source"] = "musicbrainz-release-group"
+                        append_cache(rec)
+                        cache[name] = rec
+                        if i % 25 == 0 or i == len(gaps):
+                            filled = sum(
+                                1 for r in cache.values()
+                                if r.get("source") == "musicbrainz-release-group"
+                                and r.get("tags")
+                            )
+                            print(f"  [{i:>5,}/{len(gaps):,}] "
+                                  f"{100*i/len(gaps):5.1f}%  recovered: {filled:,}",
+                                  flush=True)
+                except KeyboardInterrupt:
+                    print("\nInterrupted — progress is cached, re-run to resume.\n")
 
     write_outputs(con, cache, vocab)
     report(con)
