@@ -33,5 +33,13 @@ __pycache__/
 
 # ---------------------------------------------------------------------------
 # Explicit allowlist — tracked config that would otherwise be caught by *.json
+#
+# The blanket `*.json` above exists to keep the Spotify export out of git, but
+# it also swallows ordinary project config. Re-include those by name only —
+# never by a broad pattern, or the export starts leaking back in.
 # ---------------------------------------------------------------------------
 !.streamlit/config.toml
+!.claude/settings.json
+
+# Personal Claude overrides stay local.
+.claude/settings.local.json
