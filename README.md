@@ -44,7 +44,11 @@ Place the export at `./Spotify Extended Streaming History/`, or point
 | 3. Analyse | `.venv/bin/python analyze.py` | `data/tag_trends.parquet` |
 | 4. Dashboard | `.venv/bin/streamlit run app.py --server.address 127.0.0.1` | interactive |
 
-Run them in that order. Only Stage 2 touches the network.
+| 5. Recommend | `.venv/bin/python recommend.py` | `data/recommendations.parquet` |
+| 6. Poll | `.venv/bin/python poll.py` | `data/polled_plays.parquet` |
+| 7. Forecast | `.venv/bin/python forecast.py` | `data/forecast.parquet`, `data/genre_gaps.parquet` |
+
+Run 1–4 in that order. Stages 2, 5 and 6 touch the network; the rest are local.
 
 **Bind the dashboard to localhost.** Streamlit listens on every interface by
 default and prints an external URL on your public IP. This page renders your
@@ -158,6 +162,64 @@ been used and it is clear which charts are worth keeping.
 
 Colour is anchored to the canonical global genre ranking rather than to list
 position, so filtering out one genre never repaints the ones still on screen.
+
+### Stage 5 — Trajectory-aware recommendations
+
+A conventional recommender scores candidates against listening history, which
+means it recommends the past back to you. This history is 30% hip hop and that
+share is falling hard, so matching it points precisely where the listening is
+leaving. Candidates are scored against a trajectory-weighted taste vector
+instead:
+
+```
+weight(genre) = current_share x (1 + LAMBDA x relative_annual_change)
+```
+
+`LAMBDA = 2.0` was picked by sweep. At 0 the top ten holds six hip-hop artists
+led by MC Eiht — gangsta rap being the fastest-declining genre here. At 2 it
+holds none, led by Depeche Mode, while still grounded in real similarity.
+`--lambda 0` is kept as the honest baseline; the dashboard exposes the dial and
+re-ranks in ~0.03s because every input is cached locally.
+
+Candidates come from ListenBrainz `similar-artists` — collaborative filtering
+over real listening sessions, no auth. Spotify's equivalents are withdrawn:
+`/v1/recommendations` returns 404, `related-artists`, `top-tracks` and
+`new-releases` return 403.
+
+### Stage 6 — History poller
+
+The export is a snapshot; without this everything freezes at its generation
+date. Two limits belong to Spotify's `recently-played` endpoint and are
+surfaced rather than hidden:
+
+- **No play duration.** It reports `played_at` and full `duration_ms`, never how
+  much was heard. Since the analysis weights by `ms_played`, polled rows carry
+  an estimate flagged `ms_played_estimated`. Spotify only lists a track once it
+  passes ~30s, so the estimate holds for the 30s floor but overstates anything
+  abandoned at 45 seconds.
+- **Fifty items, one page.** This history averages ~36 plays a day, so polling
+  less often than daily silently drops plays. The run warns when a page returns
+  full — the signal that older plays fell off before it arrived.
+
+Auth is Authorization Code with PKCE, so no client secret is used. **This is
+the one thing that still needs the Spotify developer app**, with its redirect
+URI set to exactly `http://127.0.0.1:3000`.
+
+The endpoint does return real *track* artists, unlike the export, so it is
+stored — a later stage could use it to repair the album-artist flaw properly.
+
+### Stage 7 — Forecast and gaps
+
+Projects each genre's share forward under its trailing slope, damped by
+`MOMENTUM_DECAY` per month and renormalised. A straight-line extrapolation of a
+share would happily predict 140% of listening; read the output as direction and
+rough magnitude, not as a model.
+
+The gap analysis finds genres climbing fast while served by few artists — where
+the listening is already heading but has barely explored — and joins them to
+Stage 5's candidates. Ranked rather than cut at a fixed artist count, because
+the thinnest-served rising genre here still has 13 artists, so any hard
+threshold either admits everything or nothing.
 
 ## Known data flaws
 
