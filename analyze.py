@@ -48,7 +48,16 @@ def build_tag_weights(con: duckdb.DuckDBPyConnection) -> None:
         f"""
         CREATE OR REPLACE TABLE artist_tag_weights AS
         WITH ranked AS (
-            SELECT artist_name, tag, tag_count,
+            SELECT artist_name, tag,
+                   tag_count AS raw_count,
+                   -- MusicBrainz tag counts go NEGATIVE when the community
+                   -- downvotes a tag (as low as -6 here). Left unclamped they
+                   -- poison the weighting: an artist tagged [-1, -1] sums to
+                   -- exactly zero, 0/0 yields NaN, and the NaN then spreads
+                   -- across three months of every affected genre through the
+                   -- rolling mean. Clamping keeps disputed tags at minimum
+                   -- weight instead of deleting the artist outright.
+                   greatest(tag_count, 0) AS tag_count,
                    row_number() OVER (
                        PARTITION BY artist_name
                        ORDER BY tag_count DESC, tag
@@ -62,9 +71,11 @@ def build_tag_weights(con: duckdb.DuckDBPyConnection) -> None:
         SELECT
             artist_name,
             tag,
-            -- +1 so artists whose tags all have zero votes still split evenly
-            -- rather than dividing by zero.
-            (tag_count + 1.0) / sum(tag_count + 1.0) OVER (PARTITION BY artist_name)
+            -- +1 so artists whose tags all have zero votes still split evenly.
+            -- With the clamp above the denominator is at least the tag count,
+            -- so it can never reach zero.
+            (tag_count + 1.0)
+                / nullif(sum(tag_count + 1.0) OVER (PARTITION BY artist_name), 0)
                 AS tag_weight
         FROM kept
         """
@@ -282,6 +293,32 @@ def build_secondary_metrics(con: duckdb.DuckDBPyConnection) -> None:
     )
 
 
+def assert_no_nan(con: duckdb.DuckDBPyConnection) -> None:
+    """Fail loudly on non-finite values rather than writing them to Parquet.
+
+    A NaN here does not announce itself — it silently blanks a genre for three
+    months via the rolling mean and shows up much later as a puzzling gap.
+    """
+    checks = [
+        ("artist_tag_weights", "tag_weight"),
+        ("tag_trends", "share"),
+        ("tag_trends", "smoothed_share"),
+        ("tag_trends", "tag_seconds"),
+        ("skip_rate_by_tag", "skip_rate"),
+    ]
+    problems = []
+    for table, col in checks:
+        n = con.execute(
+            f"SELECT count(*) FROM {table} "
+            f"WHERE isnan({col}) OR isinf({col})"
+        ).fetchone()[0]
+        if n:
+            problems.append(f"{table}.{col}: {n:,} non-finite values")
+    if problems:
+        raise SystemExit("Refusing to write non-finite values:\n  "
+                         + "\n  ".join(problems))
+
+
 def write_outputs(con: duckdb.DuckDBPyConnection) -> None:
     SECONDARY_DIR.mkdir(parents=True, exist_ok=True)
     con.execute(
@@ -416,6 +453,7 @@ def main() -> None:
     build_tag_trends(con)
     print("Building secondary metrics ...")
     build_secondary_metrics(con)
+    assert_no_nan(con)
     write_outputs(con)
     report(con)
 
