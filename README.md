@@ -47,6 +47,7 @@ Place the export at `./Spotify Extended Streaming History/`, or point
 | 5. Recommend | `.venv/bin/python recommend.py` | `data/recommendations.parquet` |
 | 6. Poll | `.venv/bin/python poll.py` | `data/polled_plays.parquet` |
 | 7. Forecast | `.venv/bin/python forecast.py` | `data/forecast.parquet`, `data/genre_gaps.parquet` |
+| 4b. Report | `.venv/bin/python report.py --open` | `output/report.html` |
 
 Run 1–4 in that order. Stages 2, 5 and 6 touch the network; the rest are local.
 
@@ -157,8 +158,14 @@ year" off a 0.3pp move and swamps the rankings.
 
 Every chart lives in `figures.py` as a function returning a Plotly figure; the
 dashboard and the report both import from it, so chart code is never written
-twice. The static HTML report is deliberately deferred until the dashboard has
-been used and it is clear which charts are worth keeping.
+twice.
+
+`report.py` renders those same functions into `output/report.html` — one file,
+no server, works from a `file://` URL with the network off. Plotly is inlined
+**once**: passing `include_plotlyjs='inline'` per figure would embed the ~3.5MB
+library a dozen times over. Every figure is rendered twice, light and dark, and
+CSS reveals whichever matches the reader's system, because a baked-in Plotly
+figure cannot recolour itself.
 
 Colour is anchored to the canonical global genre ranking rather than to list
 position, so filtering out one genre never repaints the ones still on screen.
