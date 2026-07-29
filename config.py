@@ -63,6 +63,34 @@ SLOPE_WINDOW_MONTHS = 12       # trailing window for the trend slope
 # are judged on the same footing.
 TREND_REL_THRESHOLD = 0.15
 
+# --- Stage 5: recommendations ----------------------------------------------
+RECOMMENDATIONS_PARQUET = DATA_DIR / "recommendations.parquet"
+
+# Seeds are drawn from recent listening, not all-time. Seeding on the whole
+# history would recommend against who you were in 2019.
+SEED_WINDOW_MONTHS = 18
+N_SEEDS = 120
+
+# Candidates are cheap to generate and expensive to tag, so only the strongest
+# survive to the enrichment step.
+MAX_CANDIDATES_TO_TAG = 400
+
+# How hard to lean on trajectory. 0.0 scores candidates against current taste
+# alone; higher values push toward genres that are climbing. The relative
+# annual change is clamped before use so one explosive tag cannot dominate.
+# 2.0 chosen by sweep, not by feel. At 0 the recommender is conventional and
+# hands back six hip-hop artists in the top ten — including gangsta rap, the
+# fastest-declining thing in this library. At 2 the list is electronic-forward
+# with the strongest hip-hop candidate pushed to #11, while still grounded in
+# real listening similarity.
+TRAJECTORY_LAMBDA = 2.0
+TRAJECTORY_CLAMP = (-0.9, 2.0)
+
+# Final score is similarity^ALPHA * trajectory_fit^BETA. Similarity keeps
+# results plausible; trajectory fit is what makes them forward-looking.
+SIMILARITY_ALPHA = 0.5
+TRAJECTORY_BETA = 1.0
+
 # Floor on a tag's trailing-year share before it is classified at all. Relative
 # change is meaningless against a near-zero denominator: a genre drifting from
 # 0.05% to 0.3% scores "+540% a year" off a 0.3pp move and swamps the ranking.

@@ -214,6 +214,77 @@ def page_secondary(ctrl: dict) -> None:
         )
 
 
+@st.cache_data(show_spinner=False)
+def load_recommendations(lam: float) -> pd.DataFrame:
+    """Re-rank at an arbitrary lambda. Cache-only, so the dial is instant."""
+    import recommend
+
+    con = duckdb.connect()
+    for name, path in (
+        ("plays", config.PLAYS_PARQUET),
+        ("track_credits", config.DATA_DIR / "track_credits.parquet"),
+        ("artist_resolution", config.DATA_DIR / "artist_resolution.parquet"),
+        ("tag_trends", config.TAG_TRENDS_PARQUET),
+    ):
+        con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM '{path}'")
+    return pd.DataFrame(recommend.rank_from_cache(con, lam))
+
+
+def page_recommendations(ctrl: dict) -> None:
+    st.subheader("Recommendations")
+    st.caption(
+        "Artists you have never listened to, scored against where your taste is "
+        "**heading** rather than where it has been."
+    )
+
+    if not (config.CACHE_DIR / "similar_artists.jsonl").exists():
+        st.warning("No recommendation cache yet. Run `.venv/bin/python recommend.py` first.")
+        return
+
+    lam = st.slider(
+        "Trajectory emphasis (λ)", 0.0, 4.0, float(config.TRAJECTORY_LAMBDA), 0.5,
+        help=("0 scores against current taste only — a conventional recommender. "
+              "Higher values push toward genres that are climbing and discount "
+              "the ones falling away."),
+    )
+    c1, c2 = st.columns([3, 2])
+    c1.markdown(
+        "**λ = 0** is the honest baseline: it recommends your history back to you. "
+        "Raise it and declining genres drop out of the ranking."
+    )
+
+    recs = load_recommendations(lam)
+    if recs.empty:
+        st.error("No recommendations scored — check the caches.")
+        return
+    c2.metric("Candidates scored", f"{len(recs):,}")
+
+    show = recs.head(40)[
+        ["artist_name", "score", "trajectory_fit", "similarity",
+         "matched_genres", "via_artists", "comment"]
+    ].rename(columns={
+        "artist_name": "artist", "trajectory_fit": "fit", "similarity": "sim",
+        "matched_genres": "genres", "via_artists": "similar to", "comment": "note",
+    })
+    st.dataframe(
+        show, use_container_width=True, hide_index=True,
+        column_config={
+            "score": st.column_config.ProgressColumn(
+                "score", min_value=0.0,
+                max_value=float(show["score"].max()), format="%.3f"),
+            "fit": st.column_config.NumberColumn("fit", format="%.2f",
+                                                 help="match to your rising genres"),
+            "sim": st.column_config.NumberColumn("sim", format="%.2f",
+                                                 help="listening-similarity to your seeds"),
+        },
+    )
+    st.caption(
+        "Similarity comes from ListenBrainz collaborative filtering over real "
+        "listening sessions. Spotify's equivalent endpoints have been withdrawn "
+        "— /v1/recommendations returns 404 and related-artists 403."
+    )
+
+
 def main() -> None:
     if missing_data_notice():
         return
@@ -227,12 +298,15 @@ def main() -> None:
     ctrl = sidebar_controls(totals_probe, trends_probe)
 
     st.sidebar.divider()
-    page = st.sidebar.radio("Page", ["Genre trends", "Secondary metrics"])
+    page = st.sidebar.radio(
+        "Page", ["Genre trends", "Secondary metrics", "Recommendations"])
 
     if page == "Genre trends":
         page_trends(ctrl)
-    else:
+    elif page == "Secondary metrics":
         page_secondary(ctrl)
+    else:
+        page_recommendations(ctrl)
 
     st.sidebar.divider()
     st.sidebar.caption(
