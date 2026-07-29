@@ -24,6 +24,8 @@ import duckdb
 
 import config
 
+POLLED_PARQUET = config.DATA_DIR / "polled_plays.parquet"
+
 # Columns that define a listening event. Used for de-duplication: `source_file`
 # and `source_kind` are deliberately excluded so the same event appearing in two
 # chunk files collapses to one row.
@@ -172,7 +174,12 @@ def build_plays_raw(con: duckdb.DuckDBPyConnection, files: list[Path]) -> None:
                 ELSE 'unknown'
             END                                   AS content_type,
             ms_played / 1000.0                    AS played_seconds,
-            date_trunc('month', ts)::DATE         AS month
+            date_trunc('month', ts)::DATE         AS month,
+            -- The export reports real play duration. Rows merged in from the
+            -- poller do not, so downstream can tell the two apart.
+            FALSE                                 AS ms_played_estimated,
+            -- The export has no track-artist field at all; the poller does.
+            CAST(NULL AS VARCHAR)                 AS track_artists
         FROM source
         -- Collapse events the export lists more than once. `ts` is the play
         -- *end* time, so an identical (ts, ms_played, track) triple cannot be
@@ -185,6 +192,77 @@ def build_plays_raw(con: duckdb.DuckDBPyConnection, files: list[Path]) -> None:
         """,
         [[str(f) for f in files]],
     )
+
+
+def merge_polled(con: duckdb.DuckDBPyConnection) -> dict:
+    """Fold poller rows into plays_raw, letting the export supersede them.
+
+    The poller cannot report how long a track was actually played — it fills
+    `ms_played` with the full track length as an estimate. A later export DOES
+    carry the real figure for that same period, so the reconciliation rule is
+    simply:
+
+        the export is authoritative for everything up to its last timestamp;
+        polled rows survive only past that point.
+
+    That is stricter than de-duplicating on play identity, and deliberately so.
+    Matching on `(ts, track)` would leave behind any polled row whose timestamp
+    drifted by a second, silently double-counting the play AND keeping the
+    estimated duration over the real one. Cutting on the export's own coverage
+    boundary cannot leave a straggler.
+
+    So a quarterly export does not merely add history — it retroactively
+    replaces every estimate the poller made in the period it covers.
+    """
+    stats = {"polled_total": 0, "superseded": 0, "kept": 0, "cutoff": None}
+    if not POLLED_PARQUET.exists():
+        return stats
+
+    export_max = con.execute("SELECT max(ts) FROM plays_raw").fetchone()[0]
+    stats["cutoff"] = export_max
+
+    con.execute(
+        f"CREATE OR REPLACE VIEW polled_src AS SELECT * FROM '{POLLED_PARQUET}'")
+    stats["polled_total"] = con.execute("SELECT count(*) FROM polled_src").fetchone()[0]
+    if not stats["polled_total"]:
+        return stats
+
+    stats["superseded"] = con.execute(
+        "SELECT count(*) FROM polled_src WHERE ts <= ?", [export_max]).fetchone()[0]
+
+    # Align the poller's narrower schema onto plays_raw, then append only the
+    # rows the export does not already cover.
+    con.execute(
+        """
+        INSERT INTO plays_raw BY NAME
+        SELECT
+            ts, platform, ms_played, conn_country,
+            artist_name, track_name, album_name, spotify_track_uri,
+            CAST(NULL AS VARCHAR) AS episode_name,
+            CAST(NULL AS VARCHAR) AS episode_show_name,
+            CAST(NULL AS VARCHAR) AS spotify_episode_uri,
+            CAST(NULL AS VARCHAR) AS audiobook_title,
+            CAST(NULL AS VARCHAR) AS audiobook_uri,
+            CAST(NULL AS VARCHAR) AS audiobook_chapter_title,
+            CAST(NULL AS VARCHAR) AS audiobook_chapter_uri,
+            reason_start, reason_end, shuffle, skipped, offline,
+            CAST(NULL AS BIGINT) AS offline_timestamp,
+            incognito_mode,
+            'spotify-api-poll' AS source_file,
+            source_kind, content_type,
+            ms_played / 1000.0            AS played_seconds,
+            date_trunc('month', ts)::DATE AS month,
+            TRUE                          AS ms_played_estimated,
+            track_artists
+        FROM polled_src
+        WHERE ts > ?
+        -- Guard against the poller itself having stored a duplicate.
+        QUALIFY row_number() OVER (PARTITION BY ts, spotify_track_uri) = 1
+        """,
+        [export_max],
+    )
+    stats["kept"] = stats["polled_total"] - stats["superseded"]
+    return stats
 
 
 def build_plays(con: duckdb.DuckDBPyConnection) -> None:
@@ -229,6 +307,7 @@ def report(
     failed: list[tuple[Path, str]],
     drift: set[str],
     rows_read: int,
+    polled: dict | None = None,
 ) -> None:
     """Print the Stage 1 summary the spec asks for before anything is built on top."""
     q = lambda sql: con.execute(sql).fetchone()  # noqa: E731
@@ -350,6 +429,19 @@ def report(
     ).fetchall():
         print(f"  {yr}   {h:>8,.1f} h   {_fmt(n):>7} plays   {_fmt(a):>6} artists")
 
+    if polled and polled["polled_total"]:
+        print("\n--- Polled history reconciliation ---")
+        print(f"  export authoritative through : {polled['cutoff']:%Y-%m-%d %H:%M}")
+        print(f"  polled rows on disk          : {_fmt(polled['polled_total'])}")
+        print(f"  superseded by the export     : {_fmt(polled['superseded'])}"
+              "   (estimated durations replaced by real ones)")
+        print(f"  kept, extending the history  : {_fmt(polled['kept'])}")
+        est = q("SELECT count(*) FROM plays WHERE ms_played_estimated")[0]
+        if est:
+            pct = 100 * est / q("SELECT count(*) FROM plays")[0]
+            print(f"  ⚠ plays with ESTIMATED duration: {_fmt(est)} ({pct:.1f}%)"
+                  " — will be corrected by the next export")
+
     print("\n--- Privacy check ---")
     cols = {
         c[0]
@@ -383,13 +475,18 @@ def main() -> None:
 
     print("Building plays_raw ...")
     build_plays_raw(con, good)
+    polled = merge_polled(con)
+    if polled["polled_total"]:
+        print(f"Merging polled history: {polled['polled_total']:,} rows, "
+              f"{polled['superseded']:,} superseded by the export, "
+              f"{polled['kept']:,} kept")
     print("Building plays ...")
     build_plays(con)
 
     write_parquet(con, "plays_raw", config.PLAYS_RAW_PARQUET)
     write_parquet(con, "plays", config.PLAYS_PARQUET)
 
-    report(con, good, failed, drift, rows_read)
+    report(con, good, failed, drift, rows_read, polled)
 
 
 if __name__ == "__main__":

@@ -324,6 +324,62 @@ def skip_rate_by_tag(df: pd.DataFrame, *, mode: str = "light",
     return fig
 
 
+def genre_gaps(df: pd.DataFrame, *, mode: str = "light", top_n: int = 10) -> go.Figure:
+    """Rising genres ranked by how thinly you have explored them.
+
+    Growth is the bar; the artist count rides along as a label, because the
+    interesting reading is the pair — fast-growing AND barely covered.
+    """
+    t = THEME[mode]
+    # Select by gap score — that is the real ranking — but ORDER the bars by the
+    # value actually drawn. Sorting by a hidden score while plotting a different
+    # number produces a bar chart whose lengths run out of order, which reads as
+    # a rendering fault rather than as meaning.
+    d = df.nlargest(top_n, "gap_score").sort_values("rel_change_per_year")
+    if d.empty:
+        return _base_layout(go.Figure(), mode, "No rising genres to explore")
+
+    fig = go.Figure(go.Bar(
+        x=d["rel_change_per_year"] * 100, y=d["tag"], orientation="h",
+        marker=dict(color=CATEGORICAL[mode][2],
+                    line=dict(width=2, color=t["surface"])),
+        text=[f"{n} artists · {h:.0f}h" for n, h in zip(d["n_artists"], d["hours"])],
+        textposition="outside",
+        textfont=dict(color=t["text_secondary"], size=11, family=FONT),
+        hovertemplate=("<b>%{y}</b><br>growing %{x:+.0f}%% a year"
+                       "<br>%{customdata[0]} artists · %{customdata[1]:.0f} h listened"
+                       "<br>now %{customdata[2]:.1%} of listening<extra></extra>"),
+        customdata=d[["n_artists", "hours", "share_now"]].values,
+    ))
+    fig = _base_layout(fig, mode, "Rising genres you have barely explored",
+                       height=max(360, 34 * len(d) + 130),
+                       xlabel="growth in share (% per year)")
+    fig.update_yaxes(showgrid=False)
+    lim = float(d["rel_change_per_year"].max()) * 100
+    fig.update_xaxes(range=[0, lim * 1.45])
+    return fig
+
+
+def single_trajectory(df: pd.DataFrame, tag: str, ranked_tags: list[str], *,
+                      smoothed: bool = True, mode: str = "light") -> go.Figure:
+    """One genre's path over time. A single series, so no legend is needed."""
+    share_col = "smoothed_share" if smoothed else "share"
+    d = _prep(df[df["tag"] == tag], share_col)
+    if d.empty:
+        return _base_layout(go.Figure(), mode, f"No data for {tag}")
+    colour = build_color_map(ranked_tags, mode, display_tags=[tag]).get(
+        tag, CATEGORICAL[mode][0])
+    fig = go.Figure(go.Scatter(
+        x=d["month"], y=d[share_col] * 100, mode="lines",
+        line=dict(width=2, color=colour), fill="tozeroy", fillcolor=_fade(colour),
+        hovertemplate=f"<b>{tag}</b><br>%{{x|%b %Y}} · %{{y:.2f}}%<extra></extra>",
+    ))
+    fig = _base_layout(fig, mode, f"{tag} — share of listening over time",
+                       height=300, ylabel="share (%)")
+    fig.update_layout(hovermode="x unified")
+    return fig
+
+
 def _fade(hex_colour: str, alpha: float = 0.14) -> str:
     h = hex_colour.lstrip("#")
     r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))

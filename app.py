@@ -285,6 +285,99 @@ def page_recommendations(ctrl: dict) -> None:
     )
 
 
+@st.cache_data(show_spinner=False)
+def load_gaps() -> pd.DataFrame:
+    path = config.DATA_DIR / "genre_gaps.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return duckdb.connect().execute(
+        f"SELECT * FROM '{path}' ORDER BY gap_score DESC").df()
+
+
+def page_discover(ctrl: dict) -> None:
+    """Rising genres you barely know, and who to try in each."""
+    st.subheader("Discover")
+    st.caption(
+        "Genres climbing fast that you have barely explored — and the artists "
+        "worth trying in each. Pick a genre to see its trajectory and who fits it."
+    )
+
+    gaps = load_gaps()
+    if gaps.empty:
+        st.warning("No gap analysis yet. Run `.venv/bin/python forecast.py` first.")
+        return
+
+    st.plotly_chart(figures.genre_gaps(gaps, mode=ctrl["mode"]),
+                    use_container_width=True)
+
+    st.divider()
+
+    left, right = st.columns([1, 2])
+    genre = left.selectbox(
+        "Genre", options=gaps["tag"].tolist(),
+        help="Ordered by how under-explored it is relative to how fast it is rising.",
+    )
+    row = gaps[gaps["tag"] == genre].iloc[0]
+
+    lam = right.slider(
+        "Trajectory emphasis (λ) for these picks", 0.0, 4.0,
+        float(config.TRAJECTORY_LAMBDA), 0.5,
+        help="0 recommends your history back to you; higher favours rising genres.",
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Growth", f"{100*row['rel_change_per_year']:+.0f}% / yr")
+    m2.metric("Share of listening", f"{100*row['share_now']:.1f}%")
+    m3.metric("Artists you know", f"{int(row['n_artists'])}")
+    m4.metric("Hours listened", f"{row['hours']:.0f} h")
+
+    trends = load_trends(ctrl["variant"])
+    totals = load_tag_totals(ctrl["variant"])
+    st.plotly_chart(
+        figures.single_trajectory(trends, genre, totals["tag"].tolist(),
+                                  smoothed=ctrl["smoothed"], mode=ctrl["mode"]),
+        use_container_width=True,
+    )
+
+    st.markdown(f"#### Artists to try in **{genre}**")
+    recs = load_recommendations(lam)
+    if recs.empty:
+        st.info("No recommendations cached. Run `.venv/bin/python recommend.py`.")
+        return
+
+    # Match on the genre appearing in the candidate's own matched genres.
+    hits = recs[recs["matched_genres"].str.contains(rf"\b{genre}\b", regex=True,
+                                                    case=False, na=False)]
+    if hits.empty:
+        st.info(
+            f"No cached candidate matched **{genre}** at λ={lam}. Try lowering λ, "
+            "or re-run `recommend.py` to widen the candidate pool."
+        )
+        return
+
+    show = hits.head(25)[
+        ["artist_name", "score", "trajectory_fit", "similarity",
+         "matched_genres", "via_artists", "comment"]
+    ].rename(columns={
+        "artist_name": "artist", "trajectory_fit": "fit", "similarity": "sim",
+        "matched_genres": "genres", "via_artists": "similar to", "comment": "note",
+    })
+    st.dataframe(
+        show, use_container_width=True, hide_index=True,
+        column_config={
+            "score": st.column_config.ProgressColumn(
+                "score", min_value=0.0,
+                max_value=float(show["score"].max()), format="%.3f"),
+            "fit": st.column_config.NumberColumn("fit", format="%.2f"),
+            "sim": st.column_config.NumberColumn("sim", format="%.2f"),
+        },
+    )
+    st.caption(
+        f"{len(hits)} cached candidates carry the **{genre}** tag. "
+        "'similar to' names the artists of yours that surfaced them."
+    )
+
+
 def main() -> None:
     if missing_data_notice():
         return
@@ -299,14 +392,17 @@ def main() -> None:
 
     st.sidebar.divider()
     page = st.sidebar.radio(
-        "Page", ["Genre trends", "Secondary metrics", "Recommendations"])
+        "Page",
+        ["Genre trends", "Discover", "Recommendations", "Secondary metrics"])
 
     if page == "Genre trends":
         page_trends(ctrl)
-    elif page == "Secondary metrics":
-        page_secondary(ctrl)
-    else:
+    elif page == "Discover":
+        page_discover(ctrl)
+    elif page == "Recommendations":
         page_recommendations(ctrl)
+    else:
+        page_secondary(ctrl)
 
     st.sidebar.divider()
     st.sidebar.caption(
