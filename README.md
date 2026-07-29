@@ -42,9 +42,15 @@ Place the export at `./Spotify Extended Streaming History/`, or point
 | 1b. Credits | `.venv/bin/python credits.py` | `data/track_credits.parquet` |
 | 2. Enrich | `.venv/bin/python enrich.py` | `data/artist_tags.parquet`, `.cache/` |
 | 3. Analyse | `.venv/bin/python analyze.py` | `data/tag_trends.parquet` |
-| 4. Dashboard | `.venv/bin/streamlit run app.py` | interactive |
+| 4. Dashboard | `.venv/bin/streamlit run app.py --server.address 127.0.0.1` | interactive |
 
 Run them in that order. Only Stage 2 touches the network.
+
+**Bind the dashboard to localhost.** Streamlit listens on every interface by
+default and prints an external URL on your public IP. This page renders your
+personal listening history, so `--server.address 127.0.0.1` is part of the
+command rather than an optional extra. Drop it only if you actually want the
+page reachable from your LAN.
 
 ### Stage 1 — Ingest and normalize
 
