@@ -289,7 +289,10 @@ def build(con: duckdb.DuckDBPyConnection) -> str:
     A('<header><p class="eyebrow">Spotify listening history</p>')
     A(f'<h1>{esc(sentence(pretty(top_faller["tag"])))} gave way to '
       f'{esc(pretty(top_riser["tag"]))}.</h1>')
-    A(f'<p class="lede">Seven years of listening, {plays:,} plays, and one '
+    # Span is measured, not written in. A hardcoded "seven years" is invisibly
+    # wrong for anyone running this against their own, shorter export.
+    span = f"{months} months" if months < 24 else f"{months // 12} years"
+    A(f'<p class="lede">{span} of listening, {plays:,} plays, and one '
       f'decisive turn. {sw(top_faller["tag"])} peaked near '
       f'{100*hh_peak:.0f}% of listening time and now sits at '
       f'{100*top_faller["smoothed_share"]:.1f}%. {sw(top_riser["tag"])} moved '
