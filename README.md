@@ -16,6 +16,13 @@ an interactive dashboard if you'd rather poke at it:
 .venv/bin/streamlit run app.py --server.address 127.0.0.1
 ```
 
+![The generated report: a headline finding, summary statistics, and a stacked area chart of genre share over seven years](docs/report-preview.png)
+
+*The report opens on whatever the biggest shift in your history turns out to be —
+the headline is generated from your data, not written in advance. Above is the
+author's; yours will say something else. It renders in light or dark to match
+your system.*
+
 ## What it answers
 
 - **What has my listening actually been made of, month by month?** Share of
@@ -277,10 +284,14 @@ guarantee covers only the `labs` host.
 Resolution is strict — an exact normalised match against name or alias, never a
 guess — and everything else lands on a review list you can inspect. Names are
 folded on accents, case and stylisation so `A$AP Rocky` and `ASAP Rocky` collapse
-together. The author's run resolved 2,605 artists, sent 315 to review, and
-covered **92.3% of listening time** — the number that matters, since one
-unresolved artist you play constantly hurts more than a hundred you played once.
-`enrich.py --report` prints yours.
+together.
+
+Judge the result by listening time, not artist count — one unresolved artist you
+play constantly hurts more than a hundred you played once. The author's run
+resolved 2,605 artists and sent 315 to review, which is **98.1% of listening time
+resolved** to an MBID and **92.3% carrying usable genre tags** (resolution and
+tagging are different things: MusicBrainz knows who plenty of artists are without
+anyone having tagged them). `enrich.py --report` prints both for your data.
 
 MusicBrainz is throttled to roughly 1 req/sec with a descriptive User-Agent; a
 503 is answered with a real backoff, since MusicBrainz sends `Retry-After: 0` and
