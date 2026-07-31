@@ -61,30 +61,29 @@ MB_RECORDING_LIMIT = 100    # one page is plenty; this is a filter, not a rankin
 GENRE_RECORDINGS_CACHE = config.CACHE_DIR / "genre_recordings.jsonl"
 ARTIST_TRACKS_CACHE = config.CACHE_DIR / "spotify_artist_tracks.jsonl"
 
-# Probed 2026-07-31: this Spotify app is refused every playlist-CONTENTS call
-# while everything else it needs works. Scope is not the cause — the 403 stands
-# with modify-private, modify-public, read-private and read-collaborative all
-# granted — so the message points at the app rather than sending the reader
-# back round the consent loop for nothing.
-QUOTA_NOTE = """
-  Spotify refused a playlist-contents call with 403.
+# Spotify renamed the playlist endpoints on 2026-02-11 and the old paths now
+# answer 403 "Forbidden" — not 404, which is why this reads as a permissions
+# problem and is not one. Verified against the live API 2026-07-31:
+#
+#     GET/PUT/POST /playlists/{id}/tracks   403   <- gone
+#     GET/PUT/POST /playlists/{id}/items    200   <- current
+#     POST /users/{uid}/playlists           403   <- gone (per-user endpoints
+#                                                  were removed outright)
+#     POST /me/playlists                    201   <- current
+#
+# The response nesting moved with them: a playlist's `tracks` object is now
+# `items`, and each row's `track` is now `item`. Do not "restore" the old paths.
+FORBIDDEN_NOTE = """
+  Spotify refused a playlist call with 403.
 
-  This app can search, read tracks, list your playlists and rename them, but is
-  refused every call that reads or writes a playlist's TRACK LIST:
-      POST /users/{id}/playlists      create
-      PUT  /playlists/{id}/tracks     replace
-      POST /playlists/{id}/tracks     add
-      GET  /playlists/{id}/tracks     read contents
-  It is not a scope problem: the same 403 stands with every playlist scope
-  granted. The app is quota-restricted — its search limit caps at 10 instead of
-  50 and track objects arrive with no popularity field, the same pattern that
-  already 403s related-artists and top-tracks for this project.
+  Note that the pre-February-2026 paths (/playlists/{id}/tracks,
+  POST /users/{id}/playlists) also answer 403 rather than 404, so a 403 here
+  may mean a stale endpoint rather than a missing permission. This module uses
+  the current paths; check those first if you are debugging.
 
-  Fix it on Spotify's side (developer.spotify.com/dashboard — confirm Web API is
-  enabled, then request Extended Quota Mode). No code change is needed here.
-
-  Meanwhile `playlists.py --dry-run` does everything except the write, and
-  prints exactly what each playlist would contain.
+  If the paths are right, the likely causes are an expired consent (delete
+  .cache/spotify_token.json and re-run) or a Development Mode limit —
+  developer.spotify.com/dashboard.
 """
 
 
@@ -421,7 +420,7 @@ def _alive(resp) -> bool:
     return bool(isinstance(resp, dict) and "_status" not in resp and resp.get("id"))
 
 
-def ensure_playlist(sp, uid: str, tag: str, name: str, state: dict) -> str:
+def ensure_playlist(sp, tag: str, name: str, state: dict) -> str:
     """Resolve the playlist this stage owns for `tag`, creating if needed.
 
     Identity is the stored ID — immune to the user renaming things. The name
@@ -446,28 +445,33 @@ def ensure_playlist(sp, uid: str, tag: str, name: str, state: dict) -> str:
             break
         page = sp.get(nxt.removeprefix(SP_API), params=None)
 
-    created = sp.post(f"/users/{uid}/playlists", json={
+    # POST /me/playlists, not /users/{uid}/playlists — the per-user endpoints
+    # were removed in Feb 2026 and the old path now 403s.
+    created = sp.post("/me/playlists", json={
         "name": name, "public": False,
         "description": "created by spotify-trend-analysis",
     })
     if not _alive(created):
         raise SystemExit(
             f"Could not create playlist '{name}': {created}\n" + (
-                QUOTA_NOTE if isinstance(created, dict)
+                FORBIDDEN_NOTE if isinstance(created, dict)
                 and created.get("_status") == 403 else ""))
     return created["id"]
 
 
 def playlist_items(sp, pid: str) -> list[dict]:
     """Current contents, for the pre-replace snapshot. Nothing we overwrite
-    goes unrecorded — hand-added tracks included."""
+    goes unrecorded — hand-added tracks included.
+
+    `/items` and the `item` key, not `/tracks` and `track`: renamed Feb 2026.
+    """
     out: list[dict] = []
-    path = (f"/playlists/{pid}/tracks"
-            "?fields=items(track(uri,name,artists(name))),next&limit=100")
+    path = (f"/playlists/{pid}/items"
+            "?fields=items(item(uri,name,artists(name))),next&limit=100")
     resp = sp.get(path, params=None)
     while isinstance(resp, dict) and "_status" not in resp:
         for it in resp.get("items", []):
-            t = it.get("track") or {}
+            t = it.get("item") or {}
             out.append({"uri": t.get("uri"), "track_name": t.get("name"),
                         "artist_name": ", ".join(a.get("name", "")
                                                  for a in t.get("artists", []))})
@@ -603,11 +607,6 @@ def main() -> None:
         report(selections, dry=True)
         return
 
-    me = sp.get("/me", params=None)
-    if not _alive(me):
-        raise SystemExit(f"Could not read the current user: {me}")
-    uid = me["id"]
-
     state = load_state()
     archive_rows = []
     for sel in selections:
@@ -616,7 +615,7 @@ def main() -> None:
         if not sel["tracks"]:
             print(f"  ⚠ nothing selected for '{name}' — leaving it untouched")
             continue
-        pid = ensure_playlist(sp, uid, tag, name, state)
+        pid = ensure_playlist(sp, tag, name, state)
 
         # Snapshot BEFORE the replace, so nothing we overwrite goes unrecorded.
         for i, old in enumerate(playlist_items(sp, pid)):
@@ -628,11 +627,11 @@ def main() -> None:
             })
 
         uris = [t["spotify_track_uri"] for t in sel["tracks"]]
-        resp = sp.put(f"/playlists/{pid}/tracks", json={"uris": uris})
+        resp = sp.put(f"/playlists/{pid}/items", json={"uris": uris})
         if not isinstance(resp, dict) or "_status" in resp:
             print(f"  ⚠ replace failed for '{name}': {resp} — skipping")
             if isinstance(resp, dict) and resp.get("_status") == 403:
-                raise SystemExit(QUOTA_NOTE)
+                raise SystemExit(FORBIDDEN_NOTE)
             continue
         sp.put(f"/playlists/{pid}", json={
             "name": name,

@@ -414,12 +414,38 @@ PROBE RESULTS (Task 3) — probed 2026-07-31, client_id 3522b9b8…
                     selection, search and archive layers are all unaffected; only
                     the final write is blocked.
 
-  CONCLUSION      : live playlist writing is not available to this Spotify app.
-                    `--dry-run` is fully functional and is the working entry
-                    point. The live path is built, tested against fakes, and
-                    left in place — it needs no code change if the app is
-                    granted Extended Quota Mode.
+  CONCLUSION (SUPERSEDED — see the correction below)
+                  : read at the time as an app-level quota restriction. It was
+                    not. Every 403 above came from calling endpoints Spotify
+                    REMOVED on 2026-02-11; the removed paths answer 403 rather
+                    than 404, which is why this looked like a permissions wall.
 ```
+
+**CORRECTION (same day, after checking Spotify's February 2026 migration
+guide).** The diagnosis above is wrong in its conclusion though right in its
+observations. The endpoints were renamed, not restricted:
+
+```
+  GET/PUT/POST /playlists/{id}/tracks   403  <- removed 2026-02-11
+  GET/PUT/POST /playlists/{id}/items    200  <- current
+  POST /users/{uid}/playlists           403  <- removed (per-user endpoints gone)
+  POST /me/playlists                    201  <- current
+```
+
+The response nesting moved with them: a playlist's `tracks` object is now
+`items`, and each row's `track` is now `item`. Two observations that were read
+as evidence of quota restriction are simply this release's documented behaviour:
+search `limit` dropped from 50 to 10, and tracks no longer carry `popularity`.
+
+The elimination work above still stands and was worth doing — it correctly ruled
+out scope, request shape, verb and public/private. What it could not rule out
+from inside the API was an endpoint that had ceased to exist while still
+answering with a permissions error. The lesson for this project: on a 403 from a
+third party, check the endpoint is still current before concluding anything
+about permissions.
+
+With the current paths, Stage 8 works end to end. Tasks 8.2 and 8.3 below were
+completed.
 
 The plan's stop condition was "if search is dead". Search is alive; it is the
 write half that is blocked, which this plan did not anticipate. Per the
@@ -1687,23 +1713,25 @@ one playlist, `Breathe Carolina - Blackout` twice in another — because Spotify
 presses one song as several URIs. Fixed by deduping on the folded title; the
 re-run gives Last Resort/Scars and Promises/Doomsday.
 
-- [x] **Step 2: Live run** — BLOCKED, and not by this code.
+- [x] **Step 2: Live run**
 
 Run: `.venv/bin/python playlists.py`
-Cannot complete. Every playlist-contents call is refused with 403 by this
-Spotify app (Task 3 probe record above has the full matrix and the elimination
-of scope, request shape, verb and public/private as causes). The live path is
-implemented and unit-tested against fakes; it needs no change if the app is
-granted Extended Quota Mode. `playlists.py` raises with `QUOTA_NOTE` on a 403
-rather than printing a bare status, so the failure explains itself.
+Four private playlists created and filled:
 
-- [x] **Step 3: Idempotency check** — BLOCKED by the same 403.
+```
+  rap rock frontier · Claude      4FGDeXj6ESOfm2Ifw7JjUp   13 tracks
+  dubstep frontier · Claude       1YJ1JIhjF01UWF0WRotkFO   16 tracks
+  techno frontier · Claude        46FG8dj3jg49qPCwzKo4eH   13 tracks
+  heavy metal frontier · Claude   6Bs4gt7vmNRPuhVVb3lnxn   25 tracks
+```
 
-The state-reuse and never-delete behaviour it would have checked is covered by
-`tests/test_playlist_lifecycle.py` (stored-ID reuse, dead-ID name adoption,
-paginated adoption, near-miss names refused, no DELETE verb), and archive
-append-not-replace plus total ordering by the `write_archive` assertions in the
-same file. `git status` is clean of anything personal — verified.
+- [x] **Step 3: Idempotency check**
+
+Second run reused all four IDs — no new playlists — and the archive behaved as
+designed: `selection` rows doubled (13→26, 16→32, 13→26, 25→50) while
+`pre_replace_snapshot` rows appeared for the first time, capturing run 1's
+contents before run 2 overwrote them. `data/playlist_state.json` holds the four
+tag→ID mappings. `git status` clean of anything personal.
 
 - [ ] **Step 4: Update README.md**
 

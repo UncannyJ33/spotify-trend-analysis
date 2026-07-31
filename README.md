@@ -474,16 +474,16 @@ than overwriting one. The stage has no delete method at all.
 `--dry-run` does the whole selection and prints what each playlist would
 contain, writing nothing.
 
-> **Live playlist writing is currently blocked by Spotify, not by this code.**
-> The author's developer app is refused every playlist-*contents* call — create,
-> replace, add, and even reading a playlist's track list all return 403 — while
-> search, track lookup, playlist listing and playlist *metadata* writes all
-> work. It is not a scope problem; the 403 stands with every playlist scope
-> granted. The app is quota-restricted: its search limit caps at 10 instead of
-> 50 and track objects arrive with no `popularity` field, the same wall that
-> already 403s `related-artists` and `top-tracks` for this project. Fixing it
-> means requesting Extended Quota Mode on the Spotify dashboard; no code change
-> is needed here. Until then `--dry-run` is the working entry point.
+> **A 403 from Spotify here probably means a stale endpoint, not a missing
+> permission.** Spotify renamed the playlist endpoints on 11 February 2026, and
+> the old paths answer `403 Forbidden` rather than `404`, which reads exactly
+> like a permissions problem and is not one. `/playlists/{id}/tracks` became
+> `/playlists/{id}/items`, `POST /users/{id}/playlists` became
+> `POST /me/playlists`, and in the response body a playlist's `tracks` object is
+> now `items` with each row's `track` now `item`. This code uses the current
+> paths. Two related changes from the same release that also shape this stage:
+> search `limit` now maxes out at 10 rather than 50, and tracks no longer carry
+> a `popularity` field — which is why the ordering leans on search relevance.
 
 Shares the Stage 6 developer app and PKCE flow, asking for two extra scopes.
 Re-consent takes the union of what was granted and what is needed, so widening
@@ -529,10 +529,12 @@ rather than the raw count; if that number is high, the analysis is sound.
 **The poller says `SPOTIFY_CLIENT_ID missing`.** See Stage 6 above — that stage
 and Stage 8 are the only two that need a developer app, and they share one.
 
-**Stage 8 says Spotify refused a playlist-contents call with 403.** Your
-developer app is quota-restricted. Confirm Web API is enabled for the app on the
-Spotify dashboard, then request Extended Quota Mode. `playlists.py --dry-run`
-works regardless and shows exactly what would have been written.
+**Stage 8 says Spotify refused a playlist call with 403.** Check the endpoint
+path before the permissions. Spotify's pre-February-2026 playlist paths
+(`/playlists/{id}/tracks`, `POST /users/{id}/playlists`) return 403 rather than
+404 now that they are gone, so a stale path is indistinguishable from a denied
+one at a glance. If the paths are current, delete `.cache/spotify_token.json`
+and re-run to force fresh consent.
 
 **Stage 8 asks for consent again.** It needs playlist scopes the poller never
 requested. Re-consent grants the union, so this happens once, and polling keeps

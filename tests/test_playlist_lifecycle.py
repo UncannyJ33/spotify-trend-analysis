@@ -21,7 +21,7 @@ class FakeSp:
         self.created = []
     def get(self, path, params=None):
         self.verbs.append(("GET", path))
-        if path.startswith("/playlists/") and path.endswith("/tracks"):
+        if path.startswith("/playlists/") and "/items" in path:
             return {"items": [], "next": None}
         if path.startswith("/playlists/"):
             pid = path.split("/")[2]
@@ -47,34 +47,34 @@ NAME = "dubstep frontier · Claude"
 # 1. Stored ID that still exists: reused, nothing created
 sp = FakeSp()
 state = {"dubstep": {"id": "keep-me", "name": NAME}}
-pid = playlists.ensure_playlist(sp, "uid", "dubstep", NAME, state)
+pid = playlists.ensure_playlist(sp, "dubstep", NAME, state)
 check("stored id reused", pid, "keep-me")
 check("nothing created", sp.created, [])
 
 # 2. Stored ID deleted remotely: falls through to name-adopt
 sp = FakeSp(existing=[{"id": "adopt-me", "name": NAME}], dead_ids={"keep-me"})
 state = {"dubstep": {"id": "keep-me", "name": NAME}}
-pid = playlists.ensure_playlist(sp, "uid", "dubstep", NAME, state)
+pid = playlists.ensure_playlist(sp, "dubstep", NAME, state)
 check("dead id replaced by exact-name adoption", pid, "adopt-me")
 
 # 3. No state, no name match: creates private with the template name
 sp = FakeSp(existing=[{"id": "x", "name": "my own dubstep mix"}])
-pid = playlists.ensure_playlist(sp, "uid", "dubstep", NAME, {})
+pid = playlists.ensure_playlist(sp, "dubstep", NAME, {})
 check("created fresh", pid, "new-1")
 check("created private", sp.created[0]["public"], False)
 check("near-miss name NOT adopted",
-      any(v == ("PUT", "/playlists/x/tracks") for v in sp.verbs), False)
+      any(v == ("PUT", "/playlists/x/items") for v in sp.verbs), False)
 
 # 3b. A name that differs only by the marker must not be adopted either.
 sp = FakeSp(existing=[{"id": "y", "name": "dubstep frontier"}])
 check("name without the marker NOT adopted",
-      playlists.ensure_playlist(sp, "uid", "dubstep", NAME, {}), "new-1")
+      playlists.ensure_playlist(sp, "dubstep", NAME, {}), "new-1")
 
 # 3c. Adoption is exact, so a rename by the user just makes a new one rather
 #     than hijacking whatever now sits under the old name.
 sp = FakeSp(existing=[{"id": "z", "name": NAME.upper()}])
 check("case-different name NOT adopted",
-      playlists.ensure_playlist(sp, "uid", "dubstep", NAME, {}), "new-1")
+      playlists.ensure_playlist(sp, "dubstep", NAME, {}), "new-1")
 
 # 4. Adoption has to survive pagination — the match may be on page 2.
 sp = FakeSp(pages=[
@@ -83,14 +83,14 @@ sp = FakeSp(pages=[
     {"items": [{"id": "p2", "name": NAME}], "next": None},
 ])
 check("adoption follows pagination",
-      playlists.ensure_playlist(sp, "uid", "dubstep", NAME, {}), "p2")
+      playlists.ensure_playlist(sp, "dubstep", NAME, {}), "p2")
 
 # 5. The invariant: no DELETE verb exists on the client at all
 check("client has no delete method", hasattr(playlists.Spotify, "delete"), False)
 
 # 6. ensure_playlist must never issue a delete-shaped call either.
 sp = FakeSp(existing=[{"id": "x", "name": "unrelated"}])
-playlists.ensure_playlist(sp, "uid", "dubstep", NAME, {})
+playlists.ensure_playlist(sp, "dubstep", NAME, {})
 check("no DELETE verb issued", [v for v in sp.verbs if v[0] == "DELETE"], [])
 
 # 7. A create that fails must stop the run, not return something unusable.
@@ -100,7 +100,7 @@ class DeadSp(FakeSp):
 
 
 try:
-    playlists.ensure_playlist(DeadSp(), "uid", "dubstep", NAME, {})
+    playlists.ensure_playlist(DeadSp(), "dubstep", NAME, {})
     check("failed create raises", False, True)
 except SystemExit:
     check("failed create raises", True, True)
@@ -121,12 +121,13 @@ class ItemSp:
 
 
 def track(uri, name, *artists):
-    return {"track": {"uri": uri, "name": name,
-                      "artists": [{"name": a} for a in artists]}}
+    # Feb 2026 renamed the nesting: items[].item, formerly items[].track.
+    return {"item": {"uri": uri, "name": name,
+                     "artists": [{"name": a} for a in artists]}}
 
 
 sp = ItemSp([{"items": [track("u1", "One", "A"), track("u2", "Two", "B", "C")],
-              "next": f"{playlists.SP_API}/playlists/p/tracks?offset=100"},
+              "next": f"{playlists.SP_API}/playlists/p/items?offset=100"},
              {"items": [track("u3", "Three", "D")], "next": None}])
 got = playlists.playlist_items(sp, "p")
 check("snapshot follows pagination", [r["uri"] for r in got], ["u1", "u2", "u3"])
@@ -134,7 +135,7 @@ check("multi-artist credit joined", got[1]["artist_name"], "B, C")
 check("track name captured", got[0]["track_name"], "One")
 
 # A local/removed track comes back as a null `track` and must not crash.
-sp = ItemSp([{"items": [{"track": None}, track("u9", "Real", "E")], "next": None}])
+sp = ItemSp([{"items": [{"item": None}, track("u9", "Real", "E")], "next": None}])
 got = playlists.playlist_items(sp, "p")
 check("null track row tolerated", [r["uri"] for r in got], [None, "u9"])
 

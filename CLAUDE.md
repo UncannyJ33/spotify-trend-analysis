@@ -173,14 +173,15 @@ config are tracked. Before changing anything here, understand why it is the way 
   app (Authorization Code + PKCE, no client secret, redirect URI exactly `http://127.0.0.1:3000`).
   Every other stage runs with no `.env` at all. `SPOTIFY_CLIENT_SECRET` is read by nothing — do not
   add a flow that wants one.
-- **The developer app is quota-restricted, and Stage 8's write path is blocked by it.** Probed
-  2026-07-31: create playlist, replace items, add items and *read* a playlist's track list all
-  return 403 with an empty message, while search, `/tracks/{id}`, `/me/playlists` and playlist
-  metadata `PUT` all return 200. Not a scope problem — the 403 stands with `playlist-modify-private`,
-  `-public`, `read-private` and `read-collaborative` all granted. Two more symptoms of the same
-  restriction: search `limit` above 10 returns 400 `"Invalid limit"` (hence `SP_SEARCH_LIMIT = 10`,
-  not the documented max of 50), and track objects arrive with no `popularity` field. Do not "fix"
-  this in code; it needs Extended Quota Mode on the dashboard. `--dry-run` is unaffected.
+- **Spotify's February 2026 rename is why a 403 here may mean a dead endpoint, not a denied one.**
+  The old paths were removed and now answer `403 Forbidden` rather than `404`, which is
+  indistinguishable from a permissions failure until you try the new path. Verified live 2026-07-31:
+  `/playlists/{id}/tracks` → 403 but `/playlists/{id}/items` → 200; `POST /users/{uid}/playlists` →
+  403 but `POST /me/playlists` → 201. The body nesting moved too — a playlist's `tracks` object is
+  `items`, and each row's `track` is `item`. `playlists.py` uses the current paths and documents the
+  matrix at `FORBIDDEN_NOTE`; do not "restore" the old ones. From the same release: search `limit`
+  maxes at 10 (hence `SP_SEARCH_LIMIT = 10`, not the once-documented 50) and tracks no longer carry
+  `popularity` — which is why Stage 8 ranks on search relevance rather than that field.
 - **ListenBrainz's Popularity API is disabled server-side** (`500: "Popularity API currently disabled
   due to high load"` on `top-recordings-for-artist` and `top-release-groups-for-artist`; the batch
   `popularity/recording` route answers 200 with `total_listen_count: null` for everything). That is
