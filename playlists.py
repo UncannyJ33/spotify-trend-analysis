@@ -252,3 +252,100 @@ def choose_tracks(tracks: list[dict], on_genre: set[str], k: int) -> list[dict]:
                for t in tracks]
     flagged.sort(key=lambda t: not t["genre_matched"])
     return flagged[:k]
+
+
+# --------------------------------------------------------------------------
+# Spotify — the ordering, the URIs, and later the shelf
+# --------------------------------------------------------------------------
+
+
+class Spotify:
+    """Thin bearer-token client.
+
+    429s are honoured — Spotify's Retry-After is real, unlike MusicBrainz's —
+    but capped, so a bad header cannot park a run for hours. There is
+    deliberately NO delete verb: this stage must never be able to remove a
+    playlist, and the cheapest way to guarantee that is to not implement it.
+    """
+
+    def __init__(self, token: str):
+        self.h = {"Authorization": f"Bearer {token}"}
+        self._last = 0.0
+
+    def _wait(self):
+        gap = SP_MIN_INTERVAL - (time.monotonic() - self._last)
+        if gap > 0:
+            time.sleep(gap)
+        self._last = time.monotonic()
+
+    def _req(self, method: str, path: str, **kw):
+        for attempt in (1, 2):
+            self._wait()
+            try:
+                r = requests.request(method, f"{SP_API}{path}", headers=self.h,
+                                     timeout=30, **kw)
+            except requests.RequestException:
+                return None
+            if r.status_code == 429 and attempt == 1:
+                try:
+                    hinted = int(r.headers.get("Retry-After", "1") or 1)
+                except ValueError:
+                    hinted = 1
+                time.sleep(min(hinted, 30))
+                continue
+            if r.status_code >= 400:
+                return {"_status": r.status_code, "_body": r.text[:200]}
+            return r.json() if r.text else {}
+        return None
+
+    def get(self, path: str, params: dict | None = None):
+        return self._req("GET", path, params=params)
+
+    def post(self, path: str, json: dict):
+        return self._req("POST", path, json=json)
+
+    def put(self, path: str, json: dict):
+        return self._req("PUT", path, json=json)
+
+
+def _artist_match(item: dict, artist: str) -> bool:
+    """Accept a hit only when the artist we asked for is really credited on it.
+
+    Searching `artist:"Virtual Riot"` is a relevance query, not a filter:
+    karaoke acts, tribute covers and "in the style of" uploads all come back.
+    Folding is enrich.normalise, the same one Stage 2 resolves names with, so
+    'A$AP Rocky' and 'ASAP Rocky' are one artist. A featured credit counts —
+    the artist is genuinely on the track.
+    """
+    want = normalise(artist)
+    return want in {normalise(a.get("name", "")) for a in item.get("artists", [])}
+
+
+def sp_artist_tracks(sp, artist: str, cache: dict) -> list[dict]:
+    """This artist's tracks in Spotify's relevance order, validated.
+
+    Relevance order is the whole point: with ListenBrainz popularity down it is
+    the only popularity signal left, so the list comes back in exactly the
+    order Spotify gave it and nothing here re-sorts it. `artist_name` is set to
+    the name we asked for rather than the credit string on the result, so the
+    per-artist cap downstream stays keyed on one spelling.
+
+    An empty answer caches like any other: an artist Spotify does not carry is
+    asked once, not once per run.
+    """
+    key = normalise(artist)
+    if key in cache:
+        return [dict(t, artist_name=artist) for t in cache[key]["tracks"]]
+    resp = sp.get("/search", params={
+        "q": f'artist:"{artist.replace(chr(34), "")}"',
+        "type": "track", "limit": SP_SEARCH_LIMIT,
+    })
+    items = (resp.get("tracks", {}).get("items", [])
+             if isinstance(resp, dict) and "_status" not in resp else [])
+    tracks = [{"track_name": it.get("name"), "spotify_track_uri": it.get("uri")}
+              for it in items
+              if it.get("uri") and _artist_match(it, artist)]
+    rec = {"key": key, "artist": artist, "tracks": tracks}
+    append_jsonl(ARTIST_TRACKS_CACHE, rec)
+    cache[key] = rec
+    return [dict(t, artist_name=artist) for t in tracks]
