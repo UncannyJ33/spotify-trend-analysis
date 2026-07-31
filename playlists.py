@@ -181,3 +181,74 @@ def assemble(anchors: list[dict], discovery: list[dict], size: int) -> list[dict
         else:
             di += 1
     return out
+
+
+# --------------------------------------------------------------------------
+# MusicBrainz — which of this artist's recordings actually serve the genre
+# --------------------------------------------------------------------------
+
+
+def _title_key(name: str) -> str:
+    """Fold a track title for comparison across two catalogues.
+
+    Spotify and MusicBrainz disagree constantly about the tail of a title —
+    '- 2006 Remaster', '(Radio Edit)', '[VIP]'. Everything from the first such
+    separator on is dropped before the usual normalise(), so the two catalogues
+    are compared on the song rather than on the pressing. A title that is
+    nothing BUT a suffix falls back to the whole string: folding it to "" would
+    hand back a key that matches every untitled thing in the set.
+    """
+    head = re.split(r"\s+[-–—(\[]", name or "", maxsplit=1)[0]
+    return normalise(head) or normalise(name or "")
+
+
+def mb_genre_recordings(http: Throttled, artist_mbid: str, tag: str,
+                        cache: dict) -> set[str]:
+    """Folded titles of this artist's recordings tagged with `tag`.
+
+    One request answers "which of their work is dubstep". What it cannot answer
+    is which of it is any good — MusicBrainz orders by Lucene relevance, so
+    demos and 5.1 remixes rank alongside the hits (Aphex Twin + techno leads
+    with a SAW:II fragment). That is why this is a PREFERENCE SET applied over
+    Spotify's relevance order, never an ordering in its own right.
+
+    An empty ANSWER is cached like any other: "nobody tagged this artist's
+    recordings dubstep" is a fact, not something to re-ask every run. A failed
+    REQUEST is not cached — that is a missing answer, and caching it would
+    freeze a transient 503 into a permanent "this artist has nothing".
+    """
+    key = f"{artist_mbid}::{tag}"
+    if key in cache:
+        return set(cache[key]["titles"])
+    r = http.get(MB_RECORDING_URL, params={
+        "query": f'arid:{artist_mbid} AND tag:"{tag}"',
+        "fmt": "json", "limit": MB_RECORDING_LIMIT,
+    })
+    if r is None or r.status_code != 200:
+        print(f"    ! MusicBrainz gave no answer for {tag} recordings "
+              f"({'no response' if r is None else r.status_code}); "
+              f"treating as unknown, not as empty")
+        return set()
+    titles = {k for k in (_title_key(rec.get("title", ""))
+                          for rec in r.json().get("recordings", [])) if k}
+    rec = {"key": key, "artist_mbid": artist_mbid, "tag": tag,
+           "titles": sorted(titles)}
+    append_jsonl(GENRE_RECORDINGS_CACHE, rec)
+    cache[key] = rec
+    return titles
+
+
+def choose_tracks(tracks: list[dict], on_genre: set[str], k: int) -> list[dict]:
+    """Prefer the artist's on-genre work; Spotify relevance does the rest.
+
+    `tracks` arrives in Spotify's relevance order, which is the popularity
+    proxy. The sort is STABLE and keyed only on the genre flag, so relevance
+    survives inside each group: the artist's on-genre work rises above their
+    bigger off-genre hit, but between two on-genre tracks the better-known one
+    still leads. With no on-genre data the sort is a no-op and this degrades
+    cleanly to plain relevance order.
+    """
+    flagged = [dict(t, genre_matched=_title_key(t.get("track_name", "")) in on_genre)
+               for t in tracks]
+    flagged.sort(key=lambda t: not t["genre_matched"])
+    return flagged[:k]
