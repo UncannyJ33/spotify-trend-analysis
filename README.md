@@ -136,6 +136,7 @@ operation.
 | 5. Recommend | `python recommend.py` (`--lambda N`, `--top N`) | `data/recommendations.parquet` |
 | 6. Poll | `python poll.py` (`--status`, `--logout`) | `data/polled_plays.parquet` |
 | 7. Forecast | `python forecast.py` (`--horizon N`) | `data/forecast.parquet`, `data/genre_gaps.parquet` |
+| 8. Playlists | `python playlists.py` (`--dry-run`) | 4 private Spotify playlists + `data/playlists.parquet` |
 
 All prefixed with `.venv/bin/`. Stages 2, 5 and 6 use the network; the rest are local.
 
@@ -428,6 +429,66 @@ Stage 5's candidates. Ranked rather than cut at a fixed artist count, because th
 thinnest-served rising genre in the author's data still has 13 artists, so any
 hard threshold either admits everything or nothing.
 
+### Stage 8 — Gap playlists
+
+Turns the gap analysis into something you can press play on: one private
+playlist per top gap genre, capped at four.
+
+Each is **anchored discovery**. Around five tracks are your own recent
+favourites by library artists who serve that genre — familiar ground, and their
+URIs come free from the export, so no lookup is needed. The rest are strangers,
+drawn from Stage 5's candidates. The anchors are spread at even intervals rather
+than stacked at the front: five songs you know followed by twenty you don't
+reads as two playlists stapled together.
+
+Two sources split the judgment, and neither could do the job alone:
+
+- **Spotify's search relevance orders an artist's tracks.** ListenBrainz's
+  popularity dataset — the original design's source of real listen counts — is
+  server-side disabled, so relevance is the best popularity proxy still
+  standing, and it carries the track URI for free.
+- **MusicBrainz says which of that artist's recordings actually carry the
+  genre**, via one `arid:{mbid} AND tag:"{genre}"` search. Its own ordering is
+  useless for this — ask it for Aphex Twin's techno and the top hit is a
+  fragment off a Selected Ambient Works bootleg — but as a filter it is exactly
+  right.
+
+Preferring the on-genre titles *within* Spotify's relevance order gets both: the
+artist's on-genre work outranks their bigger off-genre hit, without demos and
+5.1 remixes outranking the hits. Papa Roach contributes "Last Resort", not "I
+Devise My Own Demise". Where an artist has no recording-level tags at all, the
+ordering degrades cleanly to plain relevance.
+
+One song gets one slot. Spotify presses the album cut, the single and the
+remaster as three distinct URIs, so dedupe is on the folded title — otherwise an
+artist's two slots both go to "Last Resort".
+
+**The playlist is a rendering, not the record.** Every run archives its
+selections to `data/playlists.parquet`, along with a snapshot of whatever it is
+about to overwrite, so Spotify never holds the only copy of anything. Identity
+is the playlist ID stored in `data/playlist_state.json`, falling back to an
+exact name match on first run — exact including case, because a near-miss is
+somebody's hand-made playlist and creating a duplicate is a far cheaper mistake
+than overwriting one. The stage has no delete method at all.
+
+`--dry-run` does the whole selection and prints what each playlist would
+contain, writing nothing.
+
+> **Live playlist writing is currently blocked by Spotify, not by this code.**
+> The author's developer app is refused every playlist-*contents* call — create,
+> replace, add, and even reading a playlist's track list all return 403 — while
+> search, track lookup, playlist listing and playlist *metadata* writes all
+> work. It is not a scope problem; the 403 stands with every playlist scope
+> granted. The app is quota-restricted: its search limit caps at 10 instead of
+> 50 and track objects arrive with no `popularity` field, the same wall that
+> already 403s `related-artists` and `top-tracks` for this project. Fixing it
+> means requesting Extended Quota Mode on the Spotify dashboard; no code change
+> is needed here. Until then `--dry-run` is the working entry point.
+
+Shares the Stage 6 developer app and PKCE flow, asking for two extra scopes.
+Re-consent takes the union of what was granted and what is needed, so widening
+for playlists never strips the poller's access or vice versa.
+
 ## Tuning it
 
 `config.py` holds every threshold in one place, commented with why each value is
@@ -442,6 +503,10 @@ what it is. The ones worth touching:
 | `MIN_SHARE_FOR_TREND` | 0.005 | Floor below which a genre is `negligible` |
 | `TREND_REL_THRESHOLD` | 0.15 | How much movement counts as rising or declining |
 | `TRAJECTORY_LAMBDA` | 2.0 | How hard recommendations lean on trajectory vs similarity |
+| `N_PLAYLISTS` | 4 | How many gap genres get a playlist |
+| `PLAYLIST_SIZE` | 25 | Tracks per playlist, anchors included |
+| `ANCHOR_TRACKS` | 5 | How many of those are your own familiar tracks |
+| `TRACKS_PER_ARTIST` | 2 | Stops one act owning a playlist |
 
 Change one, re-run `analyze.py`, re-run `report.py`. Stage 2's cache is untouched
 by any of this, so you never pay the enrichment cost twice.
@@ -461,8 +526,17 @@ rather than the raw count; if that number is high, the analysis is sound.
 **Streamlit prints an external URL on your public IP.** You dropped
 `--server.address 127.0.0.1`.
 
-**The poller says `SPOTIFY_CLIENT_ID missing`.** See Stage 6 above — that stage,
-and only that stage, needs a developer app.
+**The poller says `SPOTIFY_CLIENT_ID missing`.** See Stage 6 above — that stage
+and Stage 8 are the only two that need a developer app, and they share one.
+
+**Stage 8 says Spotify refused a playlist-contents call with 403.** Your
+developer app is quota-restricted. Confirm Web API is enabled for the app on the
+Spotify dashboard, then request Extended Quota Mode. `playlists.py --dry-run`
+works regardless and shows exactly what would have been written.
+
+**Stage 8 asks for consent again.** It needs playlist scopes the poller never
+requested. Re-consent grants the union, so this happens once, and polling keeps
+working afterwards.
 
 ## Known data flaws
 

@@ -1664,20 +1664,46 @@ git commit -m "Stage 8: playlist lifecycle, archive, dry-run and live modes"
 - Modify: `README.md` (command table row + Stage 8 section)
 - Modify: `CLAUDE.md` (commands block, invariants, gotchas)
 
-- [ ] **Step 1: Dry run against real data**
+- [x] **Step 1: Dry run against real data**
 
 Run: `.venv/bin/python playlists.py --dry-run`
-Expected: 4 playlists printed (dubstep / classical / dance / deep house on current data), anchors from the user's library, discovery tracks resolving to URIs. This spends LB + Spotify-search requests and fills the three caches; acceptable. Inspect the output *with the user* — this is the moment to catch a selection that looks wrong before anything touches their library.
+Expected 4 playlists; got 4. The plan's guess at which genres (dubstep /
+classical / dance / deep house) was stale — current `genre_gaps` ranks **rap
+rock, dubstep, techno, heavy metal**. Result:
 
-- [ ] **Step 2: Live run (user consents in browser if scopes changed)**
+```
+rap rock    13 tracks —  3 anchors, 10 discovery ( 5 recording-tag matched)
+dubstep     16 tracks —  4 anchors, 12 discovery ( 8 recording-tag matched)
+techno      13 tracks —  3 anchors, 10 discovery ( 8 recording-tag matched)
+heavy metal 25 tracks —  5 anchors, 20 discovery (18 recording-tag matched)
+```
+
+Short of PLAYLIST_SIZE where the gap genre simply has few candidates: rap rock
+has 5 candidate artists at TRACKS_PER_ARTIST=2, so 10 discovery tracks is the
+ceiling, not a failure. Heavy metal has 28 candidates and fills.
+
+The first dry run exposed a real defect — `Papa Roach - Last Resort` twice in
+one playlist, `Breathe Carolina - Blackout` twice in another — because Spotify
+presses one song as several URIs. Fixed by deduping on the folded title; the
+re-run gives Last Resort/Scars and Promises/Doomsday.
+
+- [x] **Step 2: Live run** — BLOCKED, and not by this code.
 
 Run: `.venv/bin/python playlists.py`
-Expected: 4 private playlists appear in the user's Spotify library bearing the `· Claude` marker; report prints IDs; `data/playlist_state.json` and `data/playlists.parquet` exist. Verify in the Spotify client with the user.
+Cannot complete. Every playlist-contents call is refused with 403 by this
+Spotify app (Task 3 probe record above has the full matrix and the elimination
+of scope, request shape, verb and public/private as causes). The live path is
+implemented and unit-tested against fakes; it needs no change if the app is
+granted Extended Quota Mode. `playlists.py` raises with `QUOTA_NOTE` on a 403
+rather than printing a bare status, so the failure explains itself.
 
-- [ ] **Step 3: Idempotency check**
+- [x] **Step 3: Idempotency check** — BLOCKED by the same 403.
 
-Run: `.venv/bin/python playlists.py` (again, immediately)
-Expected: same 4 playlist IDs (state reuse — no new playlists), contents replaced with identical tracks, archive grows by one run's rows plus snapshots. `git status` clean of anything personal.
+The state-reuse and never-delete behaviour it would have checked is covered by
+`tests/test_playlist_lifecycle.py` (stored-ID reuse, dead-ID name adoption,
+paginated adoption, near-miss names refused, no DELETE verb), and archive
+append-not-replace plus total ordering by the `write_archive` assertions in the
+same file. `git status` is clean of anything personal — verified.
 
 - [ ] **Step 4: Update README.md**
 

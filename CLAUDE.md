@@ -26,9 +26,12 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python poll.py --status          #            local state only, no network
 .venv/bin/python forecast.py --horizon 12  # Stage 7  → data/forecast.parquet, data/genre_gaps.parquet
 .venv/bin/python report.py --open          # Stage 4b → output/report.html
+.venv/bin/python playlists.py --dry-run    # Stage 8 preview — no Spotify writes
+.venv/bin/python playlists.py              # Stage 8 → 4 private playlists + data/playlists.parquet
 ```
 
-Run 1 → 1b → 2 → 3 in order; 4–7 consume Stage 3's output. Stages 2, 5, 6 touch the network; the rest
+Run 1 → 1b → 2 → 3 in order; 4–8 consume Stage 3's output (Stage 8 also needs
+Stage 5's and Stage 7's). Stages 2, 5, 6 touch the network; the rest
 are local and cheap to re-run. There is no test suite — each stage ends in a `report()` that prints
 counts, coverage and sanity checks to stdout, and that output is the verification surface. Read it
 before claiming a stage worked.
@@ -124,6 +127,27 @@ correct.
 - **`ignored` is a resolution status, not an absence.** It must stay out of the review list in both
   `enrich.write_outputs` and `enrich.report`, or the names the override file was written to suppress
   come straight back.
+- **Stage 8 never deletes or unfollows a playlist.** It writes only to IDs in
+  `data/playlist_state.json` or an exact `PLAYLIST_NAME_TEMPLATE` name match — exact including case,
+  because a near-miss is somebody's hand-made playlist and a duplicate is the far cheaper mistake.
+  Before every replace it snapshots current contents into `data/playlists.parquet`
+  (`kind = 'pre_replace_snapshot'`), so nothing it overwrites goes unrecorded. The `Spotify` client
+  deliberately has no `delete` method, and a test asserts that — keep it that way.
+- **Spotify scopes only ever widen.** `poll.access_token(client_id, scope)` re-consents with the
+  union of granted + needed, so running Stage 8 never strips the poller's scope or vice versa. Two
+  paths would silently narrow it and are guarded: a failed refresh re-authorises with what was held
+  rather than the default, and a refresh response that omits `scope` keeps the stored value instead
+  of erasing it and re-prompting every run.
+- **Stage 8 orders on Spotify relevance and filters on MusicBrainz tags; neither can be swapped for
+  the other.** Spotify supplies popularity order (and the URI); MusicBrainz `arid AND tag:` supplies
+  which recordings are on-genre. MusicBrainz's own ordering is Lucene relevance and is useless for
+  ranking — ask it for Aphex Twin's techno and a SAW:II bootleg fragment comes first. `choose_tracks`
+  applies the genre flag as a *stable* sort key so relevance survives inside each group.
+- **Dedupe tracks on the folded title, not the URI.** Spotify presses the album cut, the single and
+  the remaster as three distinct URIs, so URI-dedupe alone gives one artist's two slots to the same
+  song — the first dry run produced "Papa Roach — Last Resort" twice. `_title_key` drops everything
+  from the first ` - `, ` (` or ` [`, and a title that is *only* a suffix keeps its full form rather
+  than folding to `""` and matching everything.
 
 ## Privacy constraints
 
@@ -145,9 +169,23 @@ config are tracked. Before changing anything here, understand why it is the way 
 
 ## Gotchas
 
-- `SPOTIFY_CLIENT_ID` in `.env` is needed by `poll.py` and nothing else (Authorization Code + PKCE,
-  no client secret, redirect URI exactly `http://127.0.0.1:3000`). Every other stage runs with no
-  `.env` at all. `SPOTIFY_CLIENT_SECRET` is read by nothing — do not add a flow that wants one.
+- `SPOTIFY_CLIENT_ID` in `.env` is needed by `poll.py` and `playlists.py`, which share one developer
+  app (Authorization Code + PKCE, no client secret, redirect URI exactly `http://127.0.0.1:3000`).
+  Every other stage runs with no `.env` at all. `SPOTIFY_CLIENT_SECRET` is read by nothing — do not
+  add a flow that wants one.
+- **The developer app is quota-restricted, and Stage 8's write path is blocked by it.** Probed
+  2026-07-31: create playlist, replace items, add items and *read* a playlist's track list all
+  return 403 with an empty message, while search, `/tracks/{id}`, `/me/playlists` and playlist
+  metadata `PUT` all return 200. Not a scope problem — the 403 stands with `playlist-modify-private`,
+  `-public`, `read-private` and `read-collaborative` all granted. Two more symptoms of the same
+  restriction: search `limit` above 10 returns 400 `"Invalid limit"` (hence `SP_SEARCH_LIMIT = 10`,
+  not the documented max of 50), and track objects arrive with no `popularity` field. Do not "fix"
+  this in code; it needs Extended Quota Mode on the dashboard. `--dry-run` is unaffected.
+- **ListenBrainz's Popularity API is disabled server-side** (`500: "Popularity API currently disabled
+  due to high load"` on `top-recordings-for-artist` and `top-release-groups-for-artist`; the batch
+  `popularity/recording` route answers 200 with `total_listen_count: null` for everything). That is
+  why Stage 8 orders on Spotify relevance rather than real listen counts. If it ever comes back,
+  `choose_tracks` is where a real popularity signal would slot in.
 - Spotify's Web API is a dead end for enrichment and recommendations, and the code says so in
   several places: `/v1/artists/{id}` returns 200 with `genres` absent, batch endpoints and
   `related-artists`/`top-tracks`/`new-releases` return 403, `/v1/recommendations` returns 404. Genre
@@ -157,7 +195,9 @@ config are tracked. Before changing anything here, understand why it is the way 
   `credits.py` (a floor — features living solely in Spotify metadata stay invisible to it) and the
   poller's true track artists (exact, but only for tracks it has seen). Per-artist totals for
   never-polled tracks remain skewed.
-- The poller has never been run on this checkout — no `data/polled_plays.parquet`, no cached token.
-  So `credit_source` is 100% `export` today and the repair path, while tested, is dormant. Do not
-  read "it changed nothing" as "it does not work".
+- The poller has never been run on this checkout — no `data/polled_plays.parquet`. So `credit_source`
+  is 100% `export` today and the repair path, while tested, is dormant. Do not read "it changed
+  nothing" as "it does not work". There *is* now a cached token, created by Stage 8's consent, but it
+  carries only the playlist scopes; the first `poll.py` run will re-consent for the union and keep
+  both. That is `missing_scopes` working as designed, not a bug.
 - `ts` is UTC, so monthly buckets are UTC months.
