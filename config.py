@@ -104,6 +104,26 @@ TRAJECTORY_BETA = 1.0
 # Anything below this is classed 'negligible' rather than rising or declining.
 MIN_SHARE_FOR_TREND = 0.005  # 0.5% of a month's listening
 
+# --- Stage 8: gap playlists --------------------------------------------------
+PLAYLISTS_PARQUET = DATA_DIR / "playlists.parquet"      # archive of every run
+PLAYLIST_STATE_JSON = DATA_DIR / "playlist_state.json"  # gap tag -> playlist id
+
+N_PLAYLISTS = 4            # hard cap agreed with the user: never more than 4
+PLAYLIST_SIZE = 25
+ANCHOR_TRACKS = 5          # familiar tracks from library artists serving the gap
+TRACKS_PER_ARTIST = 2      # one act must not own a playlist
+ANCHOR_WINDOW_MONTHS = 18  # anchors ranked on recent listening, like SEED_WINDOW_MONTHS
+
+# The title marker is for the user's eyes in their own library: anything
+# carrying it is pipeline-managed and safe to regenerate; anything without it
+# is hand-made and must never be touched.
+PLAYLIST_NAME_TEMPLATE = "{genre} frontier · Claude"
+PLAYLIST_DESCRIPTION_TEMPLATE = (
+    "Rising, under-explored genre in your listening: {genre}. "
+    "A few anchors you know, the rest neighbours you don't. "
+    "Built by spotify-trend-analysis · refreshed {date}"
+)
+
 # Fields that must never reach a derived artifact.
 DROPPED_FIELDS = ("ip_addr",)
 

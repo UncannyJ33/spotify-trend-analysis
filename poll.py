@@ -117,13 +117,22 @@ def load_tokens() -> dict:
         return {}
 
 
-def authorize(client_id: str) -> dict:
+def missing_scopes(tok: dict, scope: str) -> set[str]:
+    """Scopes `scope` needs that the stored token was not granted.
+
+    Spotify includes the granted scope string in every token response and
+    save_tokens stores the response whole, so this is a pure set difference.
+    """
+    return set(scope.split()) - set(tok.get("scope", "").split())
+
+
+def authorize(client_id: str, scope: str = SCOPE) -> dict:
     """Interactive first-run consent. Uses PKCE, so no client secret is needed."""
     verifier, challenge = _pkce_pair()
     state = secrets.token_urlsafe(16)
     params = {
         "client_id": client_id, "response_type": "code",
-        "redirect_uri": REDIRECT_URI, "scope": SCOPE, "state": state,
+        "redirect_uri": REDIRECT_URI, "scope": scope, "state": state,
         "code_challenge_method": "S256", "code_challenge": challenge,
     }
     url = f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
@@ -160,12 +169,18 @@ def authorize(client_id: str) -> dict:
     return tok
 
 
-def access_token(client_id: str) -> str:
-    """A usable access token, refreshing or re-authorising as needed."""
+def access_token(client_id: str, scope: str = SCOPE) -> str:
+    """A usable access token covering `scope`, refreshing or re-consenting.
+
+    Stage 8 needs playlist scopes this poller never asked for, so re-consent
+    takes the UNION of what was granted and what is needed. Widening for
+    playlists must never strip the poller's own scope, or the next poll run
+    would 403 and re-prompt — and vice versa.
+    """
     tok = load_tokens()
-    if not tok.get("refresh_token"):
-        tok = authorize(client_id)
-        return tok["access_token"]
+    if not tok.get("refresh_token") or missing_scopes(tok, scope):
+        merged = set(scope.split()) | set(tok.get("scope", "").split())
+        return authorize(client_id, " ".join(sorted(merged)))["access_token"]
 
     r = requests.post(TOKEN_URL, timeout=30, data={
         "grant_type": "refresh_token", "refresh_token": tok["refresh_token"],
@@ -173,10 +188,18 @@ def access_token(client_id: str) -> str:
     })
     if r.status_code != 200:
         print(f"  refresh failed ({r.status_code}); re-authorising")
-        return authorize(client_id)["access_token"]
+        # Re-consent with everything already held, not just `scope` — dropping
+        # back to the default here would silently un-grant Stage 8's playlist
+        # scopes every time a refresh happened to fail.
+        merged = set(scope.split()) | set(tok.get("scope", "").split())
+        return authorize(client_id, " ".join(sorted(merged)))["access_token"]
     new = r.json()
     # Spotify does not always reissue the refresh token; keep the old one.
     new.setdefault("refresh_token", tok["refresh_token"])
+    # Nor does it always echo the granted scope. Losing that field would make
+    # missing_scopes() see an empty grant and re-prompt for consent on every
+    # single run, so carry the old value forward when the response omits it.
+    new.setdefault("scope", tok.get("scope", ""))
     save_tokens(new)
     return new["access_token"]
 
