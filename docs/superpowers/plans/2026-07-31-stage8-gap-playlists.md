@@ -41,9 +41,9 @@ Approach 1 rests on two endpoints this project has never called. Verify them emp
 - Modify: `docs/superpowers/plans/2026-07-31-stage8-gap-playlists.md` (fill in the Probe Results block below)
 
 **Interfaces:**
-- Produces: a filled-in **Probe Results** block and a go/no-go decision for `LB_POP_URL` and `LB_TAG_URL` used verbatim in Task 5.
+- Produces: a filled-in **Probe Results** block and a go/no-go decision for the endpoints Task 5 will use verbatim. (Outcome: no-go on both ListenBrainz candidates; Tasks 5 and 6 rewritten around MusicBrainz + Spotify search.)
 
-- [ ] **Step 1: Write the probe script**
+- [x] **Step 1: Write the probe script**
 
 ```python
 """Probe ListenBrainz popularity + bulk tag lookup with known-good MBIDs."""
@@ -90,27 +90,79 @@ if r.ok and items:
         print("  tags  :", [t["name"] for t in d.get("tags", [])][:8])
 ```
 
-- [ ] **Step 2: Run it**
+- [x] **Step 2: Run it**
 
 Run: `.venv/bin/python <scratchpad>/probe_lb.py`
 Expected: candidate A returns 200 with recording MBIDs + listen counts, bulk-tag-lookup returns 200 with per-recording tags. Any non-200: record status and body.
 
-- [ ] **Step 3: Record results and decide**
-
-Fill in this block in the plan file (edit in place):
+- [x] **Step 3: Record results and decide**
 
 ```
-PROBE RESULTS (Task 1) — filled in by executor
-  popularity endpoint : <URL that worked, or NONE>
-  response shape      : <field names for recording mbid / name / listen count>
-  bulk tag endpoint   : <URL + method that worked, or NONE>
-  tag response shape  : <field names>
-  decision            : APPROACH 1 as designed | tags via MB per-recording fallback | POPULARITY DEAD -> Spotify-search fallback (Task 5 note)
+PROBE RESULTS (Task 1) — probed 2026-07-31
+
+  popularity endpoint : NONE — the whole Popularity dataset is unavailable.
+      GET /1/popularity/top-recordings-for-artist/{mbid}     -> 500, sticky over 4 tries
+      GET /1/popularity/top-release-groups-for-artist/{mbid} -> 500 (same sibling failure)
+          body: {"code":500,"error":"Popularity API currently disabled due to
+                 high load on the server. Please try again later."}
+      GET labs /popular-recordings-by-artist/json            -> 404 (no such endpoint)
+      POST /1/popularity/recording {"recording_mbids":[...]} -> 200, but every row
+          comes back {"total_listen_count": null, "total_user_count": null},
+          for obscure AND canonical recordings alike. The endpoint is up; the
+          data behind it is not. There is no listen-count signal to be had.
+
+  bulk tag endpoint   : https://labs.api.listenbrainz.org/bulk-tag-lookup/json (POST
+      a JSON array of {"recording_mbid": ...}; GET with a single param also 200s)
+  tag response shape  : FLAT array, one row per (recording, tag) — NOT grouped:
+      {"recording_mbid", "tag", "tag_count", "percent", "source"}
+      `source` is one of 'recording' | 'artist' | 'release-group'. Only 'recording'
+      is a true track-level tag; the other two are propagated down from the artist
+      or the release and would silently re-introduce artist-level matching.
+      A 25-recording batch answered 19 distinct recordings (6 carry no tags at all).
+
+  MB recording tags   : GET /ws/2/recording/{mbid}?inc=tags+genres -> 200, but the
+      canonical recordings sampled carried empty genres[] and tags[]. Per-recording
+      MB lookups are 1.1 s each and mostly return nothing. Not worth the budget.
+
+  THE ROUTE THAT SURVIVED (found while probing, not in the original design):
+      GET /ws/2/recording?query=arid:{artist_mbid} AND tag:"{genre}" -> 200
+      One MusicBrainz request returns that artist's recordings carrying that tag.
+      Real hits on this project's own candidates:
+        Papa Roach   + rap rock    -> count=2   ['Anxiety', 'Last Resort']
+        N*E*R*D      + rap rock    -> count=13  ['Truth or Dare', 'Lapdance', ...]
+        Seven Lions  + dubstep     -> count=46  ['Days to Come', 'Someday', ...]
+        Disturbed    + heavy metal -> count=104 ['The Animal', 'Down With the Sickness (demo)', ...]
+      Caveat that shapes the design: ordering WITHIN those hits is Lucene
+      relevance, not popularity — Aphex Twin + techno leads with
+      'SAW:II CD2.6 / Sexy Bit Courtesy of NinjaTune', System of a Down + heavy
+      metal with 'Chupa Cabra / Power Struggle'. It answers WHICH recordings are
+      on-genre; it cannot answer which are worth hearing.
+
+  decision            : POPULARITY DEAD -> HYBRID (agreed with the user, 2026-07-31)
 ```
 
-Decision rules: popularity works + bulk tags work → proceed as designed. Popularity works, bulk tags dead → per-recording tags via MusicBrainz `inc=tags+genres` at 1.1 s (bounded: ~50 recordings per playlist refresh). Popularity dead → Task 5's `lb_top_recordings` is replaced by Spotify search-per-artist relevance order (Approach 2 degradation); genre preference then applies only via artist-level tags.
+**Decision: the hybrid.** Neither original branch is taken. Popularity is dead, so
+Approach 1 as designed is unbuildable; but the plan's documented degradation
+("genre preference then applies only via artist-level tags") would abandon the
+user's explicit *track-level genre matching* decision, and the `arid AND tag:`
+route makes that unnecessary. So:
 
-- [ ] **Step 4: Commit the updated plan**
+- **Spotify search per artist supplies the ordering** — `q=artist:"X"&type=track`
+  comes back in relevance order, which is the best popularity proxy still standing,
+  and it carries the URI, so resolution and ranking cost one request instead of two.
+- **MusicBrainz `arid AND tag:` supplies the genre truth** — one request per
+  (artist, gap genre) yields the set of on-genre recording titles.
+- **Ranking prefers titles present in that set**, Spotify relevance breaking ties
+  within each group. Popular *and* on-genre wins; on-genre-but-obscure beats
+  off-genre; the Subtronics rule survives intact.
+
+Two requests per candidate artist. `bulk-tag-lookup` is NOT used: it needs
+recording MBIDs as input, and the only way to get those per artist is the same MB
+search that already applies the tag filter — so the tag filter is strictly cheaper
+and strictly simpler. Task 5 and Task 6 below are rewritten to match; Tasks 2, 3, 4,
+7 and 8 are unaffected.
+
+- [x] **Step 4: Commit the updated plan**
 
 ```bash
 git checkout -b stage8-gap-playlists
@@ -462,11 +514,17 @@ at N_PLAYLISTS. Each mixes ANCHOR_TRACKS familiar tracks — the listener's own
 recent plays by library artists serving that genre — with discovery tracks
 from Stage 5's candidate artists.
 
-ListenBrainz decides WHAT (top recordings per artist, preferring recordings
-whose own tags match the gap genre); Spotify only resolves each chosen track
-to a URI and holds the shelf. The playlist is a rendering: every run archives
-its selections locally, and a snapshot of anything it overwrites, so Spotify
-never holds the only copy of anything.
+Two sources split the judgment. Spotify's search relevance ORDERS an artist's
+tracks — with ListenBrainz's popularity dataset disabled it is the only
+popularity signal still standing, and it carries the URI for free. MusicBrainz
+says WHICH of that artist's recordings actually carry the gap genre
+(`arid AND tag:`), and those are preferred within the relevance order. So the
+artist's on-genre work outranks their bigger off-genre hit, without demos and
+5.1 remixes outranking everything — which is what MusicBrainz alone would give.
+
+The playlist is a rendering: every run archives its selections locally, and a
+snapshot of anything it overwrites, so Spotify never holds the only copy of
+anything.
 
 Identity is the locally stored playlist ID (data/playlist_state.json), with an
 exact-name fallback on first run. The title carries a visible marker
@@ -478,6 +536,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import date
 
 import duckdb
@@ -490,14 +549,16 @@ from report import pretty
 SP_API = "https://api.spotify.com/v1"
 SP_SCOPES = "playlist-modify-private playlist-read-private"
 SP_MIN_INTERVAL = 0.25
+SP_SEARCH_LIMIT = 20        # one page of relevance; TRACKS_PER_ARTIST picks from it
 
-# Set from the Task 1 probe record; both candidates are in the plan.
-LB_POP_URL = "https://api.listenbrainz.org/1/popularity/top-recordings-for-artist"
-LB_TAG_URL = "https://labs.api.listenbrainz.org/bulk-tag-lookup/json"
+# ListenBrainz popularity is server-side disabled — the by-artist endpoints 500
+# and the batch route answers with null counts. See the Task 1 probe record.
+# Genre truth comes from MusicBrainz recording search instead.
+MB_RECORDING_URL = "https://musicbrainz.org/ws/2/recording"
+MB_RECORDING_LIMIT = 100    # one page is plenty; this is a filter, not a ranking
 
-POPULARITY_CACHE = config.CACHE_DIR / "recording_popularity.jsonl"
-RECORDING_TAG_CACHE = config.CACHE_DIR / "recording_tags.jsonl"
-TRACK_URI_CACHE = config.CACHE_DIR / "spotify_track_uris.jsonl"
+GENRE_RECORDINGS_CACHE = config.CACHE_DIR / "genre_recordings.jsonl"
+ARTIST_TRACKS_CACHE = config.CACHE_DIR / "spotify_artist_tracks.jsonl"
 
 
 # --------------------------------------------------------------------------
@@ -639,11 +700,180 @@ git commit -m "Stage 8: gap/anchor/candidate selection and playlist assembly"
 
 ---
 
-### Task 5: ListenBrainz fetchers and genre-preferred track choice
+### Task 5: MusicBrainz on-genre recordings and genre-preferred track choice
+
+> **Rewritten after the Task 1 probe.** The original task fetched ListenBrainz
+> popularity and bulk recording tags. Popularity is dead (see the probe record), so
+> ordering moves to Spotify (Task 6) and this task supplies only the genre truth.
 
 **Files:**
-- Modify: `playlists.py` (append a `# ListenBrainz` section)
+- Modify: `playlists.py` (append a `# MusicBrainz` section)
 - Create: `tests/test_track_choice.py`
+
+**Interfaces:**
+- Consumes: `MB_RECORDING_URL`, `enrich.Throttled` (has `.get(url, **kw)` only — no `.post` is needed under the hybrid, which is one reason it wins), `enrich.normalise`.
+- Produces:
+  - `mb_genre_recordings(http, artist_mbid: str, tag: str, cache: dict) -> set[str]` — the **normalised** titles of that artist's recordings carrying `tag`, via `query=arid:{mbid} AND tag:"{tag}"`. Cached per `(artist_mbid, tag)` in `GENRE_RECORDINGS_CACHE`; an empty result caches as an empty list, because "this artist has no recording tagged dubstep" is an answer.
+  - `choose_tracks(tracks: list[dict], on_genre: set[str], k: int) -> list[dict]` — `tracks` arrives in Spotify relevance order; a **stable** sort puts on-genre titles first without disturbing relevance within either group; each returned row gains `genre_matched: bool`; ≤ k.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+"""tests/test_track_choice.py — the within-artist genre preference."""
+import sys
+sys.path.insert(0, ".")
+import playlists
+
+failures = []
+def check(label, got, want):
+    ok = got == want
+    if not ok:
+        failures.append(f"{label}: got {got!r}, want {want!r}")
+    print(f"  {'PASS' if ok else 'FAIL'}  {label}")
+
+# Spotify relevance order: the big off-genre hit is first.
+tracks = [
+    {"spotify_track_uri": "uri:1", "track_name": "Mega Hit"},
+    {"spotify_track_uri": "uri:2", "track_name": "Pure Dubstep"},
+    {"spotify_track_uri": "uri:3", "track_name": "Also Dubstep"},
+    {"spotify_track_uri": "uri:4", "track_name": "B-side"},
+]
+on_genre = {playlists.normalise("Pure Dubstep"), playlists.normalise("Also Dubstep")}
+
+got = playlists.choose_tracks(tracks, on_genre, k=3)
+check("on-genre beats a higher-ranked off-genre hit",
+      [t["spotify_track_uri"] for t in got], ["uri:2", "uri:3", "uri:1"])
+check("genre_matched flag set", [t["genre_matched"] for t in got],
+      [True, True, False])
+
+check("no on-genre data at all -> relevance order survives untouched",
+      [t["spotify_track_uri"] for t in playlists.choose_tracks(tracks, set(), k=2)],
+      ["uri:1", "uri:2"])
+
+check("sort is stable within each group",
+      [t["spotify_track_uri"] for t in playlists.choose_tracks(tracks, on_genre, k=4)],
+      ["uri:2", "uri:3", "uri:1", "uri:4"])
+
+check("k caps output", len(playlists.choose_tracks(tracks, on_genre, k=1)), 1)
+check("empty input tolerated", playlists.choose_tracks([], set(), k=3), [])
+
+# Title folding must survive Spotify's suffixes: the MB title is plain, the
+# Spotify title carries a remaster/edit tail.
+tail = [{"spotify_track_uri": "uri:9",
+         "track_name": "Pure Dubstep - Extended Mix"}]
+check("suffixed Spotify title still matches the MB title",
+      playlists.choose_tracks(tail, on_genre, k=1)[0]["genre_matched"], True)
+
+if failures:
+    print(f"{len(failures)} FAILURE(S)"); sys.exit(1)
+print("all assertions passed")
+```
+
+- [ ] **Step 2: Run it to make sure it fails**
+
+Run: `.venv/bin/python tests/test_track_choice.py`
+Expected: `AttributeError: module 'playlists' has no attribute 'choose_tracks'`
+
+- [ ] **Step 3: Implement** (append to `playlists.py`)
+
+```python
+# --------------------------------------------------------------------------
+# MusicBrainz — which of this artist's recordings actually serve the genre
+# --------------------------------------------------------------------------
+
+
+def _title_key(name: str) -> str:
+    """Fold a track title for comparison across two catalogues.
+
+    Spotify and MusicBrainz disagree constantly about the tail of a title —
+    '- 2006 Remaster', '(Extended Mix)', '- Radio Edit'. Everything after the
+    first ' - ' or ' (' is dropped before the usual normalise(), so the two
+    catalogues are compared on the song rather than on the pressing.
+    """
+    head = re.split(r"\s+[-–(\[]", name or "", maxsplit=1)[0]
+    return normalise(head) or normalise(name or "")
+
+
+def mb_genre_recordings(http: Throttled, artist_mbid: str, tag: str,
+                        cache: dict) -> set[str]:
+    """Normalised titles of this artist's recordings tagged with `tag`.
+
+    One request answers 'which of their work is dubstep'. What it cannot answer
+    is which of it is any good — MusicBrainz orders by Lucene relevance, so
+    demos and 5.1 remixes rank alongside the hits. That is why this is a
+    PREFERENCE SET applied over Spotify's relevance order, never an ordering.
+
+    An empty answer is cached like any other: 'nobody tagged this artist's
+    recordings dubstep' is a fact, not a failure to retry every run.
+    """
+    key = f"{artist_mbid}::{tag}"
+    if key in cache:
+        return {t for t in cache[key]["titles"]}
+    r = http.get(MB_RECORDING_URL, params={
+        "query": f'arid:{artist_mbid} AND tag:"{tag}"',
+        "fmt": "json", "limit": MB_RECORDING_LIMIT,
+    })
+    titles: set[str] = set()
+    if r is not None and r.status_code == 200:
+        for rec in r.json().get("recordings", []):
+            key_title = _title_key(rec.get("title", ""))
+            if key_title:
+                titles.add(key_title)
+    rec = {"key": key, "artist_mbid": artist_mbid, "tag": tag,
+           "titles": sorted(titles)}
+    append_jsonl(GENRE_RECORDINGS_CACHE, rec)
+    cache[key] = rec
+    return titles
+
+
+def choose_tracks(tracks: list[dict], on_genre: set[str], k: int) -> list[dict]:
+    """Prefer the artist's on-genre work; Spotify relevance does the rest.
+
+    `tracks` arrives in Spotify's relevance order, which is the popularity
+    proxy. Sorting is STABLE and keyed only on the genre flag, so relevance is
+    preserved inside each group: the artist's on-genre work rises above their
+    bigger off-genre hit, but among two on-genre tracks the better-known one
+    still leads. With no on-genre data the sort is a no-op and this degrades
+    cleanly to plain relevance order.
+    """
+    flagged = [dict(t, genre_matched=_title_key(t.get("track_name", "")) in on_genre)
+               for t in tracks]
+    flagged.sort(key=lambda t: not t["genre_matched"])
+    return flagged[:k]
+```
+
+Add to the imports and constants at the top of `playlists.py`:
+
+```python
+import re
+
+MB_RECORDING_URL = "https://musicbrainz.org/ws/2/recording"
+MB_RECORDING_LIMIT = 100   # one page is plenty; this is a filter, not a ranking
+
+GENRE_RECORDINGS_CACHE = config.CACHE_DIR / "genre_recordings.jsonl"
+```
+
+(These are already in the Task 4 header above, which was updated when this task
+was rewritten — the ListenBrainz constants it originally carried are gone.)
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `.venv/bin/python tests/test_track_choice.py`
+Expected: `all assertions passed`
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add playlists.py tests/test_track_choice.py
+git commit -m "Stage 8: MusicBrainz on-genre recordings and genre-first track choice"
+```
+
+---
+
+### Task 5 (superseded) — original ListenBrainz popularity design
+
+<details>
+<summary>Kept for the record; unbuildable while the Popularity API is disabled.</summary>
 
 **Interfaces:**
 - Consumes: `LB_POP_URL` / `LB_TAG_URL` (as verified in Task 1), `Throttled` (has `.get(url, params=...)`; give it a `.post` only if the probe showed bulk lookup needs POST — if `Throttled` lacks `.post`, use module-level `requests.post` wrapped in the same `time.sleep` spacing, matching whatever the probe proved).
@@ -790,17 +1020,29 @@ git add playlists.py tests/test_track_choice.py
 git commit -m "Stage 8: ListenBrainz popularity, recording tags, genre-first choice"
 ```
 
+</details>
+
 ---
 
-### Task 6: Spotify URI resolver
+### Task 6: Spotify artist-track search
+
+> **Rewritten after the Task 1 probe.** The original task resolved one known
+> (artist, track) pair to a URI, because ListenBrainz was to have chosen the
+> tracks. With popularity dead, Spotify's own relevance order IS the track
+> choice, so the search is per-artist and returns a ranked list. The result
+> validation — never trust a search hit's artist — is unchanged and is the part
+> that mattered.
 
 **Files:**
-- Modify: `playlists.py` (append a `# Spotify resolver` section)
+- Modify: `playlists.py` (append a `# Spotify` section)
 - Create: `tests/test_uri_resolver.py`
 
 **Interfaces:**
 - Consumes: a bearer token (passed in as a string; auth happens once in `main`).
-- Produces: `sp_search_uri(sp, artist: str, track: str, cache: dict) -> str | None` where `sp` is a `Spotify` client (Task 7 defines it; for this task only `sp.get(path, params) -> dict|None` is needed — define the minimal `Spotify` class here and Task 7 extends it). Misses cache as `{"uri": None}` so a track Spotify lacks is asked exactly once. Match validation via `_match(result, artist, track) -> bool`.
+- Produces:
+  - `Spotify` — thin bearer client with `get`/`post`/`put` and **no delete**, 429-aware.
+  - `_artist_match(item: dict, artist: str) -> bool` — accept a hit only if the wanted artist is actually credited on it, after `enrich.normalise` folding.
+  - `sp_artist_tracks(sp, artist: str, cache: dict) -> list[dict]` — up to `SP_SEARCH_LIMIT` of that artist's tracks in Spotify relevance order, keys `artist_name`, `track_name`, `spotify_track_uri`. Cached per normalised artist in `ARTIST_TRACKS_CACHE`; an empty result caches too, so an artist Spotify does not carry is asked exactly once.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -831,40 +1073,48 @@ def item(uri, name, *artists):
     return {"uri": uri, "name": name, "artists": [{"name": a} for a in artists]}
 
 
-# Exact-ish hit accepted
-sp = FakeSp([item("spotify:track:1", "Pure Dubstep", "Virtual Riot")])
+# Relevance order is preserved exactly as Spotify returned it.
+sp = FakeSp([item("spotify:track:1", "Energy Drink", "Virtual Riot"),
+             item("spotify:track:2", "Idols",        "Virtual Riot")])
 cache = {}
-check("plain hit resolves",
-      playlists.sp_search_uri(sp, "Virtual Riot", "Pure Dubstep", cache),
-      "spotify:track:1")
+got = playlists.sp_artist_tracks(sp, "Virtual Riot", cache)
+check("relevance order preserved",
+      [t["spotify_track_uri"] for t in got], ["spotify:track:1", "spotify:track:2"])
+check("track names carried", [t["track_name"] for t in got],
+      ["Energy Drink", "Idols"])
+check("artist is the one we asked for, not the credit string",
+      {t["artist_name"] for t in got}, {"Virtual Riot"})
 
-# Wrong artist rejected even at rank 1; right artist at rank 2 wins
-sp = FakeSp([item("spotify:track:bad", "Pure Dubstep", "Karaoke Crew"),
-             item("spotify:track:2",  "Pure Dubstep", "Virtual Riot")])
-check("wrong-artist result skipped",
-      playlists.sp_search_uri(sp, "Virtual Riot", "Pure Dubstep", {}),
-      "spotify:track:2")
+# A search for one artist returns other people's tracks; they must be dropped.
+sp = FakeSp([item("spotify:track:bad", "Virtual Riot Tribute", "Karaoke Crew"),
+             item("spotify:track:ok",  "Energy Drink",         "Virtual Riot")])
+check("wrong-artist hit dropped",
+      [t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "Virtual Riot", {})],
+      ["spotify:track:ok"])
+
+# A featured credit still counts as the artist appearing on the track.
+sp = FakeSp([item("spotify:track:f", "Collab", "Someone Else", "Virtual Riot")])
+check("featured credit accepted",
+      [t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "Virtual Riot", {})],
+      ["spotify:track:f"])
 
 # Stylisation folds: A$AP vs ASAP
-sp = FakeSp([item("spotify:track:3", "Praise The Lord", "A$AP Rocky")])
+sp = FakeSp([item("spotify:track:3", "Praise the Lord", "A$AP Rocky")])
 check("stylised artist name matches",
-      playlists.sp_search_uri(sp, "ASAP Rocky", "Praise The Lord", {}),
-      "spotify:track:3")
+      [t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "ASAP Rocky", {})],
+      ["spotify:track:3"])
 
-# Remaster suffix on the result title still matches the plain query
-sp = FakeSp([item("spotify:track:4", "Enjoy the Silence - 2006 Remaster", "Depeche Mode")])
-check("suffixed title matches",
-      playlists.sp_search_uri(sp, "Depeche Mode", "Enjoy the Silence", {}),
-      "spotify:track:4")
-
-# Nothing acceptable -> None, and the miss is cached
+# Nothing acceptable -> empty, and the miss is cached so it is asked once.
 sp = FakeSp([item("spotify:track:5", "Different Song", "Someone Else")])
 cache = {}
-check("no match returns None",
-      playlists.sp_search_uri(sp, "Virtual Riot", "Pure Dubstep", cache), None)
-check("miss was cached", playlists._uri_key("Virtual Riot", "Pure Dubstep") in cache, True)
-playlists.sp_search_uri(sp, "Virtual Riot", "Pure Dubstep", cache)
+check("no usable hit returns empty",
+      playlists.sp_artist_tracks(sp, "Nobody At All", cache), [])
+check("miss was cached", playlists.normalise("Nobody At All") in cache, True)
+playlists.sp_artist_tracks(sp, "Nobody At All", cache)
 check("cached miss not re-searched", sp.calls, 1)
+
+# The invariant from Task 7, asserted here too: the client cannot delete.
+check("client has no delete method", hasattr(playlists.Spotify, "delete"), False)
 
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)
@@ -874,7 +1124,7 @@ print("all assertions passed")
 - [ ] **Step 2: Run it to make sure it fails**
 
 Run: `.venv/bin/python tests/test_uri_resolver.py`
-Expected: `AttributeError: module 'playlists' has no attribute 'sp_search_uri'`
+Expected: `AttributeError: module 'playlists' has no attribute 'sp_artist_tracks'`
 
 - [ ] **Step 3: Implement** (append to `playlists.py`)
 
@@ -928,42 +1178,58 @@ class Spotify:
         return self._req("PUT", path, json=json)
 
 
-def _uri_key(artist: str, track: str) -> str:
-    return f"{normalise(artist)} :: {normalise(track)}"
+def _artist_match(item: dict, artist: str) -> bool:
+    """Accept a hit only when the artist we asked for is really credited on it.
+
+    Searching `artist:"Virtual Riot"` is a relevance query, not a filter:
+    karaoke acts, tribute covers and 'in the style of' uploads all come back.
+    Folding is `enrich.normalise`, the same one Stage 2 resolves names with, so
+    'A$AP Rocky' and 'ASAP Rocky' are one artist. A featured credit counts —
+    the artist is genuinely on the track.
+    """
+    want = normalise(artist)
+    return want in {normalise(a.get("name", "")) for a in item.get("artists", [])}
 
 
-def _match(item: dict, artist: str, track: str) -> bool:
-    """Accept a result only when both names really agree, after the same
-    folding Stage 2 uses. Titles match on prefix so '— 2006 Remaster' and
-    similar suffixes do not cost the track."""
-    want_artist = normalise(artist)
-    got_artists = {normalise(a.get("name", "")) for a in item.get("artists", [])}
-    if want_artist not in got_artists:
-        return False
-    want, got = normalise(track), normalise(item.get("name", ""))
-    return got == want or got.startswith(want) or want.startswith(got)
+def sp_artist_tracks(sp, artist: str, cache: dict) -> list[dict]:
+    """This artist's tracks in Spotify's relevance order, validated.
 
+    Relevance order is the whole point: with ListenBrainz popularity down it is
+    the only popularity signal left, so the list is returned in exactly the
+    order Spotify gave it and nothing here re-sorts it. `artist_name` is set to
+    the name we asked for, not the credit string on the result, so downstream
+    grouping and the per-artist cap stay keyed on one spelling.
 
-def sp_search_uri(sp, artist: str, track: str, cache: dict) -> str | None:
-    """One targeted search; the first VALIDATED result wins; misses cached."""
-    key = _uri_key(artist, track)
+    An empty answer caches like any other: an artist Spotify does not carry is
+    asked once, not once per run.
+    """
+    key = normalise(artist)
     if key in cache:
-        return cache[key]["uri"]
-    q = f'track:"{track.replace(chr(34), "")}" artist:"{artist.replace(chr(34), "")}"'
-    resp = sp.get("/search", params={"q": q, "type": "track", "limit": 5})
-    uri = None
+        return [dict(t, artist_name=artist) for t in cache[key]["tracks"]]
+    resp = sp.get("/search", params={
+        "q": f'artist:"{artist.replace(chr(34), "")}"',
+        "type": "track", "limit": SP_SEARCH_LIMIT,
+    })
     items = (resp or {}).get("tracks", {}).get("items", []) if isinstance(resp, dict) else []
-    for item in items:
-        if _match(item, artist, track):
-            uri = item.get("uri")
-            break
-    rec = {"key": key, "artist": artist, "track": track, "uri": uri}
-    append_jsonl(TRACK_URI_CACHE, rec)
+    tracks = [{"track_name": it.get("name"), "spotify_track_uri": it.get("uri")}
+              for it in items
+              if it.get("uri") and _artist_match(it, artist)]
+    rec = {"key": key, "artist": artist, "tracks": tracks}
+    append_jsonl(ARTIST_TRACKS_CACHE, rec)
     cache[key] = rec
-    return uri
+    return [dict(t, artist_name=artist) for t in tracks]
 ```
 
-Note: `load_jsonl(TRACK_URI_CACHE, "key")` is how `main` will load this cache — the `key` field exists for that.
+Add to the constants at the top of `playlists.py`:
+
+```python
+SP_SEARCH_LIMIT = 20        # one page of relevance; TRACKS_PER_ARTIST picks from it
+ARTIST_TRACKS_CACHE = config.CACHE_DIR / "spotify_artist_tracks.jsonl"
+```
+
+and drop `TRACK_URI_CACHE`, which the per-track resolver used.
+
+Note: `load_jsonl(ARTIST_TRACKS_CACHE, "key")` is how `main` loads this cache — the `key` field exists for that.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -974,7 +1240,7 @@ Expected: `all assertions passed`
 
 ```bash
 git add playlists.py tests/test_uri_resolver.py
-git commit -m "Stage 8: validated Spotify URI resolver with miss caching"
+git commit -m "Stage 8: validated Spotify artist-track search with miss caching"
 ```
 
 ---
@@ -1187,35 +1453,37 @@ def register_sources(con: duckdb.DuckDBPyConnection) -> None:
         con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM '{path}'")
 
 
-def build_selections(con, http, sp, dry: bool) -> list[dict]:
+def build_selections(con, http, sp) -> list[dict]:
     """Everything up to (but excluding) the Spotify writes; shared by both
-    modes so --dry-run previews exactly what a live run would do."""
+    modes so --dry-run previews exactly what a live run would do.
+
+    Per candidate artist this spends one Spotify search (relevance order, which
+    is the surviving popularity signal) and one MusicBrainz search (which of
+    their recordings carry the gap genre). Both are cached, so a re-run inside
+    the same quarter spends nothing.
+    """
     tag_cache = load_jsonl(config.CACHE_DIR / "candidate_tags.jsonl", "mbid")
-    pop_cache = load_jsonl(POPULARITY_CACHE, "artist_mbid")
-    rtag_cache = load_jsonl(RECORDING_TAG_CACHE, "recording_mbid")
-    uri_cache = load_jsonl(TRACK_URI_CACHE, "key")
+    genre_rec_cache = load_jsonl(GENRE_RECORDINGS_CACHE, "key")
+    artist_tracks_cache = load_jsonl(ARTIST_TRACKS_CACHE, "key")
 
     out = []
     for gap in select_gaps(con):
         tag = gap["tag"]
         anchors = select_anchor_tracks(con, tag)
+        seen_uris = {a["spotify_track_uri"] for a in anchors}
         discovery = []
         for cand in select_candidates(con, tag, tag_cache):
             if len(discovery) >= config.PLAYLIST_SIZE:   # enough material
                 break
-            recs = lb_top_recordings(http, cand["mbid"], pop_cache)
-            rtags = lb_recording_tags(http, [r["recording_mbid"] for r in recs],
-                                      rtag_cache)
-            for chosen in choose_tracks(recs, rtags, tag, config.TRACKS_PER_ARTIST):
-                uri = sp_search_uri(sp, cand["artist_name"],
-                                    chosen["recording_name"], uri_cache)
-                if uri:
-                    discovery.append({
-                        "artist_name": cand["artist_name"],
-                        "track_name": chosen["recording_name"],
-                        "spotify_track_uri": uri,
-                        "genre_matched": tag in rtags.get(chosen["recording_mbid"], set()),
-                    })
+            tracks = sp_artist_tracks(sp, cand["artist_name"], artist_tracks_cache)
+            if not tracks:
+                continue
+            on_genre = mb_genre_recordings(http, cand["mbid"], tag, genre_rec_cache)
+            for chosen in choose_tracks(tracks, on_genre, config.TRACKS_PER_ARTIST):
+                if chosen["spotify_track_uri"] in seen_uris:
+                    continue
+                seen_uris.add(chosen["spotify_track_uri"])
+                discovery.append(chosen)
         tracks = assemble(anchors, discovery, config.PLAYLIST_SIZE)
         out.append({"gap": gap, "tracks": tracks})
     return out
@@ -1244,7 +1512,7 @@ def main() -> None:
     sp = Spotify(access_token(client_id, SP_SCOPES))
     http = Throttled(MB_MIN_INTERVAL)
 
-    selections = build_selections(con, http, sp, args.dry_run)
+    selections = build_selections(con, http, sp)
     today = date.today().isoformat()
 
     if args.dry_run:
