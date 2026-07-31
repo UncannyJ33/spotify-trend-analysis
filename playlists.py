@@ -277,11 +277,28 @@ def choose_tracks(tracks: list[dict], on_genre: set[str], k: int) -> list[dict]:
     bigger off-genre hit, but between two on-genre tracks the better-known one
     still leads. With no on-genre data the sort is a no-op and this degrades
     cleanly to plain relevance order.
+
+    One song is then allowed one slot. Spotify returns the album cut, the
+    single, the remaster and the deluxe edition as distinct URIs, so deduping
+    on URI alone hands an artist's two slots to the same song twice — the first
+    dry run produced 'Papa Roach - Last Resort' back to back. Dedupe runs after
+    the sort and before the cap, so the best-ranked pressing survives and the
+    freed slot goes to a different song rather than being lost.
     """
     flagged = [dict(t, genre_matched=_title_key(t.get("track_name", "")) in on_genre)
                for t in tracks]
     flagged.sort(key=lambda t: not t["genre_matched"])
-    return flagged[:k]
+
+    out, seen = [], set()
+    for t in flagged:
+        song = _title_key(t.get("track_name", ""))
+        if song in seen:
+            continue
+        seen.add(song)
+        out.append(t)
+        if len(out) >= k:
+            break
+    return out
 
 
 # --------------------------------------------------------------------------

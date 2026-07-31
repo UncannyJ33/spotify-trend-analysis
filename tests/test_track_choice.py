@@ -35,6 +35,45 @@ check("sort is stable within each group",
 
 check("k caps output", len(playlists.choose_tracks(tracks, on_genre, k=1)), 1)
 check("empty input tolerated", playlists.choose_tracks([], set(), k=3), [])
+
+# --------------------------------------------------------------------------
+# One song, many releases. Spotify returns the album cut, the single, the
+# remaster and the deluxe edition as DISTINCT URIs, so deduping on URI alone
+# fills an artist's slots with the same song twice — observed live as
+# 'Papa Roach - Last Resort' twice in one playlist.
+# --------------------------------------------------------------------------
+
+releases = [
+    {"spotify_track_uri": "uri:album",  "track_name": "Last Resort"},
+    {"spotify_track_uri": "uri:single", "track_name": "Last Resort"},
+    {"spotify_track_uri": "uri:remas",  "track_name": "Last Resort - 2020 Remaster"},
+    {"spotify_track_uri": "uri:scars",  "track_name": "Scars"},
+]
+got = playlists.choose_tracks(releases, set(), k=2)
+check("same song on several releases counts once",
+      [t["spotify_track_uri"] for t in got], ["uri:album", "uri:scars"])
+check("dedupe keeps the highest-ranked pressing",
+      got[0]["spotify_track_uri"], "uri:album")
+
+# Dedupe must not fire across genuinely different songs that merely share a
+# prefix-ish shape.
+distinct = [
+    {"spotify_track_uri": "u1", "track_name": "Breathe"},
+    {"spotify_track_uri": "u2", "track_name": "Breathe Carolina"},
+]
+check("different songs are not collapsed",
+      len(playlists.choose_tracks(distinct, set(), k=2)), 2)
+
+# A duplicate must not eat a slot: dedupe runs after the genre sort and before
+# the k cap, so k distinct songs come back whenever k distinct songs exist.
+mixed = [
+    {"spotify_track_uri": "uri:off1", "track_name": "Ballad"},
+    {"spotify_track_uri": "uri:off2", "track_name": "Ballad - Live"},
+    {"spotify_track_uri": "uri:on",   "track_name": "Banger"},
+]
+got = playlists.choose_tracks(mixed, {playlists._title_key("Banger")}, k=2)
+check("a duplicate does not consume one of the k slots",
+      [t["spotify_track_uri"] for t in got], ["uri:on", "uri:off1"])
 check("input is not mutated", tracks[0], {"spotify_track_uri": "uri:1",
                                           "track_name": "Mega Hit"})
 
