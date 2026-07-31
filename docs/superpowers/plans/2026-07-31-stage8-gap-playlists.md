@@ -367,18 +367,65 @@ print("unfollow probe playlist:", d.status_code)
 Run: `.venv/bin/python <scratchpad>/probe_spotify.py`
 Expected: search 200 with URIs; me 200; create 201; replace 200/201 (returns a snapshot_id); details 200; read-back shows the rename and `tracks.total: 1`; unfollow 200. The browser consent screen should list both playlist scopes.
 
-- [ ] **Step 3: Record results in the plan**
+- [x] **Step 3: Record results in the plan**
 
 ```
-PROBE RESULTS (Task 3) — filled in by executor
-  search          : <status; do results carry uri/name/artists as expected?>
-  create/replace  : <statuses>
-  details/read    : <statuses>
-  consent scopes  : <what the consent screen showed>
-  surprises       : <anything the client in Task 7 must accommodate>
+PROBE RESULTS (Task 3) — probed 2026-07-31, client_id 3522b9b8…
+
+  consent scopes  : consent screen listed both playlist scopes and granted them;
+                    the stored token reports
+                      "playlist-read-private playlist-modify-private"
+                    and later, after a wider re-consent,
+                      "…playlist-modify-public playlist-read-collaborative"
+                    Scope is NOT the problem — see below.
+
+  WORKS (200):
+    GET  /me                                    200
+    GET  /search?q=artist:"X"&type=track        200, relevance-ordered, validated
+    GET  /tracks/{id}                           200
+    GET  /me/playlists                          200  (34 playlists, paginates)
+    GET  /playlists/{id}   (metadata fields)    200
+    PUT  /playlists/{id}   (name, description)  200  — metadata writes DO work
+
+  BLOCKED (403 "Forbidden", empty message, no headers of note):
+    POST /users/{uid}/playlists                 403  create
+    PUT  /playlists/{id}/tracks                 403  replace  <- Stage 8's core write
+    POST /playlists/{id}/tracks                 403  add
+    GET  /playlists/{id}/tracks                 403  read contents
+
+  Ruled out before concluding it is the app:
+    - not scope: 403 persists with playlist-modify-private, -public,
+      read-private and read-collaborative all granted
+    - not the request: uid is 25 chars, alnum, URL-safe; playlist id URL-safe;
+      GET on the same playlist id returns 200
+    - not public/private: create 403s with public true, false, and omitted
+    - not the verb: PUT and POST on /tracks both 403
+
+  OTHER RESTRICTIONS OBSERVED (this app is quota-limited, not merely scoped):
+    - search `limit` above 10 returns 400 "Invalid limit" (documented max is 50)
+    - track objects come back with NO `popularity` field
+    - /me/playlists rows report tracks.total as null
+    These match the pattern already recorded in CLAUDE.md for this app —
+    related-artists, top-tracks, new-releases 403; /v1/recommendations 404.
+
+  surprises       : the split is PLAYLIST CONTENTS, not playlists. This app can
+                    create nothing and cannot see or change any playlist's track
+                    list, but can rename and re-describe one freely. Stage 8's
+                    selection, search and archive layers are all unaffected; only
+                    the final write is blocked.
+
+  CONCLUSION      : live playlist writing is not available to this Spotify app.
+                    `--dry-run` is fully functional and is the working entry
+                    point. The live path is built, tested against fakes, and
+                    left in place — it needs no code change if the app is
+                    granted Extended Quota Mode.
 ```
 
-If search is dead (403/404): STOP. Approach 1's resolver and Approach 2's fallback both die with it; report to the user — the playlist feature is not currently buildable, only the dry-run selection layer is.
+The plan's stop condition was "if search is dead". Search is alive; it is the
+write half that is blocked, which this plan did not anticipate. Per the
+constraint that this stage must never destroy anything, nothing was forced:
+the probe wrote a description to a throwaway playlist SJ created for the test
+and touched nothing else.
 
 - [ ] **Step 4: Commit the updated plan**
 

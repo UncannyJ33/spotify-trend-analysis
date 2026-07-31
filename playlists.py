@@ -45,7 +45,11 @@ from report import pretty
 SP_API = "https://api.spotify.com/v1"
 SP_SCOPES = "playlist-modify-private playlist-read-private"
 SP_MIN_INTERVAL = 0.25
-SP_SEARCH_LIMIT = 20        # one page of relevance; TRACKS_PER_ARTIST picks from it
+# One page of relevance; TRACKS_PER_ARTIST picks from it. Ten, not the
+# documented maximum of fifty: this app answers "Invalid limit" (400) to
+# anything above 10, so a larger value fails every search rather than
+# returning more. Verified by probe, 2026-07-31.
+SP_SEARCH_LIMIT = 10
 
 # ListenBrainz popularity is server-side disabled — the by-artist endpoints 500
 # and the batch route answers 200 with null listen counts for every recording.
@@ -56,6 +60,32 @@ MB_RECORDING_LIMIT = 100    # one page is plenty; this is a filter, not a rankin
 
 GENRE_RECORDINGS_CACHE = config.CACHE_DIR / "genre_recordings.jsonl"
 ARTIST_TRACKS_CACHE = config.CACHE_DIR / "spotify_artist_tracks.jsonl"
+
+# Probed 2026-07-31: this Spotify app is refused every playlist-CONTENTS call
+# while everything else it needs works. Scope is not the cause — the 403 stands
+# with modify-private, modify-public, read-private and read-collaborative all
+# granted — so the message points at the app rather than sending the reader
+# back round the consent loop for nothing.
+QUOTA_NOTE = """
+  Spotify refused a playlist-contents call with 403.
+
+  This app can search, read tracks, list your playlists and rename them, but is
+  refused every call that reads or writes a playlist's TRACK LIST:
+      POST /users/{id}/playlists      create
+      PUT  /playlists/{id}/tracks     replace
+      POST /playlists/{id}/tracks     add
+      GET  /playlists/{id}/tracks     read contents
+  It is not a scope problem: the same 403 stands with every playlist scope
+  granted. The app is quota-restricted — its search limit caps at 10 instead of
+  50 and track objects arrive with no popularity field, the same pattern that
+  already 403s related-artists and top-tracks for this project.
+
+  Fix it on Spotify's side (developer.spotify.com/dashboard — confirm Web API is
+  enabled, then request Extended Quota Mode). No code change is needed here.
+
+  Meanwhile `playlists.py --dry-run` does everything except the write, and
+  prints exactly what each playlist would contain.
+"""
 
 
 # --------------------------------------------------------------------------
@@ -404,7 +434,10 @@ def ensure_playlist(sp, uid: str, tag: str, name: str, state: dict) -> str:
         "description": "created by spotify-trend-analysis",
     })
     if not _alive(created):
-        raise SystemExit(f"Could not create playlist '{name}': {created}")
+        raise SystemExit(
+            f"Could not create playlist '{name}': {created}\n" + (
+                QUOTA_NOTE if isinstance(created, dict)
+                and created.get("_status") == 403 else ""))
     return created["id"]
 
 
@@ -581,6 +614,8 @@ def main() -> None:
         resp = sp.put(f"/playlists/{pid}/tracks", json={"uris": uris})
         if not isinstance(resp, dict) or "_status" in resp:
             print(f"  ⚠ replace failed for '{name}': {resp} — skipping")
+            if isinstance(resp, dict) and resp.get("_status") == 403:
+                raise SystemExit(QUOTA_NOTE)
             continue
         sp.put(f"/playlists/{pid}", json={
             "name": name,
