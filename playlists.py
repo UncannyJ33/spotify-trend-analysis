@@ -349,3 +349,287 @@ def sp_artist_tracks(sp, artist: str, cache: dict) -> list[dict]:
     append_jsonl(ARTIST_TRACKS_CACHE, rec)
     cache[key] = rec
     return [dict(t, artist_name=artist) for t in tracks]
+
+
+# --------------------------------------------------------------------------
+# Playlist lifecycle — ID first, exact name second, create third. Never delete.
+# --------------------------------------------------------------------------
+
+
+def load_state() -> dict:
+    if not config.PLAYLIST_STATE_JSON.exists():
+        return {}
+    try:
+        return json.loads(config.PLAYLIST_STATE_JSON.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_state(d: dict) -> None:
+    config.PLAYLIST_STATE_JSON.write_text(
+        json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _alive(resp) -> bool:
+    return bool(isinstance(resp, dict) and "_status" not in resp and resp.get("id"))
+
+
+def ensure_playlist(sp, uid: str, tag: str, name: str, state: dict) -> str:
+    """Resolve the playlist this stage owns for `tag`, creating if needed.
+
+    Identity is the stored ID — immune to the user renaming things. The name
+    match is an exact-template fallback for first runs and lost state; it is
+    EXACT on purpose, case and all. A near-miss is somebody's hand-made
+    playlist, and adopting it would mean this stage overwrites something a
+    person built. Creating a duplicate is the cheap mistake; overwriting is
+    the expensive one.
+    """
+    entry = state.get(tag) or {}
+    if entry.get("id"):
+        if _alive(sp.get(f"/playlists/{entry['id']}", params={"fields": "id,name"})):
+            return entry["id"]
+
+    page = sp.get("/me/playlists", params={"limit": 50})
+    while isinstance(page, dict) and "_status" not in page:
+        for item in page.get("items", []):
+            if item.get("name") == name:
+                return item["id"]
+        nxt = page.get("next")
+        if not nxt:
+            break
+        page = sp.get(nxt.removeprefix(SP_API), params=None)
+
+    created = sp.post(f"/users/{uid}/playlists", json={
+        "name": name, "public": False,
+        "description": "created by spotify-trend-analysis",
+    })
+    if not _alive(created):
+        raise SystemExit(f"Could not create playlist '{name}': {created}")
+    return created["id"]
+
+
+def playlist_items(sp, pid: str) -> list[dict]:
+    """Current contents, for the pre-replace snapshot. Nothing we overwrite
+    goes unrecorded — hand-added tracks included."""
+    out: list[dict] = []
+    path = (f"/playlists/{pid}/tracks"
+            "?fields=items(track(uri,name,artists(name))),next&limit=100")
+    resp = sp.get(path, params=None)
+    while isinstance(resp, dict) and "_status" not in resp:
+        for it in resp.get("items", []):
+            t = it.get("track") or {}
+            out.append({"uri": t.get("uri"), "track_name": t.get("name"),
+                        "artist_name": ", ".join(a.get("name", "")
+                                                 for a in t.get("artists", []))})
+        nxt = resp.get("next")
+        if not nxt:
+            break
+        resp = sp.get(nxt.removeprefix(SP_API), params=None)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Archive — the playlist is a rendering; this Parquet is the record
+# --------------------------------------------------------------------------
+
+
+ARCHIVE_COLS = ["run_date", "kind", "gap_tag", "playlist_id", "position",
+                "slot", "artist_name", "track_name", "spotify_track_uri", "source"]
+
+
+def write_archive(con: duckdb.DuckDBPyConnection, rows: list[dict]) -> None:
+    """Append this run to the archive, rewritten in total order.
+
+    ORDER BY ALL for the same reason every other write in this project uses it:
+    a partial sort key leaves ties for DuckDB's parallel sort to break however
+    it likes, and byte-identical re-runs quietly stop holding.
+    """
+    if not rows:
+        return
+    con.execute(f"""CREATE OR REPLACE TABLE _new ({', '.join(
+        c + (' INTEGER' if c == 'position' else ' VARCHAR') for c in ARCHIVE_COLS)})""")
+    con.executemany(
+        f"INSERT INTO _new VALUES ({', '.join('?' for _ in ARCHIVE_COLS)})",
+        [[r.get(c) for c in ARCHIVE_COLS] for r in rows])
+    if config.PLAYLISTS_PARQUET.exists():
+        con.execute(f"""CREATE OR REPLACE TABLE _all AS
+            SELECT * FROM '{config.PLAYLISTS_PARQUET}' UNION ALL SELECT * FROM _new""")
+    else:
+        con.execute("CREATE OR REPLACE TABLE _all AS SELECT * FROM _new")
+    con.execute(f"COPY (SELECT * FROM _all ORDER BY ALL) TO "
+                f"'{config.PLAYLISTS_PARQUET}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+
+
+# --------------------------------------------------------------------------
+
+
+def register_sources(con: duckdb.DuckDBPyConnection) -> None:
+    needed = {
+        "genre_gaps": config.DATA_DIR / "genre_gaps.parquet",
+        "plays": config.PLAYS_PARQUET,
+        "artist_tags": config.ARTIST_TAGS_PARQUET,
+        "recommendations": config.RECOMMENDATIONS_PARQUET,
+    }
+    for name, path in needed.items():
+        if not path.exists():
+            raise SystemExit(f"{path} not found — run the earlier stages first.")
+        con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM '{path}'")
+
+
+def build_selections(con, http, sp) -> list[dict]:
+    """Everything up to (but excluding) the Spotify writes; shared by both
+    modes so --dry-run previews exactly what a live run would do.
+
+    Per candidate artist this spends one Spotify search (relevance order, the
+    surviving popularity signal) and one MusicBrainz search (which of their
+    recordings carry the gap genre). Both are cached append-only, so a re-run
+    inside the same quarter spends nothing.
+    """
+    tag_cache = load_jsonl(config.CACHE_DIR / "candidate_tags.jsonl", "mbid")
+    genre_rec_cache = load_jsonl(GENRE_RECORDINGS_CACHE, "key")
+    artist_tracks_cache = load_jsonl(ARTIST_TRACKS_CACHE, "key")
+
+    out = []
+    for gap in select_gaps(con):
+        tag = gap["tag"]
+        print(f"\n{pretty(tag)} — {gap['n_artists']} artists, {gap['hours']:.0f} h")
+        anchors = select_anchor_tracks(con, tag)
+        print(f"  {len(anchors)} anchors from your own listening")
+
+        seen_uris = {a["spotify_track_uri"] for a in anchors}
+        candidates = select_candidates(con, tag, tag_cache)
+        print(f"  {len(candidates)} candidate artists carry this genre")
+
+        discovery: list[dict] = []
+        for cand in candidates:
+            if len(discovery) >= config.PLAYLIST_SIZE:   # enough material
+                break
+            tracks = sp_artist_tracks(sp, cand["artist_name"], artist_tracks_cache)
+            if not tracks:
+                continue
+            on_genre = mb_genre_recordings(http, cand["mbid"], tag, genre_rec_cache)
+            for chosen in choose_tracks(tracks, on_genre, config.TRACKS_PER_ARTIST):
+                if chosen["spotify_track_uri"] in seen_uris:
+                    continue
+                seen_uris.add(chosen["spotify_track_uri"])
+                discovery.append(chosen)
+
+        matched = sum(1 for d in discovery if d.get("genre_matched"))
+        print(f"  {len(discovery)} discovery tracks "
+              f"({matched} matched on recording-level tags)")
+        out.append({"gap": gap,
+                    "tracks": assemble(anchors, discovery, config.PLAYLIST_SIZE)})
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Stage 8 gap playlists")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="select and resolve, print the result, write nothing")
+    args = ap.parse_args()
+
+    import os
+
+    from dotenv import load_dotenv
+    load_dotenv()
+    from poll import access_token
+
+    config.ensure_dirs()
+    con = duckdb.connect()
+    register_sources(con)
+
+    client_id = os.getenv("SPOTIFY_CLIENT_ID")
+    if not client_id:
+        raise SystemExit(
+            "SPOTIFY_CLIENT_ID missing from .env — Stage 8 shares the Stage 6 "
+            "Spotify app (redirect URI exactly http://127.0.0.1:3000).")
+    sp = Spotify(access_token(client_id, SP_SCOPES))
+    http = Throttled(MB_MIN_INTERVAL)
+
+    selections = build_selections(con, http, sp)
+    today = date.today().isoformat()
+
+    if args.dry_run:
+        report(selections, dry=True)
+        return
+
+    me = sp.get("/me", params=None)
+    if not _alive(me):
+        raise SystemExit(f"Could not read the current user: {me}")
+    uid = me["id"]
+
+    state = load_state()
+    archive_rows = []
+    for sel in selections:
+        tag = sel["gap"]["tag"]
+        name = config.PLAYLIST_NAME_TEMPLATE.format(genre=pretty(tag))
+        if not sel["tracks"]:
+            print(f"  ⚠ nothing selected for '{name}' — leaving it untouched")
+            continue
+        pid = ensure_playlist(sp, uid, tag, name, state)
+
+        # Snapshot BEFORE the replace, so nothing we overwrite goes unrecorded.
+        for i, old in enumerate(playlist_items(sp, pid)):
+            archive_rows.append({
+                "run_date": today, "kind": "pre_replace_snapshot", "gap_tag": tag,
+                "playlist_id": pid, "position": i, "slot": None,
+                "artist_name": old["artist_name"], "track_name": old["track_name"],
+                "spotify_track_uri": old["uri"], "source": "spotify",
+            })
+
+        uris = [t["spotify_track_uri"] for t in sel["tracks"]]
+        resp = sp.put(f"/playlists/{pid}/tracks", json={"uris": uris})
+        if not isinstance(resp, dict) or "_status" in resp:
+            print(f"  ⚠ replace failed for '{name}': {resp} — skipping")
+            continue
+        sp.put(f"/playlists/{pid}", json={
+            "name": name,
+            "description": config.PLAYLIST_DESCRIPTION_TEMPLATE.format(
+                genre=pretty(tag), date=today),
+        })
+        state[tag] = {"id": pid, "name": name}
+        sel["playlist_id"] = pid
+        for t in sel["tracks"]:
+            archive_rows.append({
+                "run_date": today, "kind": "selection", "gap_tag": tag,
+                "playlist_id": pid, "position": t["position"], "slot": t["slot"],
+                "artist_name": t["artist_name"], "track_name": t["track_name"],
+                "spotify_track_uri": t["spotify_track_uri"],
+                "source": "plays" if t["slot"] == "anchor" else "spotify-search",
+            })
+
+    save_state(state)
+    write_archive(con, archive_rows)
+    report(selections, dry=False)
+
+
+def report(selections: list[dict], dry: bool) -> None:
+    print()
+    print("=" * 74)
+    print(f"STAGE 8 — GAP PLAYLISTS {'(dry run — nothing written)' if dry else ''}")
+    print("=" * 74)
+    for sel in selections:
+        g = sel["gap"]
+        n_anchor = sum(1 for t in sel["tracks"] if t["slot"] == "anchor")
+        n_disc = len(sel["tracks"]) - n_anchor
+        n_matched = sum(1 for t in sel["tracks"] if t.get("genre_matched"))
+        print(f"\n{config.PLAYLIST_NAME_TEMPLATE.format(genre=pretty(g['tag']))}")
+        print(f"  gap: {g['n_artists']} artists, {g['hours']:.0f} h, "
+              f"{100 * g['rel_change_per_year']:+.0f}%/yr")
+        print(f"  {len(sel['tracks'])} tracks — {n_anchor} anchors, {n_disc} "
+              f"discovery ({n_matched} matched on recording-level tags)")
+        if sel.get("playlist_id"):
+            print(f"  playlist: {sel['playlist_id']}")
+        for t in sel["tracks"][:8]:
+            mark = "⚓" if t["slot"] == "anchor" else " "
+            print(f"   {mark} {t['artist_name'][:28]:<28} {t['track_name'][:38]}")
+        if len(sel["tracks"]) > 8:
+            print(f"     ... {len(sel['tracks']) - 8} more")
+    if not dry:
+        print(f"\nArchive -> {config.PLAYLISTS_PARQUET}")
+        print(f"State   -> {config.PLAYLIST_STATE_JSON}")
+    print("=" * 74)
+
+
+if __name__ == "__main__":
+    main()
