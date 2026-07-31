@@ -13,6 +13,10 @@ output/
 .cache/
 .env
 
+# Your hand-written answers to the Stage 2 review list — a list of artists you
+# listen to. The tracked artist_overrides.example.csv documents the format.
+artist_overrides.csv
+
 # ---------------------------------------------------------------------------
 # Private working notes — the original build brief, kept local.
 # ---------------------------------------------------------------------------

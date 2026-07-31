@@ -29,6 +29,7 @@ a review list.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -53,6 +54,10 @@ USER_AGENT = (
     "( https://github.com/UncannyJ33/spotify-trend-analysis )"
 )
 MB_MIN_INTERVAL = 1.1  # seconds between MusicBrainz requests, with headroom
+
+# An override row must carry a real MBID or the literal IGNORE. Anything else is
+# a typo, and a typo'd MBID would otherwise be pinned as gospel.
+MBID_RE = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 
 CACHE_FILE = config.CACHE_DIR / "artist_resolution.jsonl"
 GENRE_VOCAB_FILE = config.CACHE_DIR / "mb_genre_vocabulary.txt"
@@ -151,6 +156,147 @@ def load_genre_vocabulary(http: Throttled) -> set[str]:
 # --------------------------------------------------------------------------
 # Cache
 # --------------------------------------------------------------------------
+
+
+def load_overrides() -> dict[str, dict]:
+    """Hand-written answers to the review list, keyed by normalised name.
+
+    Resolution refuses to guess, which is right, but it left the review list
+    write-only: Stage 2 ranked what it could not resolve by listening time and
+    offered no way to hand an answer back. This is that way.
+
+    Two kinds of row:
+
+        Wale,ab2528dd-...,the US rapper not the percussionist
+        Various Artists,IGNORE,compilation placeholder
+
+    An MBID pins the artist and skips the search entirely. IGNORE marks a name
+    that is not an artist at all, so it stops surfacing in the review list on
+    every future run.
+
+    Keyed on the *normalised* name, so an entry written `A$AP Rocky` matches
+    however the export happens to spell it — the same folding resolution uses.
+    """
+    path = config.ARTIST_OVERRIDES_CSV
+    if not path.exists():
+        return {}
+
+    out: dict[str, dict] = {}
+    with path.open(encoding="utf-8-sig", newline="") as fh:
+        for lineno, row in enumerate(csv.DictReader(fh), start=2):
+            name = (row.get("artist_name") or "").strip()
+            raw = (row.get("mbid") or "").strip()
+            # Comment rows are skipped before validation — a prose line with a
+            # comma in it would otherwise parse as a malformed override.
+            if not name or name.startswith("#") or not raw:
+                continue
+            ignore = raw.casefold() == "ignore"
+            if not ignore and not MBID_RE.fullmatch(raw):
+                print(f"  ⚠ {path.name} line {lineno}: "
+                      f"'{raw}' is neither a UUID nor IGNORE — skipped")
+                continue
+            out[normalise(name)] = {
+                "mbid": None if ignore else raw.casefold(),
+                "ignore": ignore,
+                "note": (row.get("note") or "").strip(),
+            }
+    return out
+
+
+def override_satisfied(rec: dict, ov: dict) -> bool:
+    """Is this cached record the answer the override file currently asks for?"""
+    return (rec.get("source") == "override"
+            and rec.get("status") == "resolved"
+            and rec.get("mbid") == ov["mbid"])
+
+
+def purge_stale_overrides(cache: dict[str, dict], overrides: dict[str, dict]) -> int:
+    """Drop cached override answers the file no longer backs.
+
+    The cache is append-only and last-write-wins, so without this, deleting a
+    line from the override file would leave its answer frozen in place forever
+    and the artist would never be resolved normally again.
+    """
+    stale = [
+        name for name, rec in cache.items()
+        if rec.get("source") == "override"
+        and not override_satisfied(rec, overrides.get(normalise(name)) or {"mbid": object()})
+    ]
+    for name in stale:
+        del cache[name]
+    return len(stale)
+
+
+def resolve_via_override(http: Throttled, name: str, mbid: str) -> dict:
+    """Fetch tags for a hand-supplied MBID. No search, no ranking, no guessing.
+
+    Tags are returned unfiltered, exactly as `resolve_via_musicbrainz` does —
+    `write_outputs` is the single place the genre vocabulary is applied.
+    """
+    base = {"artist_name": name, "source": "override", "mbid": mbid}
+    # MB_SEARCH_URL is the artist endpoint; /{mbid} is a direct lookup on it.
+    r = http.get(f"{MB_SEARCH_URL}/{mbid}",
+                 params={"inc": "tags+genres", "fmt": "json"})
+    if r is None or r.status_code != 200:
+        return {**base, "status": "error", "score": None, "matched_name": None,
+                "n_candidates": 0, "tags": []}
+
+    d = r.json()
+    # `inc=genres` is MusicBrainz's curated list; raw tags are the fallback.
+    src = d.get("genres") or d.get("tags") or []
+    tags = [{"tag": t["name"].casefold(), "count": max(t.get("count") or 0, 0)}
+            for t in src if t.get("name")]
+    return {**base, "status": "resolved", "score": 100,
+            "matched_name": d.get("name"), "n_candidates": 1, "tags": tags}
+
+
+def apply_overrides(http: Throttled | None, artists: list[str],
+                    cache: dict[str, dict], overrides: dict[str, dict]) -> dict:
+    """Fold manual answers over the cache. An override always wins.
+
+    IGNORE entries are applied in memory and never cached: they cost no request,
+    so recomputing them every run keeps the file authoritative for free. MBID
+    entries do cost a request, so those are cached and re-fetched only when the
+    file changes.
+    """
+    stats = {"ignored": 0, "pinned": 0, "fetched": 0, "failed": 0, "unused": 0}
+    seen: set[str] = set()
+
+    for name in artists:
+        key = normalise(name)
+        ov = overrides.get(key)
+        if not ov:
+            continue
+        seen.add(key)
+
+        if ov["ignore"]:
+            cache[name] = {
+                "artist_name": name, "source": "override", "status": "ignored",
+                "mbid": None, "score": None, "matched_name": None,
+                "n_candidates": 0, "tags": [], "note": ov["note"],
+            }
+            stats["ignored"] += 1
+            continue
+
+        prev = cache.get(name)
+        if prev and override_satisfied(prev, ov):
+            stats["pinned"] += 1
+            continue
+        if http is None:            # --report: no network, leave the cache alone
+            continue
+
+        rec = resolve_via_override(http, name, ov["mbid"])
+        rec["note"] = ov["note"]
+        append_cache(rec)
+        cache[name] = rec
+        if rec["status"] == "resolved":
+            stats["fetched"] += 1
+            stats["pinned"] += 1
+        else:
+            stats["failed"] += 1
+
+    stats["unused"] = len(set(overrides) - seen)
+    return stats
 
 
 def load_cache() -> dict[str, dict]:
@@ -347,7 +493,10 @@ def write_outputs(con: duckdb.DuckDBPyConnection, cache: dict[str, dict],
                    w.listening_hours
             FROM artist_resolution r
             LEFT JOIN artist_weight w USING (artist_name)
-            WHERE r.status <> 'resolved' OR r.n_tags = 0
+            -- 'ignored' names were reviewed once and declared not-an-artist.
+            -- Re-listing them is exactly what the override file exists to stop.
+            WHERE r.status <> 'ignored'
+              AND (r.status <> 'resolved' OR r.n_tags = 0)
             ORDER BY w.listening_hours DESC NULLS LAST
         ) TO '{REVIEW_PARQUET}' (FORMAT PARQUET, COMPRESSION ZSTD)"""
     )
@@ -419,7 +568,8 @@ def report(con: duckdb.DuckDBPyConnection) -> None:
         """
         SELECT r.artist_name, r.status, r.matched_name, w.listening_hours
         FROM artist_resolution r LEFT JOIN artist_weight w USING (artist_name)
-        WHERE r.status <> 'resolved' OR r.n_tags = 0
+        WHERE r.status <> 'ignored'
+          AND (r.status <> 'resolved' OR r.n_tags = 0)
         ORDER BY w.listening_hours DESC NULLS LAST LIMIT 20
         """
     ).fetchall()
@@ -429,6 +579,16 @@ def report(con: duckdb.DuckDBPyConnection) -> None:
         near = f"  nearest: {m}" if m else ""
         print(f"   {(h or 0):>6.1f} h  {a[:32]:<32} {st}{near}")
     print(f"\n   full review list -> {REVIEW_PARQUET}")
+
+    n_ignored = q("SELECT count(*) FROM artist_resolution "
+                  "WHERE status = 'ignored'")[0]
+    print(f"\n   To answer any of these by hand, add a row to "
+          f"{config.ARTIST_OVERRIDES_CSV.name}:")
+    print("       artist_name,mbid,note")
+    print("       Wale,ab2528dd-...,the US rapper not the percussionist")
+    print("       Various Artists,IGNORE,not an artist")
+    if n_ignored:
+        print(f"   ({n_ignored:,} name(s) currently suppressed by IGNORE)")
     print("=" * 74)
 
 
@@ -475,10 +635,31 @@ def main() -> None:
     cache = load_cache()
     print(f"Artists to cover: {len(artists):,}   already cached: {len(cache):,}")
 
+    overrides = load_overrides()
+    if overrides:
+        dropped = purge_stale_overrides(cache, overrides)
+        ov_stats = apply_overrides(None if args.report else http,
+                                   artists, cache, overrides)
+        print(
+            f"Overrides: {len(overrides):,} in {config.ARTIST_OVERRIDES_CSV.name} "
+            f"— {ov_stats['pinned']:,} pinned "
+            f"({ov_stats['fetched']:,} newly fetched), "
+            f"{ov_stats['ignored']:,} ignored"
+            + (f", {ov_stats['failed']:,} failed" if ov_stats["failed"] else "")
+            + (f", {dropped:,} stale dropped" if dropped else "")
+            + (f", {ov_stats['unused']:,} match no artist"
+               if ov_stats["unused"] else "")
+        )
+
     if not args.report:
         retry = {"error", "not_found"} if args.retry_errors else {"error"}
+        # An override always wins, so an overridden name is never searched —
+        # including one whose override fetch failed, which retries as an
+        # override on the next run rather than falling back to a guess.
+        overridden = set(overrides)
         todo = [a for a in artists
-                if a not in cache or cache[a].get("status") in retry]
+                if normalise(a) not in overridden
+                and (a not in cache or cache[a].get("status") in retry)]
         if args.limit:
             todo = todo[: args.limit]
 

@@ -1,0 +1,34 @@
+artist_name,mbid,note
+# Copy to artist_overrides.csv and edit. That file is gitignored; this one is not.
+# Lines starting with # are ignored, so every example below is inert until you
+# uncomment it and put a real MBID in.
+#
+# Stage 2 never guesses: a name that does not match a MusicBrainz artist exactly
+# lands on the review list instead. This file is how you answer it by hand.
+#
+# COLUMNS
+#   artist_name   the name as it appears in your export. Matched loosely on
+#                 accents/case/stylisation - "A$AP Rocky" here matches "ASAP Rocky".
+#   mbid          a MusicBrainz artist UUID (8-4-4-4-12 hex) or the literal IGNORE.
+#   note          free text for your own benefit. Never read by the code.
+#
+# FINDING AN MBID
+#   Search https://musicbrainz.org/search?type=artist and take the UUID out of
+#   the artist page URL: musicbrainz.org/artist/<MBID> - everything after the
+#   last slash. A wrong-looking value is rejected with a warning rather than
+#   silently pinned.
+#
+# WHICH ONES ARE WORTH FIXING
+#   Run: .venv/bin/python enrich.py --report
+#   It prints the review list ranked by listening time. Fix the top few. An
+#   artist you played twice is not worth the lookup.
+#
+# Changes take effect on the next enrich.py run. Delete a row to un-pin an
+# artist and send it back through normal resolution.
+#
+# --- corrections: pin a name to one specific artist ---
+# Wale,00000000-0000-0000-0000-000000000000,the US rapper not the percussionist
+#
+# --- suppressions: not an artist, stop listing it ---
+# Various Artists,IGNORE,compilation placeholder
+# Unknown Artist,IGNORE,export junk

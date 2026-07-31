@@ -243,9 +243,14 @@ records one row per performer with a `credit_type`.
 No weights are stored — Stage 3 decides what a feature is worth at query time, so
 album-artist-only is simply the weight-0 case and stays available.
 
-It only catches features named in the *title*; features living solely in
-Spotify's track metadata stay invisible. This is a floor, not a fix. Run
-`credits.py --review` to eyeball what the regex extracted.
+The regex only catches features named in the *title*; features living solely in
+Spotify's track metadata stay invisible to it. Run `credits.py --review` to
+eyeball what it extracted.
+
+That guesswork is superseded wherever real data exists. If you run the
+[Stage 6 poller](#stage-6--history-poller), every track it sees contributes its
+true performer list, which replaces the parsed credits for all plays of that
+track. The regex is the floor for tracks the poller has never seen.
 
 ### Stage 2 — Genre enrichment
 
@@ -285,6 +290,24 @@ Resolution is strict — an exact normalised match against name or alias, never 
 guess — and everything else lands on a review list you can inspect. Names are
 folded on accents, case and stylisation so `A$AP Rocky` and `ASAP Rocky` collapse
 together.
+
+**Answering the review list.** Refusing to guess is right, but it needs a way to
+hand an answer back. Copy `artist_overrides.example.csv` to
+`artist_overrides.csv` and add a row per artist:
+
+```csv
+artist_name,mbid,note
+Dave,<mbid>,UK rapper not Dave Matthews Band
+21 Savage ft. Project Pat,IGNORE,unsplit feature string
+```
+
+An MBID pins that name to that artist and skips the search entirely. `IGNORE`
+marks a name that is not an artist at all — regex artifacts and compilation
+placeholders — so it stops surfacing on every future run. Run `enrich.py
+--report` first: it ranks the review list by listening time, and only the top
+few are worth a lookup. Overrides always win over the cache, take effect on the
+next run, and deleting a row un-pins the artist and sends it back through normal
+resolution. The file is gitignored, since it is a list of artists you listen to.
 
 Judge the result by listening time, not artist count — one unresolved artist you
 play constantly hurts more than a hundred you played once. The author's run
@@ -378,8 +401,19 @@ one thing that needs a Spotify developer app**: create one at
 redirect URI to exactly `http://127.0.0.1:3000`, and put the client ID in `.env`
 as `SPOTIFY_CLIENT_ID`. Nothing else in the pipeline needs credentials.
 
-The endpoint does return real *track* artists, unlike the export, so it's stored —
-a later stage could use it to repair the album-artist flaw properly.
+**It also repairs the export's worst flaw.** The endpoint returns the real
+*track* artists, which the export does not have at all. Stage 1b uses that: any
+track the poller has seen even once gets its true credits applied to **every**
+play of it, including export rows from years earlier. Since you replay tracks,
+one polled listen can fix a decade of misattribution for that track — and the
+poller's answer replaces the title-regex guess outright rather than merging with
+it.
+
+The trade-off is deliberate: credits now depend on poll state as well as the
+export, so historical genre shares shift slightly as the poller learns more
+tracks. The alternative was freezing the export period on known-wrong data
+forever. Both `credits.py` and the `track_credits` table record a
+`credit_source` of `export` or `poller` so you can always see which is which.
 
 ### Stage 7 — Forecast and gaps
 
@@ -434,7 +468,9 @@ and only that stage, needs a developer app.
 
 - `master_metadata_album_artist_name` is the **album** artist, not the track
   artist. On compilations, features and soundtracks it misattributes the play.
-  Stage 1b recovers part of this; per-artist totals remain skewed.
+  Stage 1b recovers part of this from track titles, and the Stage 6 poller
+  repairs it outright for any track it has seen — but per-artist totals for
+  never-polled tracks remain skewed.
 - `ts` is UTC. Monthly buckets are therefore UTC months.
 - Rows from the Video history files that carry a track URI are eligible for
   `plays`, but in practice all are short snippets the 30-second floor removes.

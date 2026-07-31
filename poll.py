@@ -59,6 +59,11 @@ POLLED_PARQUET = config.DATA_DIR / "polled_plays.parquet"
 
 PAGE_LIMIT = 50
 
+# Separator for the track-artist list. ASCII Unit Separator, chosen because no
+# artist name can contain it — any printable delimiter eventually collides with
+# a real name ("Tyler, The Creator", "AC/DC", "Simon & Garfunkel").
+ARTIST_SEP = "\x1f"
+
 
 # --------------------------------------------------------------------------
 # OAuth (Authorization Code with PKCE)
@@ -236,9 +241,12 @@ def to_rows(items: list[dict]) -> list[dict]:
             "track_name": tr.get("name"),
             "album_name": album.get("name"),
             "spotify_track_uri": tr.get("uri"),
-            # The API DOES give real track artists, unlike the export. Kept so a
-            # later stage can use it to repair the album-artist flaw.
-            "track_artists": ", ".join(a["name"] for a in artists) or None,
+            # The API DOES give real track artists, unlike the export. Stage 1b
+            # uses this to repair the album-artist flaw for tracks seen here.
+            # Joined on US (0x1f), NOT ", " — "Tyler, The Creator" contains a
+            # comma and would split into two artists that do not exist. Order is
+            # preserved: Spotify lists the primary performer first.
+            "track_artists": ARTIST_SEP.join(a["name"] for a in artists) or None,
             "reason_start": (it.get("context") or {}).get("type"),
             "reason_end": None,
             "shuffle": None, "skipped": None, "offline": None,

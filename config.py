@@ -32,6 +32,13 @@ DATA_DIR = _path_from_env("SPOTIFY_DATA_DIR", PROJECT_ROOT / "data")
 CACHE_DIR = _path_from_env("SPOTIFY_CACHE_DIR", PROJECT_ROOT / ".cache")
 OUTPUT_DIR = _path_from_env("SPOTIFY_OUTPUT_DIR", PROJECT_ROOT / "output")
 
+# Hand-written answers to Stage 2's review list. Gitignored like the rest of the
+# personal data, since it is a list of artists you listen to; the tracked
+# `artist_overrides.example.csv` documents the format.
+ARTIST_OVERRIDES_CSV = _path_from_env(
+    "SPOTIFY_ARTIST_OVERRIDES", PROJECT_ROOT / "artist_overrides.csv"
+)
+
 PLAYS_RAW_PARQUET = DATA_DIR / "plays_raw.parquet"
 PLAYS_PARQUET = DATA_DIR / "plays.parquet"
 ARTIST_TAGS_PARQUET = DATA_DIR / "artist_tags.parquet"
