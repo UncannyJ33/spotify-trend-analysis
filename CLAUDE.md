@@ -124,6 +124,22 @@ correct.
 - **`track_artists` is joined on `0x1f`, never a printable delimiter.** `", "` splits
   "Tyler, The Creator" into two artists who do not exist; every printable separator eventually
   collides with a real name ("AC/DC", "Simon & Garfunkel"). `poll.ARTIST_SEP` is the one definition.
+- **MusicBrainz tag coverage tracks fame, not your listening, and the gap is measurable.** In this
+  library 100% of artists with 50h+ carry a genre tag, 94% at 10–50h, 86% at 2–10h, 77% at 0.5–2h and
+  64% below that — 331 hours sit on artists that resolved perfectly and contribute nothing to any
+  genre share. Small and independent acts are hit hardest, which is exactly where a listener notices.
+  `artist_overrides.csv`'s optional `tags` column answers it: hand-supplied genres, applied by
+  `enrich.apply_override_tags` AFTER the lookup and the release-group backfill so a human answer beats
+  both. They REPLACE rather than merge (a hand answer exists because the looked-up one was absent or
+  wrong), are never written to the cache so an edit takes effect on the next run, must be canonical
+  MusicBrainz genres or they are refused with a warning, and all carry `OVERRIDE_TAG_COUNT` equally —
+  stating genres is not casting votes. `artist_tags.source` is `override` for these.
+- **A high resolution score is not proof of the right artist.** `Henrik` matched *Henrik Irgens*, a
+  Danish multi-instrumentalist, at score 88 out of 8 candidates, then the release-group backfill hung
+  nine wrong genres on him (ambient, art rock, downtempo, experimental, leftfield…). Mis-resolution is
+  worse than non-resolution: it invents listening in genres the user has never played. When an artist
+  looks wrong, check the *collaborators* — the right Henrik is the one credited beside GRAHAM on the
+  album the user actually played.
 - **The override file outranks the resolution cache, and must keep doing so.** `enrich.py` purges
   cached override answers the CSV no longer backs (`purge_stale_overrides`) before applying it.
   Without that, deleting a row would leave its answer frozen in the append-only cache forever.

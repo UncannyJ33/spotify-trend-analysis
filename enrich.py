@@ -195,12 +195,55 @@ def load_overrides() -> dict[str, dict]:
                 print(f"  ⚠ {path.name} line {lineno}: "
                       f"'{raw}' is neither a UUID nor IGNORE — skipped")
                 continue
+            # Hand-supplied genres, pipe-separated. MusicBrainz coverage falls
+            # off hard for smaller artists — in this library 100% of 50h+
+            # artists carry a genre tag but only 64% of the under-30-minute
+            # ones do — so an artist can resolve perfectly and still contribute
+            # nothing. This is how you answer that, and it is the only way a
+            # genre ever enters this project by hand rather than by lookup.
+            tags = [t.strip() for t in (row.get("tags") or "").split("|") if t.strip()]
             out[normalise(name)] = {
                 "mbid": None if ignore else raw.casefold(),
                 "ignore": ignore,
                 "note": (row.get("note") or "").strip(),
+                "tags": tags,
             }
     return out
+
+
+def apply_override_tags(cache: dict[str, dict], overrides: dict[str, dict],
+                        vocab: set[str]) -> int:
+    """Replace an artist's tags with hand-supplied ones where the file gives them.
+
+    REPLACES rather than merges, for the same reason the poller's credits
+    replace the title regex's: a hand answer exists because the looked-up one
+    was absent or wrong, and merging would keep the thing being corrected.
+
+    These are never written to the resolution cache — like IGNORE rows, they
+    are recomputed on every run, so editing the CSV takes effect immediately
+    instead of being frozen behind an append-only cache entry.
+
+    A tag outside the MusicBrainz genre vocabulary is refused rather than
+    written as a non-genre: hand-tagging is a shortcut around the lookup, not
+    around the vocabulary, and a typo would otherwise sit in the data unnoticed.
+    """
+    applied = 0
+    for name, rec in cache.items():
+        want = (overrides.get(normalise(name)) or {}).get("tags") or []
+        if not want:
+            continue
+        good = [t for t in want if (not vocab) or (t.casefold() in vocab)]
+        for bad in [t for t in want if t not in good]:
+            print(f"  ⚠ {config.ARTIST_OVERRIDES_CSV.name}: '{bad}' is not a "
+                  f"MusicBrainz genre — skipped for {name}")
+        if not good:
+            continue
+        # Equal weight: a person saying "these are the genres" is not casting
+        # votes, so pretending to know relative strength would be invention.
+        rec["tags"] = [{"tag": t, "count": config.OVERRIDE_TAG_COUNT} for t in good]
+        rec["source"] = "override"
+        applied += 1
+    return applied
 
 
 def override_satisfied(rec: dict, ov: dict) -> bool:
@@ -713,6 +756,13 @@ def main() -> None:
                                   flush=True)
                 except KeyboardInterrupt:
                     print("\nInterrupted — progress is cached, re-run to resume.\n")
+
+    # Applied last, so a hand answer beats both the lookup and the
+    # release-group backfill. Not cached — see apply_override_tags.
+    hand = apply_override_tags(cache, overrides, vocab)
+    if hand:
+        print(f"\nHand-tagged {hand} artist(s) from "
+              f"{config.ARTIST_OVERRIDES_CSV.name}")
 
     write_outputs(con, cache, vocab)
     report(con)

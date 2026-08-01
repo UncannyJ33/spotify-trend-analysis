@@ -148,6 +148,13 @@ PLAYLIST_DESCRIPTION_PINNED_TEMPLATE = (
     "Built by spotify-trend-analysis · refreshed {date}"
 )
 
+# Weight given to a genre supplied by hand in artist_overrides.csv. MusicBrainz
+# counts are vote tallies; a person listing an artist's genres is not voting, so
+# every hand tag carries the same weight and the artist's listening time splits
+# evenly across them. Must be >= MIN_TAG_COUNT_FOR_ANCHOR or hand-tagged artists
+# could never anchor a Stage 8 playlist.
+OVERRIDE_TAG_COUNT = 1
+
 # Fields that must never reach a derived artifact.
 DROPPED_FIELDS = ("ip_addr",)
 

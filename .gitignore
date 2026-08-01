@@ -57,3 +57,6 @@ __pycache__/
 
 # Personal Claude overrides stay local.
 .claude/settings.local.json
+
+# Scratch worktrees are separate checkouts, not content of this one.
+.claude/worktrees/

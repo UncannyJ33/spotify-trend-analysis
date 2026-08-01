@@ -575,6 +575,31 @@ missing. The stages are ordered for a reason; run them in sequence.
 heavily-stylised names. Check the time-weighted coverage from `enrich.py --report`
 rather than the raw count; if that number is high, the analysis is sound.
 
+**An artist you like has no genres, so they never show up anywhere.** This is
+the most common real gap, and it isn't random — MusicBrainz coverage tracks
+fame, and your listening doesn't. In the author's library:
+
+| Listening | Artists | Tagged | Untagged hours |
+|-----------|---------|--------|----------------|
+| 50h+ | 11 | 100% | 0 |
+| 10–50h | 67 | 94% | 45 |
+| 2–10h | 245 | 86% | 127 |
+| 0.5–2h | 384 | 77% | 97 |
+| under 0.5h | 1,814 | 64% | 62 |
+
+331 hours sit on artists that resolved perfectly and contribute nothing. Smaller
+and independent acts are hit hardest. Two fixes: add the genres to
+[MusicBrainz](https://musicbrainz.org) — best, since it fixes it for everyone —
+or fill the optional `tags` column in `artist_overrides.csv` for a local answer
+that takes effect on the next `enrich.py` run.
+
+**An artist resolved to the wrong person.** Worse than not resolving, because
+the analysis gains listening in genres you've never played. Check the score in
+`data/artist_resolution.parquet`: anything below 100 with several candidates is
+a guess worth verifying. The reliable tell is collaborators — look up who is
+credited alongside them on an album you actually played. Pin the right MBID in
+`artist_overrides.csv`.
+
 **Streamlit prints an external URL on your public IP.** You dropped
 `--server.address 127.0.0.1`.
 

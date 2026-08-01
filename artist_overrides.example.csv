@@ -1,4 +1,4 @@
-artist_name,mbid,note
+artist_name,mbid,note,tags
 # Copy to artist_overrides.csv and edit. That file is gitignored; this one is not.
 # Lines starting with # are ignored, so every example below is inert until you
 # uncomment it and put a real MBID in.
@@ -11,6 +11,22 @@ artist_name,mbid,note
 #                 accents/case/stylisation - "A$AP Rocky" here matches "ASAP Rocky".
 #   mbid          a MusicBrainz artist UUID (8-4-4-4-12 hex) or the literal IGNORE.
 #   note          free text for your own benefit. Never read by the code.
+#   tags          OPTIONAL. Pipe-separated MusicBrainz genres, supplied by hand
+#                 for an artist MusicBrainz has never tagged. REPLACES whatever
+#                 the lookup found, rather than merging — a hand answer exists
+#                 because the looked-up one was absent or wrong. Every tag must
+#                 be a canonical MusicBrainz genre; anything else is refused
+#                 with a warning rather than written as a non-genre. All hand
+#                 tags carry equal weight: you are stating the genres, not
+#                 casting votes, so the artist's time splits evenly across them.
+#
+# WHY HAND TAGS EXIST
+#   MusicBrainz coverage tracks fame, and your listening does not. In the
+#   author's library 100% of artists with 50h+ carry a genre tag, but only 64%
+#   of those under 30 minutes do — 331 hours sit on artists that resolved
+#   perfectly and contribute nothing. Small and independent acts are hit worst.
+#   Better still: add the genres to MusicBrainz itself, which fixes it for
+#   everyone. This file is the local shortcut when you would rather not.
 #
 # FINDING AN MBID
 #   Search https://musicbrainz.org/search?type=artist and take the UUID out of
@@ -28,6 +44,12 @@ artist_name,mbid,note
 #
 # --- corrections: pin a name to one specific artist ---
 # Wale,00000000-0000-0000-0000-000000000000,the US rapper not the percussionist
+#
+# --- hand-supplied genres for an artist MusicBrainz never tagged ---
+# Some Small Act,00000000-0000-0000-0000-000000000000,MB has them untagged,folk pop|pop rap
+#
+# --- both at once: the wrong artist was matched AND the right one is untagged ---
+# Henrik,00000000-0000-0000-0000-000000000000,was matching a different Henrik,folk pop|pop
 #
 # --- suppressions: not an artist, stop listing it ---
 # Various Artists,IGNORE,compilation placeholder
