@@ -22,6 +22,11 @@ artist_overrides.csv
 # playlist_overrides.example.csv documents the format.
 playlist_overrides.csv
 
+# Your keep/drop calls on the Stage 9 review list — which tracks off your own
+# playlists you want carried over. The tracked consolidate_overrides.example.csv
+# documents the format.
+consolidate_overrides.csv
+
 # ---------------------------------------------------------------------------
 # Private working notes — the original build brief, kept local.
 # ---------------------------------------------------------------------------
