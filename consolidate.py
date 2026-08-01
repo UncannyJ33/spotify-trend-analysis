@@ -474,6 +474,16 @@ def create_and_fill(sp, name: str, uris: list[str], description: str) -> str:
 
     POST /me/playlists, not /users/{uid}/playlists — the per-user endpoints were
     removed in February 2026 and the old path now answers 403.
+
+    `public: False` is sent and cannot be verified. Observed live 2026-07-31: a
+    playlist created with `public: False` reads back `public: true`, and a
+    follow-up `PUT /playlists/{id}` with `{"public": false}` returns 200 with an
+    empty body while the field stays `true`. The user's own hand-made playlists
+    report `public: true` too, so this looks like the long-standing
+    unreliability of that field rather than a real exposure — but the API gives
+    no way to confirm it either way. The Spotify app is the only authority on
+    whether a playlist is actually private. Do not add a retry loop around this;
+    it already returns success.
     """
     created = sp.post("/me/playlists", json={
         "name": name, "public": False, "description": description})
