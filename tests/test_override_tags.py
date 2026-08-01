@@ -93,6 +93,50 @@ enrich.apply_override_tags(
 check("stylised names still match",
       [t["tag"] for t in cache["A$AP Rocky"]["tags"]], ["pop"])
 
+# --------------------------------------------------------------------------
+# A row may supply tags with NO mbid. The artists MusicBrainz serves worst are
+# exactly the ones it cannot resolve either, so demanding an MBID first would
+# lock out the cases hand-tagging exists for.
+# --------------------------------------------------------------------------
+import pathlib
+import tempfile
+
+d = pathlib.Path(tempfile.mkdtemp())
+csv_path = d / "overrides.csv"
+enrich.config.ARTIST_OVERRIDES_CSV = csv_path
+
+csv_path.write_text(
+    "artist_name,mbid,note,tags\n"
+    "NoMbid,,MusicBrainz has no entry at all,drill|hip hop\n"
+    "Pinned,e142ed6b-3b35-40e6-92fc-722bbb497dc1,right artist,pop\n"
+    "BadUuid,not-a-uuid,typo,pop\n"
+    "Suppressed,IGNORE,not an artist,\n"
+    "NothingAtAll,,,\n", encoding="utf-8")
+ov = enrich.load_overrides()
+
+check("tags-only row is kept", enrich.normalise("NoMbid") in ov, True)
+check("tags-only row pins nothing",
+      ov[enrich.normalise("NoMbid")]["mbid"], None)
+check("tags-only row carries its tags",
+      ov[enrich.normalise("NoMbid")]["tags"], ["drill", "hip hop"])
+check("a row with neither mbid nor tags is still skipped",
+      enrich.normalise("NothingAtAll") in ov, False)
+check("IGNORE still suppresses",
+      ov[enrich.normalise("Suppressed")]["ignore"], True)
+check("IGNORE pins nothing either",
+      ov[enrich.normalise("Suppressed")]["mbid"], None)
+check("a malformed MBID is still rejected",
+      enrich.normalise("BadUuid") in ov, False)
+check("a real MBID still pins",
+      ov[enrich.normalise("Pinned")]["mbid"],
+      "e142ed6b-3b35-40e6-92fc-722bbb497dc1")
+
+# A tags-only row must never reach resolve_via_override — there is no MBID to
+# resolve, and passing None would send a null into the MusicBrainz URL.
+check("tags-only row is not mistaken for a pin",
+      ov[enrich.normalise("NoMbid")]["mbid"] is None
+      and not ov[enrich.normalise("NoMbid")]["ignore"], True)
+
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)
 print("all assertions passed")

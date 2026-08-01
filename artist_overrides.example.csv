@@ -48,6 +48,12 @@ artist_name,mbid,note,tags
 # --- hand-supplied genres for an artist MusicBrainz never tagged ---
 # Some Small Act,00000000-0000-0000-0000-000000000000,MB has them untagged,folk pop|pop rap
 #
+# --- genres with NO mbid: MusicBrainz has no entry for them at all ---
+#     Leave the mbid blank. Resolution still runs and still fails; only the
+#     genres are supplied. This is common — the acts MusicBrainz serves worst
+#     are the same ones it cannot resolve.
+# Some Tiny Act,,no MB entry exists,drill|uk drill
+#
 # --- both at once: the wrong artist was matched AND the right one is untagged ---
 # Henrik,00000000-0000-0000-0000-000000000000,was matching a different Henrik,folk pop|pop
 #

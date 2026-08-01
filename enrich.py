@@ -188,10 +188,18 @@ def load_overrides() -> dict[str, dict]:
             raw = (row.get("mbid") or "").strip()
             # Comment rows are skipped before validation — a prose line with a
             # comma in it would otherwise parse as a malformed override.
-            if not name or name.startswith("#") or not raw:
+            if not name or name.startswith("#"):
                 continue
-            ignore = raw.casefold() == "ignore"
-            if not ignore and not MBID_RE.fullmatch(raw):
+            has_tags = bool((row.get("tags") or "").strip())
+            # A row may carry tags with no MBID. The artists worst served by
+            # MusicBrainz are exactly the ones it cannot resolve either, so
+            # requiring an MBID before accepting hand tags would lock out the
+            # very cases hand-tagging exists for. Resolution stays unresolved;
+            # only the genres are supplied.
+            if not raw and not has_tags:
+                continue
+            ignore = raw.casefold() == "ignore" if raw else False
+            if raw and not ignore and not MBID_RE.fullmatch(raw):
                 print(f"  ⚠ {path.name} line {lineno}: "
                       f"'{raw}' is neither a UUID nor IGNORE — skipped")
                 continue
@@ -203,7 +211,9 @@ def load_overrides() -> dict[str, dict]:
             # genre ever enters this project by hand rather than by lookup.
             tags = [t.strip() for t in (row.get("tags") or "").split("|") if t.strip()]
             out[normalise(name)] = {
-                "mbid": None if ignore else raw.casefold(),
+                # None for both IGNORE and a tags-only row: neither pins an
+                # artist, so neither may reach resolve_via_override.
+                "mbid": raw.casefold() if (raw and not ignore) else None,
                 "ignore": ignore,
                 "note": (row.get("note") or "").strip(),
                 "tags": tags,
@@ -302,7 +312,8 @@ def apply_overrides(http: Throttled | None, artists: list[str],
     entries do cost a request, so those are cached and re-fetched only when the
     file changes.
     """
-    stats = {"ignored": 0, "pinned": 0, "fetched": 0, "failed": 0, "unused": 0}
+    stats = {"ignored": 0, "pinned": 0, "fetched": 0, "failed": 0, "unused": 0,
+             "tags_only": 0}
     seen: set[str] = set()
 
     for name in artists:
@@ -319,6 +330,14 @@ def apply_overrides(http: Throttled | None, artists: list[str],
                 "n_candidates": 0, "tags": [], "note": ov["note"],
             }
             stats["ignored"] += 1
+            continue
+
+        if ov["mbid"] is None:
+            # A tags-only row. It says nothing about WHICH artist this is, so
+            # resolution is left to run (or fail) exactly as it would without
+            # the file; only the genres are supplied, later, by
+            # apply_override_tags. Nothing is pinned and nothing is cached.
+            stats["tags_only"] += 1
             continue
 
         prev = cache.get(name)
