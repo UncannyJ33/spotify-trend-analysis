@@ -23,15 +23,26 @@ CREATE TABLE plays AS SELECT * FROM (VALUES
   -- library artist with no dubstep tag: must not anchor dubstep
   ('Drake',      'Passionfruit', 'uri:pass',  9000.0, DATE '2026-06-01'),
   -- a podcast row: no track uri, must never reach a playlist
-  ('Some Show',  'Episode 12',   NULL,        9999.0, DATE '2026-06-01')
+  ('Some Show',  'Episode 12',   NULL,        9999.0, DATE '2026-06-01'),
+  -- carries `dubstep` only at tag_count 0: must not anchor
+  ('Fake Dubstep Act', 'Not Really', 'uri:fake', 8000.0, DATE '2026-06-01'),
+  -- the indie blend: two artists, one tag each
+  ('Folkie',     'Quiet Song',   'uri:folk',  1000.0, DATE '2026-06-01'),
+  ('Popper',     'Bright Song',  'uri:pop',   2000.0, DATE '2026-06-01')
 ) t(artist_name, track_name, spotify_track_uri, played_seconds, month)""")
 con.execute("""
 CREATE TABLE artist_tags AS SELECT * FROM (VALUES
-  ('Subtronics', 'dubstep', TRUE), ('Excision', 'dubstep', TRUE),
-  ('Drake', 'hip hop', TRUE),
+  ('Subtronics', 'dubstep', 5, TRUE), ('Excision', 'dubstep', 3, TRUE),
+  ('Drake', 'hip hop', 4, TRUE),
   -- a non-genre tag must not qualify an artist as serving the gap
-  ('Some Show', 'dubstep', FALSE)
-) t(artist_name, tag, is_genre)""")
+  ('Some Show', 'dubstep', 9, FALSE),
+  -- downvoted to zero: MusicBrainz counts go negative and Stage 2 clamps them,
+  -- so 0 means nobody stands behind this tag. REAPER anchored a heavy metal
+  -- playlist on exactly this. It must not qualify as an anchor.
+  ('Fake Dubstep Act', 'dubstep', 0, TRUE),
+  -- a blend member, for the multi-tag anchor test
+  ('Folkie', 'indie folk', 2, TRUE), ('Popper', 'indie pop', 2, TRUE)
+) t(artist_name, tag, tag_count, is_genre)""")
 con.execute("""
 CREATE TABLE recommendations AS SELECT * FROM (VALUES
   ('Virtual Riot', 'mbid-vr', 0.9), ('SVDDEN DEATH', 'mbid-sd', 0.8),
@@ -57,7 +68,7 @@ gaps = playlists.select_gaps(con)
 check("gaps capped at N_PLAYLISTS", len(gaps), 4)
 check("gaps ordered by score", [g["tag"] for g in gaps][:2], ["dubstep", "classical"])
 
-anchors = playlists.select_anchor_tracks(con, "dubstep")
+anchors = playlists.select_anchor_tracks(con, ["dubstep"])
 check("anchor cap respected", len(anchors) <= playlists.config.ANCHOR_TRACKS, True)
 check("per-artist cap: Subtronics contributes 2 not 3",
       sum(1 for a in anchors if a["artist_name"] == "Subtronics"), 2)
@@ -68,12 +79,32 @@ check("untagged-artist track excluded",
 check("non-genre tag does not qualify an artist",
       any(a["artist_name"] == "Some Show" for a in anchors), False)
 check("ranked by recent hours", anchors[0]["spotify_track_uri"], "uri:griz")
+check("downvoted-to-zero tag does not qualify an anchor",
+      any(a["artist_name"] == "Fake Dubstep Act" for a in anchors), False)
 
-cands = playlists.select_candidates(con, "dubstep", TAG_CACHE)
+# A blended playlist draws anchors from every tag it names.
+blend = playlists.select_anchor_tracks(con, ["indie pop", "indie folk"])
+check("blend pulls anchors from both tags",
+      sorted(a["artist_name"] for a in blend), ["Folkie", "Popper"])
+check("blend ranks across the whole blend, not per tag",
+      blend[0]["artist_name"], "Popper")
+check("empty tag list yields no anchors",
+      playlists.select_anchor_tracks(con, []), [])
+
+cands = playlists.select_candidates(con, ["dubstep"], TAG_CACHE)
 check("gap-tag filter applied", [c["artist_name"] for c in cands],
       ["Virtual Riot", "SVDDEN DEATH"])
 check("library artist excluded from discovery",
       any(c["artist_name"] == "Subtronics" for c in cands), False)
+
+# Candidates qualify on ANY tag in the blend, and appear once even if several.
+multi = playlists.select_candidates(con, ["dubstep", "ambient"], TAG_CACHE)
+check("blend widens the candidate pool",
+      [c["artist_name"] for c in multi],
+      ["Virtual Riot", "SVDDEN DEATH", "Boring Artist"])
+both = playlists.select_candidates(con, ["dubstep", "metal"], TAG_CACHE)
+check("an artist matching two tags of the blend appears once",
+      [c["artist_name"] for c in both], ["Virtual Riot", "SVDDEN DEATH"])
 
 tracks = playlists.assemble(
     anchors=[{"spotify_track_uri": f"uri:a{i}"} for i in range(3)],

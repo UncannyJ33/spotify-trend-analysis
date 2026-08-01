@@ -136,7 +136,7 @@ operation.
 | 5. Recommend | `python recommend.py` (`--lambda N`, `--top N`) | `data/recommendations.parquet` |
 | 6. Poll | `python poll.py` (`--status`, `--logout`) | `data/polled_plays.parquet` |
 | 7. Forecast | `python forecast.py` (`--horizon N`) | `data/forecast.parquet`, `data/genre_gaps.parquet` |
-| 8. Playlists | `python playlists.py` (`--dry-run`) | 4 private Spotify playlists + `data/playlists.parquet` |
+| 8. Playlists | `python playlists.py` (`--dry-run`) | 4 Spotify playlists + `data/playlists.parquet` |
 
 All prefixed with `.venv/bin/`. Stages 2, 5 and 6 use the network; the rest are local.
 
@@ -431,15 +431,52 @@ hard threshold either admits everything or nothing.
 
 ### Stage 8 — Gap playlists
 
-Turns the gap analysis into something you can press play on: one private
-playlist per top gap genre, capped at four.
+Turns the gap analysis into something you can press play on: one playlist per
+top gap genre, capped at four.
+
+**`playlist_overrides.csv` overrules the ranking when you need it to.** The gap
+ranking answers "where is your listening heading", weighted by seconds — and
+seconds are dominated by whatever plays during a workout, where music is a
+metronome rather than a choice. The export records no activity type at all
+(platform is 95% mobile either way; `reason_start` can't separate a restless
+desk session from a skip-heavy run), so no amount of analysis recovers the
+difference. This file is where a human supplies what the data does not contain,
+exactly as `artist_overrides.csv` answers Stage 2's review list. It's gitignored
+— it's a statement of taste — with a tracked `playlist_overrides.example.csv`
+documenting the format:
+
+```csv
+label,tags
+shoegaze,shoegaze|dream pop
+ambient,ambient|drone|field recording
+```
+
+`tags` is pipe-separated and an artist qualifies by carrying any of them, so a
+playlist can span related genres. That does two jobs: it blends genres that only
+make sense apart from each other, and it rescues a genre whose candidate pool is
+too thin to fill `PLAYLIST_SIZE` on its own. In the author's data one gap genre
+had just 6 candidate artists — a hard ceiling of 16 tracks at two per artist —
+and widening it to four neighbouring genres took it to 18 artists and a full
+playlist. Widening beats raising `TRACKS_PER_ARTIST`, which just lets one act
+take four of your twenty-five slots.
+
+A label that is a genre in `genre_gaps.parquet` keeps its trend numbers and is
+described as rising. Any other label is **pinned** and says so in its
+description, because several genres worth pinning are ones the history says
+you're moving away from — claiming they're rising would be a lie the playlist
+tells its owner every time they open it.
 
 Each is **anchored discovery**. Around five tracks are your own recent
 favourites by library artists who serve that genre — familiar ground, and their
-URIs come free from the export, so no lookup is needed. The rest are strangers,
-drawn from Stage 5's candidates. The anchors are spread at even intervals rather
-than stacked at the front: five songs you know followed by twenty you don't
-reads as two playlists stapled together.
+URIs come free from the export, so no lookup is needed. An anchor artist must
+carry the genre with a MusicBrainz tag count of at least
+`MIN_TAG_COUNT_FOR_ANCHOR`: counts go negative on downvotes and Stage 2 clamps
+them to zero, so a zero means nobody stands behind that tag. Without the floor,
+an electronic act carrying a metal tag at count 0 anchored a metal playlist.
+
+The rest are strangers, drawn from Stage 5's candidates. The anchors are spread
+at even intervals rather than stacked at the front: five songs you know followed
+by twenty you don't reads as two playlists stapled together.
 
 Two sources split the judgment, and neither could do the job alone:
 
@@ -485,9 +522,24 @@ contain, writing nothing.
 > search `limit` now maxes out at 10 rather than 50, and tracks no longer carry
 > a `popularity` field — which is why the ordering leans on search relevance.
 
+> **Spotify ignores `public: false`, and these playlists are link-readable.**
+> Playlists are created with `"public": false` and Spotify reports `public: true`
+> anyway; a subsequent `PUT` of `public: false` returns 200 and changes nothing.
+> They do *not* appear on the server-rendered public profile page, but fetching
+> `open.spotify.com/playlist/{id}` unauthenticated does return the title — as it
+> does for any Spotify playlist, since all of them are reachable by direct link.
+> If it matters to you, set the visibility in the Spotify client, which exposes
+> a toggle the API currently does not honour. Nothing else in this project puts
+> your listening history anywhere but your own disk; this one stage necessarily
+> writes to Spotify, so it's worth knowing exactly what that means.
+
 Shares the Stage 6 developer app and PKCE flow, asking for two extra scopes.
 Re-consent takes the union of what was granted and what is needed, so widening
 for playlists never strips the poller's access or vice versa.
+
+Dropping a genre from the override file stops Stage 8 updating that playlist; it
+does **not** delete it, because this stage has no delete path at all. Orphaned
+playlists stay in your library until you remove them yourself.
 
 ## Tuning it
 

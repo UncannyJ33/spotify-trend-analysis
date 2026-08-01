@@ -17,6 +17,11 @@ output/
 # listen to. The tracked artist_overrides.example.csv documents the format.
 artist_overrides.csv
 
+# Which genres you want playlists for — a statement of personal taste, and one
+# that deliberately departs from what the trend analysis found. The tracked
+# playlist_overrides.example.csv documents the format.
+playlist_overrides.csv
+
 # ---------------------------------------------------------------------------
 # Private working notes — the original build brief, kept local.
 # ---------------------------------------------------------------------------

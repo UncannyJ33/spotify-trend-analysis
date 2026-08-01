@@ -27,7 +27,7 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python forecast.py --horizon 12  # Stage 7  → data/forecast.parquet, data/genre_gaps.parquet
 .venv/bin/python report.py --open          # Stage 4b → output/report.html
 .venv/bin/python playlists.py --dry-run    # Stage 8 preview — no Spotify writes
-.venv/bin/python playlists.py              # Stage 8 → 4 private playlists + data/playlists.parquet
+.venv/bin/python playlists.py              # Stage 8 → 4 playlists + data/playlists.parquet
 ```
 
 Run 1 → 1b → 2 → 3 in order; 4–8 consume Stage 3's output (Stage 8 also needs
@@ -70,11 +70,18 @@ attribution without recomputing anything. Every consumer must filter on `variant
 figure and taking `mode="light"|"dark"`. `app.py` and `report.py` both import it. Do not write chart
 code in either renderer.
 
-**Two places accept a human answer, and both are files rather than code.** `artist_overrides.csv`
+**Three places accept a human answer, and all are files rather than code.** `artist_overrides.csv`
 answers Stage 2's review list (name → MBID, or `IGNORE` for things that were never artists);
-`.env` carries `SPOTIFY_CLIENT_ID` for the poller. Both are gitignored with a tracked
-`*.example.*` alongside documenting the format. When adding another, follow that pattern rather than
-introducing a config format.
+`playlist_overrides.csv` answers Stage 8's "which genres deserve a playlist"; `.env` carries
+`SPOTIFY_CLIENT_ID` for the poller and Stage 8. All are gitignored with a tracked `*.example.*`
+alongside documenting the format. When adding another, follow that pattern rather than introducing
+a config format.
+
+`playlist_overrides.csv` exists because the gap ranking weights by seconds listened, and seconds are
+dominated by workout listening, where music is functional rather than chosen. The export records no
+activity type — `platform` is ~95% mobile either way and `reason_start` cannot separate a restless
+desk session from a skip-heavy run — so this is genuinely unrecoverable from the data, not a
+modelling gap to close later. Do not try to infer listening mode; ask.
 
 **Credits have two sources and the better one wins per track.** `track_credits.credit_source` is
 `poller` where Stage 6 has seen the track and supplied its true performer list, `export` where only
@@ -143,6 +150,20 @@ correct.
   which recordings are on-genre. MusicBrainz's own ordering is Lucene relevance and is useless for
   ranking — ask it for Aphex Twin's techno and a SAW:II bootleg fragment comes first. `choose_tracks`
   applies the genre flag as a *stable* sort key so relevance survives inside each group.
+- **Anchors gate on `tag_count`, candidates do not.** `MIN_TAG_COUNT_FOR_ANCHOR` keeps an artist out
+  of a playlist unless MusicBrainz shows real community support for that genre. Counts go negative on
+  downvotes and Stage 2 clamps them at 0, so 0 means "nobody stands behind this" — REAPER carries
+  `heavy metal` at 0 and anchored a metal playlist on it. The floor costs ~5% of genre rows (531 of
+  9,943, across 245 artists), which is the price of not putting a track the listener already knows
+  into a genre it does not belong to.
+- **A playlist spec's `tags` is a list, and every consumer must treat it as one.** `select_anchor_tracks`
+  semi-joins so an artist carrying three of the tags stays one artist rather than three copies of its
+  listening time; `mb_genre_recordings` sends one Lucene `OR` rather than one request per tag, and
+  sorts the tags into its cache key so `a|b` and `b|a` do not fork the cache.
+- **`public: false` does not work, and Stage 8's playlists are link-readable.** Spotify accepts the
+  field on create, reports `public: true` regardless, and a later `PUT {"public": false}` returns 200
+  without changing it. They stay off the server-rendered public profile page, but any playlist is
+  fetchable by direct link. Do not claim these playlists are private in docs or descriptions.
 - **Dedupe tracks on the folded title, not the URI.** Spotify presses the album cut, the single and
   the remaster as three distinct URIs, so URI-dedupe alone gives one artist's two slots to the same
   song — the first dry run produced "Papa Roach — Last Resort" twice. `_title_key` drops everything

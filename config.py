@@ -114,12 +114,36 @@ ANCHOR_TRACKS = 5          # familiar tracks from library artists serving the ga
 TRACKS_PER_ARTIST = 2      # one act must not own a playlist
 ANCHOR_WINDOW_MONTHS = 18  # anchors ranked on recent listening, like SEED_WINDOW_MONTHS
 
+# Which playlists to build, when the gap ranking is not the right answer. Same
+# split as .env and artist_overrides.csv: the real file is gitignored because it
+# is a statement of personal taste, and the tracked *.example.csv documents the
+# format. Absent, Stage 8 falls back to the top N_PLAYLISTS gap genres.
+PLAYLIST_OVERRIDES_CSV = _path_from_env(
+    "SPOTIFY_PLAYLIST_OVERRIDES", PROJECT_ROOT / "playlist_overrides.csv"
+)
+
+# An anchor artist must carry the genre with at least this much community
+# support. MusicBrainz tag counts go negative on downvotes and Stage 2 clamps
+# them at 0, so a 0 means "nobody stands behind this tag" — REAPER carries
+# `heavy metal` at 0 and anchored a metal playlist on the strength of it.
+# Candidates are unaffected; this gates anchors only, where a wrong genre is
+# most visible because the listener already knows the track.
+MIN_TAG_COUNT_FOR_ANCHOR = 1
+
 # The title marker is for the user's eyes in their own library: anything
 # carrying it is pipeline-managed and safe to regenerate; anything without it
 # is hand-made and must never be touched.
 PLAYLIST_NAME_TEMPLATE = "{genre} frontier · Claude"
 PLAYLIST_DESCRIPTION_TEMPLATE = (
     "Rising, under-explored genre in your listening: {genre}. "
+    "A few anchors you know, the rest neighbours you don't. "
+    "Built by spotify-trend-analysis · refreshed {date}"
+)
+# Pinned genres are a personal choice, not a trend finding — several are
+# actively declining in the history. Saying "rising" about them would be a
+# lie the playlist tells its own owner every time they open it.
+PLAYLIST_DESCRIPTION_PINNED_TEMPLATE = (
+    "{genre} — a genre you asked for rather than one the trend analysis found. "
     "A few anchors you know, the rest neighbours you don't. "
     "Built by spotify-trend-analysis · refreshed {date}"
 )

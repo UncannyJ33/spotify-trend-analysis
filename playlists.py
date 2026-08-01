@@ -29,6 +29,7 @@ library. This stage never deletes or unfollows a playlist.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import time
@@ -92,41 +93,63 @@ FORBIDDEN_NOTE = """
 # --------------------------------------------------------------------------
 
 
-def select_gaps(con: duckdb.DuckDBPyConnection) -> list[dict]:
-    """Top gap genres, hard-capped at N_PLAYLISTS by agreement."""
+def select_gaps(con: duckdb.DuckDBPyConnection, limit: int | None = -1) -> list[dict]:
+    """Top gap genres, hard-capped at N_PLAYLISTS by agreement.
+
+    `limit=None` returns the whole table, which the override loader uses to
+    look up trend numbers for a label it did not choose.
+    """
+    n = config.N_PLAYLISTS if limit == -1 else limit
     cols = ["tag", "gap_score", "hours", "n_artists", "rel_change_per_year"]
     rows = con.execute(
         f"""
         SELECT {', '.join(cols)} FROM genre_gaps
         ORDER BY gap_score DESC
-        LIMIT {config.N_PLAYLISTS}
+        {'' if n is None else f'LIMIT {n}'}
         """
     ).fetchall()
     return [dict(zip(cols, r)) for r in rows]
 
 
-def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tag: str) -> list[dict]:
-    """The listener's own recent favourites by artists serving this genre.
+def select_anchor_tracks(con: duckdb.DuckDBPyConnection,
+                         tags: list[str]) -> list[dict]:
+    """The listener's own recent favourites by artists serving these genres.
 
-    Anchors are chosen at artist level (the artist carries the gap tag) and at
-    track level by the listener's own recent play time — their URIs come
-    straight from the export, so no search is ever needed for anchors.
-    Recording-level genre matching is NOT attempted here: library tracks have
-    no recording MBIDs, and resolving them is the per-track explosion this
-    project has twice declined.
+    `tags` is a list because a playlist may span several related genres — an
+    indie playlist wants indie pop and indie folk together, and a bass one
+    wants dubstep alongside its neighbours. The artist qualifies if it carries
+    ANY of them, matched by a semi-join so an artist carrying three of the
+    tags is still one artist rather than three copies of its listening time.
+
+    Anchors are chosen at artist level and at track level by the listener's own
+    recent play time — their URIs come straight from the export, so no search
+    is ever needed for anchors. Recording-level genre matching is NOT attempted
+    here: library tracks have no recording MBIDs, and resolving them is the
+    per-track explosion this project has twice declined.
+
+    MIN_TAG_COUNT_FOR_ANCHOR gates on community support. A tag clamped to 0 is
+    one nobody stands behind, and it used to be enough to anchor a playlist.
     """
+    if not tags:
+        return []
     cols = ["artist_name", "track_name", "spotify_track_uri", "hours"]
+    placeholders = ", ".join("?" for _ in tags)
     rows = con.execute(
         f"""
         WITH recent AS (
             SELECT p.artist_name, p.track_name, p.spotify_track_uri,
                    sum(p.played_seconds) / 3600.0 AS hours
             FROM plays p
-            JOIN artist_tags t
-              ON t.artist_name = p.artist_name AND t.is_genre AND t.tag = ?
             WHERE p.spotify_track_uri IS NOT NULL
               AND p.month >= (SELECT max(month) FROM plays)
                              - INTERVAL {config.ANCHOR_WINDOW_MONTHS} MONTH
+              AND EXISTS (
+                  SELECT 1 FROM artist_tags t
+                  WHERE t.artist_name = p.artist_name
+                    AND t.is_genre
+                    AND t.tag_count >= {config.MIN_TAG_COUNT_FOR_ANCHOR}
+                    AND t.tag IN ({placeholders})
+              )
             GROUP BY 1, 2, 3
         )
         SELECT artist_name, track_name, spotify_track_uri, hours
@@ -137,18 +160,19 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tag: str) -> list[dict]
         ORDER BY hours DESC, spotify_track_uri
         LIMIT {config.ANCHOR_TRACKS}
         """,
-        [tag],
+        list(tags),
     ).fetchall()
     return [dict(zip(cols, r)) for r in rows]
 
 
-def select_candidates(con: duckdb.DuckDBPyConnection, tag: str,
+def select_candidates(con: duckdb.DuckDBPyConnection, tags: list[str],
                       tag_cache: dict) -> list[dict]:
-    """Stage 5 candidates whose tag vector serves this gap, best score first.
+    """Stage 5 candidates whose tag vector serves any of these genres.
 
     Library artists are excluded by normalised name: the discovery slots are
     for strangers, and the familiar ones already have the anchor slots.
     """
+    wanted = set(tags)
     known = {normalise(r[0]) for r in con.execute(
         "SELECT DISTINCT artist_name FROM plays WHERE artist_name IS NOT NULL"
     ).fetchall()}
@@ -159,10 +183,47 @@ def select_candidates(con: duckdb.DuckDBPyConnection, tag: str,
     for name, mbid, score in rows:
         if normalise(name) in known:
             continue
-        tags = {t["tag"] for t in (tag_cache.get(mbid) or {}).get("tags", [])}
-        if tag in tags:
+        got = {t["tag"] for t in (tag_cache.get(mbid) or {}).get("tags", [])}
+        if got & wanted:
             out.append({"artist_name": name, "mbid": mbid, "score": score})
     return out
+
+
+def load_playlist_specs(con: duckdb.DuckDBPyConnection) -> list[dict]:
+    """What playlists to build: the override file if present, else the gaps.
+
+    The override exists because the gap ranking answers "where is your
+    listening heading", weighted by seconds — and seconds are dominated by
+    whatever plays during a workout, where music is a metronome rather than a
+    choice. The export records no activity, so it cannot tell functional
+    listening from attentive listening, and no amount of analysis recovers it.
+    The file is where a human supplies what the data does not contain, exactly
+    as artist_overrides.csv answers Stage 2's review list.
+
+    A label that IS a gap genre keeps its trend numbers and its description;
+    one that is not is marked pinned, and says so rather than claiming to be
+    rising when the history says it is falling.
+    """
+    gaps = {g["tag"]: g for g in select_gaps(con, limit=None)}
+    if not config.PLAYLIST_OVERRIDES_CSV.exists():
+        return [{"label": g["tag"], "tags": [g["tag"]], "pinned": False, "gap": g}
+                for g in select_gaps(con)]
+
+    specs = []
+    with config.PLAYLIST_OVERRIDES_CSV.open(encoding="utf-8-sig", newline="") as fh:
+        for row in csv.DictReader(fh):
+            label = (row.get("label") or "").strip()
+            raw = (row.get("tags") or "").strip()
+            if not label or label.startswith("#"):
+                continue
+            tags = [t.strip() for t in raw.split("|") if t.strip()] or [label]
+            specs.append({"label": label, "tags": tags,
+                          "pinned": label not in gaps, "gap": gaps.get(label)})
+    if len(specs) > config.N_PLAYLISTS:
+        print(f"  ! {config.PLAYLIST_OVERRIDES_CSV.name} lists {len(specs)} "
+              f"playlists; N_PLAYLISTS caps at {config.N_PLAYLISTS} — using the "
+              f"first {config.N_PLAYLISTS}")
+    return specs[:config.N_PLAYLISTS]
 
 
 def assemble(anchors: list[dict], discovery: list[dict], size: int) -> list[dict]:
@@ -231,9 +292,9 @@ def _title_key(name: str) -> str:
     return normalise(head) or normalise(name or "")
 
 
-def mb_genre_recordings(http: Throttled, artist_mbid: str, tag: str,
+def mb_genre_recordings(http: Throttled, artist_mbid: str, tags: list[str],
                         cache: dict) -> set[str]:
-    """Folded titles of this artist's recordings tagged with `tag`.
+    """Folded titles of this artist's recordings tagged with any of `tags`.
 
     One request answers "which of their work is dubstep". What it cannot answer
     is which of it is any good — MusicBrainz orders by Lucene relevance, so
@@ -241,26 +302,33 @@ def mb_genre_recordings(http: Throttled, artist_mbid: str, tag: str,
     with a SAW:II fragment). That is why this is a PREFERENCE SET applied over
     Spotify's relevance order, never an ordering in its own right.
 
+    Several tags go in one request as a Lucene OR, so a blended playlist costs
+    the same single lookup per artist as a single-genre one.
+
     An empty ANSWER is cached like any other: "nobody tagged this artist's
     recordings dubstep" is a fact, not something to re-ask every run. A failed
     REQUEST is not cached — that is a missing answer, and caching it would
     freeze a transient 503 into a permanent "this artist has nothing".
     """
-    key = f"{artist_mbid}::{tag}"
+    tags = sorted(set(tags))
+    if not tags:
+        return set()
+    key = f"{artist_mbid}::{'|'.join(tags)}"
     if key in cache:
         return set(cache[key]["titles"])
+    clause = " OR ".join(f'tag:"{t}"' for t in tags)
     r = http.get(MB_RECORDING_URL, params={
-        "query": f'arid:{artist_mbid} AND tag:"{tag}"',
+        "query": f"arid:{artist_mbid} AND ({clause})",
         "fmt": "json", "limit": MB_RECORDING_LIMIT,
     })
     if r is None or r.status_code != 200:
-        print(f"    ! MusicBrainz gave no answer for {tag} recordings "
+        print(f"    ! MusicBrainz gave no answer for {'/'.join(tags)} recordings "
               f"({'no response' if r is None else r.status_code}); "
               f"treating as unknown, not as empty")
         return set()
     titles = {k for k in (_title_key(rec.get("title", ""))
                           for rec in r.json().get("recordings", [])) if k}
-    rec = {"key": key, "artist_mbid": artist_mbid, "tag": tag,
+    rec = {"key": key, "artist_mbid": artist_mbid, "tags": tags,
            "titles": sorted(titles)}
     append_jsonl(GENRE_RECORDINGS_CACHE, rec)
     cache[key] = rec
@@ -544,15 +612,17 @@ def build_selections(con, http, sp) -> list[dict]:
     artist_tracks_cache = load_jsonl(ARTIST_TRACKS_CACHE, "key")
 
     out = []
-    for gap in select_gaps(con):
-        tag = gap["tag"]
-        print(f"\n{pretty(tag)} — {gap['n_artists']} artists, {gap['hours']:.0f} h")
-        anchors = select_anchor_tracks(con, tag)
+    for spec in load_playlist_specs(con):
+        tags = spec["tags"]
+        blend = "" if tags == [spec["label"]] else f"  [{' + '.join(tags)}]"
+        print(f"\n{pretty(spec['label'])}"
+              f"{' (pinned)' if spec['pinned'] else ''}{blend}")
+        anchors = select_anchor_tracks(con, tags)
         print(f"  {len(anchors)} anchors from your own listening")
 
         seen_uris = {a["spotify_track_uri"] for a in anchors}
-        candidates = select_candidates(con, tag, tag_cache)
-        print(f"  {len(candidates)} candidate artists carry this genre")
+        candidates = select_candidates(con, tags, tag_cache)
+        print(f"  {len(candidates)} candidate artists carry these genres")
 
         discovery: list[dict] = []
         for cand in candidates:
@@ -561,7 +631,7 @@ def build_selections(con, http, sp) -> list[dict]:
             tracks = sp_artist_tracks(sp, cand["artist_name"], artist_tracks_cache)
             if not tracks:
                 continue
-            on_genre = mb_genre_recordings(http, cand["mbid"], tag, genre_rec_cache)
+            on_genre = mb_genre_recordings(http, cand["mbid"], tags, genre_rec_cache)
             for chosen in choose_tracks(tracks, on_genre, config.TRACKS_PER_ARTIST):
                 if chosen["spotify_track_uri"] in seen_uris:
                     continue
@@ -571,7 +641,7 @@ def build_selections(con, http, sp) -> list[dict]:
         matched = sum(1 for d in discovery if d.get("genre_matched"))
         print(f"  {len(discovery)} discovery tracks "
               f"({matched} matched on recording-level tags)")
-        out.append({"gap": gap,
+        out.append({"spec": spec,
                     "tracks": assemble(anchors, discovery, config.PLAYLIST_SIZE)})
     return out
 
@@ -610,7 +680,8 @@ def main() -> None:
     state = load_state()
     archive_rows = []
     for sel in selections:
-        tag = sel["gap"]["tag"]
+        spec = sel["spec"]
+        tag = spec["label"]
         name = config.PLAYLIST_NAME_TEMPLATE.format(genre=pretty(tag))
         if not sel["tracks"]:
             print(f"  ⚠ nothing selected for '{name}' — leaving it untouched")
@@ -633,10 +704,11 @@ def main() -> None:
             if isinstance(resp, dict) and resp.get("_status") == 403:
                 raise SystemExit(FORBIDDEN_NOTE)
             continue
+        template = (config.PLAYLIST_DESCRIPTION_PINNED_TEMPLATE if spec["pinned"]
+                    else config.PLAYLIST_DESCRIPTION_TEMPLATE)
         sp.put(f"/playlists/{pid}", json={
             "name": name,
-            "description": config.PLAYLIST_DESCRIPTION_TEMPLATE.format(
-                genre=pretty(tag), date=today),
+            "description": template.format(genre=pretty(tag), date=today),
         })
         state[tag] = {"id": pid, "name": name}
         sel["playlist_id"] = pid
@@ -660,13 +732,19 @@ def report(selections: list[dict], dry: bool) -> None:
     print(f"STAGE 8 — GAP PLAYLISTS {'(dry run — nothing written)' if dry else ''}")
     print("=" * 74)
     for sel in selections:
-        g = sel["gap"]
+        spec = sel["spec"]
+        g = spec.get("gap")
         n_anchor = sum(1 for t in sel["tracks"] if t["slot"] == "anchor")
         n_disc = len(sel["tracks"]) - n_anchor
         n_matched = sum(1 for t in sel["tracks"] if t.get("genre_matched"))
-        print(f"\n{config.PLAYLIST_NAME_TEMPLATE.format(genre=pretty(g['tag']))}")
-        print(f"  gap: {g['n_artists']} artists, {g['hours']:.0f} h, "
-              f"{100 * g['rel_change_per_year']:+.0f}%/yr")
+        print(f"\n{config.PLAYLIST_NAME_TEMPLATE.format(genre=pretty(spec['label']))}")
+        if spec["tags"] != [spec["label"]]:
+            print(f"  blend: {' + '.join(spec['tags'])}")
+        if g:
+            print(f"  gap: {g['n_artists']} artists, {g['hours']:.0f} h, "
+                  f"{100 * g['rel_change_per_year']:+.0f}%/yr")
+        else:
+            print("  pinned: your choice, not a trend finding")
         print(f"  {len(sel['tracks'])} tracks — {n_anchor} anchors, {n_disc} "
               f"discovery ({n_matched} matched on recording-level tags)")
         if sel.get("playlist_id"):

@@ -134,33 +134,51 @@ http = FakeHttp({"recordings": [{"title": "Neon Angel"},
                                 {"title": "Energy Drink (VIP)"},
                                 {"title": ""}]})
 cache = {}
-got = playlists.mb_genre_recordings(http, "mbid-vr", "dubstep", cache)
+got = playlists.mb_genre_recordings(http, "mbid-vr", ["dubstep"], cache)
 check("titles folded to comparison keys",
       got, {playlists._title_key("Neon Angel"), playlists._title_key("Energy Drink")})
 check("empty title dropped", "" in got, False)
 check("query is arid AND tag", http.calls[0]["query"],
-      'arid:mbid-vr AND tag:"dubstep"')
+      'arid:mbid-vr AND (tag:"dubstep")')
 check("answer cached", "mbid-vr::dubstep" in cache, True)
 
-playlists.mb_genre_recordings(http, "mbid-vr", "dubstep", cache)
+playlists.mb_genre_recordings(http, "mbid-vr", ["dubstep"], cache)
 check("cache hit spends no request", len(http.calls), 1)
 
 # The same artist for a DIFFERENT gap genre is a different question.
-playlists.mb_genre_recordings(http, "mbid-vr", "techno", cache)
+playlists.mb_genre_recordings(http, "mbid-vr", ["techno"], cache)
 check("cache is keyed on (artist, tag)", len(http.calls), 2)
 
 # "Nobody tagged this artist's recordings dubstep" is an answer, not a retry.
 empty = FakeHttp({"recordings": []})
 c2 = {}
-check("empty answer returns empty", playlists.mb_genre_recordings(empty, "m", "t", c2), set())
-playlists.mb_genre_recordings(empty, "m", "t", c2)
+check("empty answer returns empty", playlists.mb_genre_recordings(empty, "m", ["t"], c2), set())
+playlists.mb_genre_recordings(empty, "m", ["t"], c2)
 check("empty answer is cached, not re-asked", len(empty.calls), 1)
 
 # A failed request must NOT cache — that is a missing answer, not an empty one.
 dead = FakeHttp({}, status=503)
 c3 = {}
-check("failed request returns empty", playlists.mb_genre_recordings(dead, "m", "t", c3), set())
+check("failed request returns empty", playlists.mb_genre_recordings(dead, "m", ["t"], c3), set())
 check("failed request not cached", c3, {})
+
+# A blend goes out as ONE Lucene OR, not one request per tag.
+blend_http = FakeHttp({"recordings": [{"title": "Quiet Song"}]})
+c4 = {}
+playlists.mb_genre_recordings(blend_http, "m", ["indie pop", "indie folk"], c4)
+check("blend is a single request", len(blend_http.calls), 1)
+check("blend query ORs the tags", blend_http.calls[0]["query"],
+      'arid:m AND (tag:"indie folk" OR tag:"indie pop")')
+check("blend cache key covers the whole blend",
+      "m::indie folk|indie pop" in c4, True)
+
+# Tag order must not split the cache — same blend, same key, no second request.
+playlists.mb_genre_recordings(blend_http, "m", ["indie folk", "indie pop"], c4)
+check("tag order does not fork the cache", len(blend_http.calls), 1)
+
+check("no tags means no request",
+      playlists.mb_genre_recordings(blend_http, "m", [], {}), set())
+check("no tags spends nothing", len(blend_http.calls), 1)
 
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)

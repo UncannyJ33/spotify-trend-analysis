@@ -1,0 +1,35 @@
+# Which playlists Stage 8 should build. Copy to playlist_overrides.csv and edit.
+# The real file is gitignored: it is a statement of personal taste, not code —
+# the rows below are illustrative only and are deliberately not anyone's real
+# listening. Delete the file entirely and Stage 8 falls back to the top
+# N_PLAYLISTS genres from data/genre_gaps.parquet.
+#
+#   label  the playlist's name in Spotify, via PLAYLIST_NAME_TEMPLATE
+#          ("shoegaze" -> "shoegaze frontier · Claude"). Keep it stable: the
+#          label is the key in data/playlist_state.json, so changing it makes
+#          a NEW playlist instead of updating the existing one.
+#   tags   one or more MusicBrainz genre tags, pipe-separated. An artist
+#          qualifies by carrying ANY of them. Omit to use the label itself.
+#
+# Blending tags does two jobs. It puts genres together that only make sense
+# together, and it rescues a genre whose candidate pool is too thin to fill
+# PLAYLIST_SIZE on its own — widening to neighbours is usually better than
+# raising TRACKS_PER_ARTIST, which just lets one act dominate.
+#
+# A label that IS a genre in data/genre_gaps.parquet keeps its trend numbers and
+# is described as rising. Any other label is "pinned" and its description says
+# so, because a genre worth pinning is often one the history says you are moving
+# away from, and claiming otherwise would be a lie told to the playlist's owner.
+#
+# Why this file exists: the gap ranking weights by seconds listened, and seconds
+# are dominated by whatever plays during a workout, where music is a metronome
+# rather than a choice. The export records no activity type, so it cannot tell
+# functional listening from attentive listening. This is where a human supplies
+# what the data does not contain.
+#
+# At most N_PLAYLISTS rows are used (config.py, default 4).
+label,tags
+shoegaze,shoegaze|dream pop
+ambient,ambient|drone|field recording
+bossa nova,bossa nova
+delta blues,delta blues|country blues
