@@ -110,7 +110,7 @@ PLAYLIST_STATE_JSON = DATA_DIR / "playlist_state.json"  # gap tag -> playlist id
 
 N_PLAYLISTS = 4            # hard cap agreed with the user: never more than 4
 PLAYLIST_SIZE = 25
-ANCHOR_TRACKS = 5          # familiar tracks from library artists serving the gap
+ANCHOR_TRACKS = 6          # familiar tracks from library artists serving the gap
 TRACKS_PER_ARTIST = 2      # one act must not own a playlist
 ANCHOR_WINDOW_MONTHS = 18  # anchors ranked on recent listening, like SEED_WINDOW_MONTHS
 
