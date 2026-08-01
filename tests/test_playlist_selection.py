@@ -142,6 +142,31 @@ check("uri in both pools appears once",
 
 check("empty everything is tolerated", playlists.assemble([], [], 10), [])
 
+# --------------------------------------------------------------------------
+# Discovery running dry must not abandon the anchors. Anchors sit at spaced
+# positions, so the first unfilled gap between them used to end the playlist —
+# a genre with six qualifying library artists and no candidates produced a
+# ONE-track playlist instead of six.
+# --------------------------------------------------------------------------
+anchors_only = playlists.assemble(
+    anchors=[{"spotify_track_uri": f"uri:a{i}"} for i in range(6)],
+    discovery=[], size=25)
+check("no discovery at all still places every anchor", len(anchors_only), 6)
+check("anchors-only playlist is all anchors",
+      {t["slot"] for t in anchors_only}, {"anchor"})
+check("anchors-only positions stay contiguous",
+      [t["position"] for t in anchors_only], list(range(6)))
+
+# Partial discovery: anchors keep going after discovery is exhausted.
+partial = playlists.assemble(
+    anchors=[{"spotify_track_uri": f"uri:a{i}"} for i in range(4)],
+    discovery=[{"spotify_track_uri": "uri:d0"}], size=25)
+check("anchors continue past exhausted discovery", len(partial), 5)
+check("the one discovery track is still used",
+      sum(1 for t in partial if t["slot"] == "discovery"), 1)
+check("no duplicates when discovery runs dry",
+      len({t["spotify_track_uri"] for t in partial}), 5)
+
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)
 print("all assertions passed")

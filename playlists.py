@@ -253,13 +253,19 @@ def assemble(anchors: list[dict], discovery: list[dict], size: int) -> list[dict
         if want_anchor:
             ai = take(anchors, ai)
             want_anchor = ai < len(anchors)
-        if want_anchor:
-            pool, idx = anchors, ai
-        else:
+        if not want_anchor:
             di = take(discovery, di)
             if di >= len(discovery):
-                break
-            pool, idx = discovery, di
+                # Discovery is spent. Fall back to whatever anchors are left
+                # rather than ending here: the anchors sit at spaced
+                # positions, so stopping at the first unfilled gap throws away
+                # every anchor after it. A genre with six qualifying library
+                # artists and no candidates produced a ONE-track playlist.
+                ai = take(anchors, ai)
+                if ai >= len(anchors):
+                    break
+                want_anchor = True
+        pool, idx = (anchors, ai) if want_anchor else (discovery, di)
 
         row = dict(pool[idx])
         row["slot"] = "anchor" if pool is anchors else "discovery"
