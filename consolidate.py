@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import sys
 from collections import Counter
@@ -47,8 +48,19 @@ SCOPES_WRITE = SCOPES_READ + " playlist-modify-private"
 
 KEEP, DROP, REVIEW = "keep", "drop", "review"
 
-REVIEW_COLS = ["decision", "artist_name", "track_name", "rap_share", "reason",
-               "added_at", "tags", "spotify_track_uri"]
+REVIEW_COLS = ["decision", "source", "artist_name", "track_name", "rap_share",
+               "reason", "added_at", "tags", "spotify_track_uri"]
+
+# Stage 9's own resolution cache, deliberately NOT enrich.py's.
+#
+# Reading enrich's cache is free and correct — an artist it already resolved
+# should never cost a second request. Writing to it is not: enrich.write_outputs
+# flattens that whole cache into artist_tags.parquet, so pushing playlist-only
+# artists in would seed a listening-history artifact with acts carrying no
+# listening time at all, and shift Stage 2's own coverage figures. Different
+# population, different file. Append-only and fsynced per record like every
+# other cache here, so a quarterly re-run spends nothing it has already spent.
+CONSOLIDATE_CACHE = config.CACHE_DIR / "consolidate_artists.jsonl"
 
 
 # --------------------------------------------------------------------------
@@ -98,28 +110,85 @@ def artist_family_weights(con: duckdb.DuckDBPyConnection) -> dict[str, dict]:
         WHERE is_genre AND artist_name IS NOT NULL
     """).fetchall()
 
-    acc: dict[str, dict] = {}
+    by_artist: dict[str, list] = {}
     for artist, tag, w in rows:
-        fam = tag_family(tag)
-        rec = acc.setdefault(normalise(artist), {
-            "artist_name": artist, "rap_w": 0.0, "edm_w": 0.0,
-            "rap_n": 0, "edm_n": 0, "tags": [], "n_tags": 0,
-        })
-        rec["n_tags"] += 1
-        if fam:
-            rec[f"{fam}_w"] += float(w)
-            rec[f"{fam}_n"] += 1
-            rec["tags"].append(f"{tag}({int(w)})")
+        by_artist.setdefault(artist, []).append({"tag": tag, "count": w})
+    # One scoring path shared with resolve_missing(): the zero-vote fallback is
+    # an invariant, and two copies of it would eventually disagree.
+    return {normalise(a): _weights_from_tags(a, tags)
+            for a, tags in by_artist.items()}
 
-    for rec in acc.values():
-        rap_w, edm_w = rec["rap_w"], rec["edm_w"]
-        if rap_w == 0 and edm_w == 0 and (rec["rap_n"] or rec["edm_n"]):
-            # Every family tag sits at zero votes: fall back to presence.
-            rap_w, edm_w = float(rec["rap_n"]), float(rec["edm_n"])
-            rec["zero_vote_fallback"] = True
-        total = rap_w + edm_w
-        rec["rap_share"] = (rap_w / total) if total else None
-    return acc
+
+def _weights_from_tags(name: str, tags: list[dict]) -> dict:
+    """Build one weights record from raw MusicBrainz tag dicts."""
+    rec = {"artist_name": name, "rap_w": 0.0, "edm_w": 0.0,
+           "rap_n": 0, "edm_n": 0, "tags": [], "n_tags": len(tags)}
+    for t in tags:
+        fam = tag_family(t.get("tag", ""))
+        if not fam:
+            continue
+        w = max(int(t.get("count") or 0), 0)
+        rec[f"{fam}_w"] += float(w)
+        rec[f"{fam}_n"] += 1
+        rec["tags"].append(f"{t['tag']}({w})")
+    rap_w, edm_w = rec["rap_w"], rec["edm_w"]
+    if rap_w == 0 and edm_w == 0 and (rec["rap_n"] or rec["edm_n"]):
+        rap_w, edm_w = float(rec["rap_n"]), float(rec["edm_n"])
+    total = rap_w + edm_w
+    rec["rap_share"] = (rap_w / total) if total else None
+    return rec
+
+
+def resolve_missing(names: list[str], weights: dict) -> int:
+    """Ask MusicBrainz about artists Stage 2 has never covered.
+
+    These are real: a playlist carries acts the listening history does not, and
+    the first run left 36 of them unscorable — a mix of UK drill and bass that
+    no amount of reasoning about the name can separate. Guessing at them by ear
+    is exactly what this project refuses to do everywhere else.
+
+    Order: Stage 9's cache, then Stage 2's cache (free — an artist already
+    resolved must never cost a second request), then MusicBrainz. An artist the
+    search resolves but leaves untagged falls back to release-group tags, which
+    is the pass that gives Tion Wayne his `drill`/`uk drill` and ArrDee his.
+    A name MusicBrainz cannot resolve stays unscorable and goes to review.
+    """
+    from enrich import (MB_MIN_INTERVAL, Throttled, load_cache,
+                        resolve_via_musicbrainz, tags_from_release_groups)
+
+    mine = {}
+    if CONSOLIDATE_CACHE.exists():
+        for line in CONSOLIDATE_CACHE.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # truncated final line from an interrupted run
+                mine[rec["artist_name"]] = rec
+
+    stage2 = load_cache()
+    http, resolved, spent = None, 0, 0
+    for name in names:
+        rec = mine.get(name) or stage2.get(name)
+        if rec is None:
+            if http is None:
+                http = Throttled(MB_MIN_INTERVAL)
+                config.ensure_dirs()
+            rec = resolve_via_musicbrainz(http, name)
+            if rec.get("mbid") and not rec.get("tags"):
+                rec["tags"] = tags_from_release_groups(http, rec["mbid"])
+                rec["source"] = "release-groups"
+            with CONSOLIDATE_CACHE.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            spent += 1
+        if rec.get("tags"):
+            weights[normalise(name)] = _weights_from_tags(name, rec["tags"])
+            resolved += 1
+    print(f"  resolved {resolved}/{len(names)} previously untagged artists "
+          f"({spent} MusicBrainz lookup(s) spent)")
+    return resolved
 
 
 # --------------------------------------------------------------------------
@@ -340,6 +409,7 @@ def write_review(rows: list[dict]) -> None:
                                              r["track_name"])):
             w.writerow({
                 "decision": "",
+                "source": r.get("source", ""),
                 "artist_name": ", ".join(r["artists"]),
                 "track_name": r["track_name"],
                 "rap_share": "" if r["rap_share"] is None else f"{r['rap_share']:.3f}",
@@ -506,6 +576,9 @@ def main() -> None:
     ap.add_argument("--name", dest="target", default=None,
                     help="name for the consolidated playlist "
                          "(default: '<first --keep-whole> · consolidated')")
+    ap.add_argument("--resolve-missing", action="store_true",
+                    help="ask MusicBrainz about artists with no local tags "
+                         "(1.1s per lookup) instead of sending them to review")
     ap.add_argument("--write", action="store_true",
                     help="actually create the playlist; without it nothing is written")
     args = ap.parse_args()
@@ -539,6 +612,22 @@ def main() -> None:
         rows = [dict(r, source=name) for r in read_playlist(sp, pl["id"])]
         sizes[name] = len(rows)
         (whole if name in args.whole else to_filter).extend(rows)
+
+    if args.resolve_missing:
+        # Only names that actually matter: an artist on a track already answered
+        # by hand needs no lookup, and neither does one already tagged.
+        overrides_now = load_overrides()
+        unknown = []
+        for row in to_filter:
+            if dedupe_key(row) in overrides_now:
+                continue
+            for name in row["artists"]:
+                if normalise(name) not in weights and name not in unknown:
+                    unknown.append(name)
+        if unknown:
+            print(f"  {len(unknown)} artist(s) with no local tags; "
+                  f"resolving (~{len(unknown) * 1.1:.0f}s) ...")
+            resolve_missing(unknown, weights)
 
     overrides = load_overrides()
     if overrides:
