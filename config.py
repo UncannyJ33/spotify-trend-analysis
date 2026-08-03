@@ -155,6 +155,59 @@ PLAYLIST_DESCRIPTION_PINNED_TEMPLATE = (
 # could never anchor a Stage 8 playlist.
 OVERRIDE_TAG_COUNT = 1
 
+# --- Stage 9: consolidating hand-made playlists ------------------------------
+# Unlike Stage 8, this stage reads playlists a person built. It creates a third
+# playlist and never modifies either source.
+
+CONSOLIDATE_REVIEW_CSV = DATA_DIR / "consolidate_review.csv"  # machine output
+
+# Hand-written answers to the review list, same split as artist_overrides.csv:
+# the real file is gitignored because it is a statement of personal taste, and
+# the tracked *.example.csv documents the format. An override always outranks a
+# computed score.
+CONSOLIDATE_OVERRIDES_CSV = _path_from_env(
+    "SPOTIFY_CONSOLIDATE_OVERRIDES", PROJECT_ROOT / "consolidate_overrides.csv"
+)
+
+# Bands on rap_share = rap_weight / (rap_weight + electronic_weight). Chosen
+# against this library's real spread, where the two naive rules both fail: a veto
+# list drops Daft Punk (1 rap tag against 92 electronic) and an allow list keeps
+# Kendrick Lamar (58 against 2). Weighting puts them at 0.01 and 0.97, so the
+# thresholds sit in genuinely empty space rather than cutting through a cluster.
+CONSOLIDATE_KEEP_BELOW = 0.25
+CONSOLIDATE_DROP_ABOVE = 0.60
+
+# What a featured credit's genre is worth against the primary artist's 1.0.
+# Spotify's `artists` array does not say who is featured, so position is the only
+# signal available: artists[0] is primary, the rest are treated as features. A
+# rapper guesting on an electronic track therefore lands in review rather than
+# being dropped outright. Genuine co-headlines ("Chase & Status, Stormzy") are
+# under-weighted by this; tune once a real run has been read.
+CONSOLIDATE_FEATURE_WEIGHT = 0.5
+
+# Tag -> family. Order matters: rap is tested first and wins, because this
+# library's vocabulary genuinely overlaps -- `hardcore hip hop` (48 artists)
+# matches both lists, and it is rap. The blocklist then removes tags that match
+# an electronic pattern while being nothing of the kind: `garage rock` is not
+# UK garage and `hardcore punk` is not hardcore techno. Anything matching neither
+# list is off-family (rock, metal, pop) and goes to review, not to a guess.
+CONSOLIDATE_RAP_PATTERNS = (
+    "hip hop", "hip-hop", "rap", "trap", "drill", "grime", "crunk",
+    "g-funk", "boom bap", "turntablism",
+)
+CONSOLIDATE_EDM_PATTERNS = (
+    "house", "techno", "trance", "dubstep", "garage", "drum and bass", "dnb",
+    "jungle", "breakbeat", "breaks", "big beat", "electro", "electronic",
+    "electronica", "edm", "bass", "idm", "hardstyle", "gabber", "hardcore",
+    "downtempo", "synthwave", "eurodance", "rave", "glitch", "trip hop",
+)
+# Tags that match CONSOLIDATE_EDM_PATTERNS but are not electronic music.
+# `dance` is deliberately NOT a pattern: it matches `dancehall`, which is not.
+CONSOLIDATE_EDM_BLOCKLIST = (
+    "garage rock", "garage punk", "hardcore punk", "post-hardcore",
+    "melodic hardcore", "metalcore", "deathcore", "grindcore",
+)
+
 # Fields that must never reach a derived artifact.
 DROPPED_FIELDS = ("ip_addr",)
 

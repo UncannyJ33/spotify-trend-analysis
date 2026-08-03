@@ -1,0 +1,37 @@
+decision,artist_name,track_name,note
+# Copy to consolidate_overrides.csv and edit. That file is gitignored; this one is not.
+# Lines starting with # are ignored, so every example below is inert until you
+# uncomment it.
+#
+# Stage 9 never guesses in the band where the tag data is genuinely unclear: it
+# writes those tracks to data/consolidate_review.csv instead. This file is how you
+# answer them by hand, and an answer here always outranks the computed score.
+#
+# COLUMNS
+#   decision      exactly `keep` or `drop`. Anything else is refused with a
+#                 warning rather than silently ignored - a typo would otherwise
+#                 read as a real answer.
+#   artist_name   the primary credit. Matched loosely on accents/case/stylisation,
+#                 the same folding Stage 2 uses - "A$AP Rocky" matches "ASAP Rocky".
+#   track_name    the title. Folded the same way the deduper folds it, so one row
+#                 answers the album cut, the single and the remaster together:
+#                 "Song", "Song (Radio Edit)" and "Song - 2011 Remaster" are one key.
+#   note          free text for your own benefit. Never read by the code.
+#
+# WHAT LANDS IN REVIEW
+#   ambiguous band   scored between the keep and drop thresholds - genuinely mixed
+#                    artists like Diplo, who sits at 0.32 rap by tag weight.
+#   untagged         MusicBrainz has no tags for the artist at all. Re-run with
+#                    --resolve-missing to spend lookups on them instead.
+#   off-family       tagged, but as rock/metal/pop - real data, zero weight in both
+#                    the rap and electronic families, so the ratio is undefined.
+#
+# Open data/consolidate_review.csv, copy the rows you care about here with a
+# decision filled in, and re-run. Answered rows stop coming back.
+#
+# --- keep: electronic enough for the workout playlist ---
+# keep,Diplo,Revolution,scores 0.32 but this one is a festival track
+# keep,The Prodigy,Breathe,big beat not rap
+#
+# --- drop: rap that scored ambiguously ---
+# drop,Travis Scott,SICKO MODE,carries electronic tags but it is a rap track
