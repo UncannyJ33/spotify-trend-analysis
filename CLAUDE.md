@@ -30,11 +30,14 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python playlists.py              # Stage 8 → 4 playlists + data/playlists.parquet
 .venv/bin/python consolidate.py --keep-whole "A" --filter "B"    # Stage 9 dry run
 .venv/bin/python consolidate.py --keep-whole "A" --filter "B" --write   # Stage 9 → new playlist
+.venv/bin/python running.py                # Stage 10 dry run (default)
+.venv/bin/python running.py --write        # Stage 10 → 2 playlists + data/running_state.json
 ```
 
 Run 1 → 1b → 2 → 3 in order; 4–8 consume Stage 3's output (Stage 8 also needs
 Stage 5's and Stage 7's). Stage 9 is independent of the gap analysis — it reads
-playlists a person built and needs only Stage 2's tags. Stages 2, 5, 6 touch the network; the rest
+playlists a person built and needs only Stage 2's tags. Stage 10 needs 1b, 2 and
+5, and is likewise independent of the gap analysis. Stages 2, 5, 6, 10 touch the network; the rest
 are local and cheap to re-run.
 
 Verification is split. Stages 1–7 have no tests — each ends in a `report()` that prints counts,
@@ -81,12 +84,13 @@ attribution without recomputing anything. Every consumer must filter on `variant
 figure and taking `mode="light"|"dark"`. `app.py` and `report.py` both import it. Do not write chart
 code in either renderer.
 
-**Four places accept a human answer, and all are files rather than code.** `artist_overrides.csv`
+**Five places accept a human answer, and all are files rather than code.** `artist_overrides.csv`
 answers Stage 2's review list (name → MBID, or `IGNORE` for things that were never artists);
 `playlist_overrides.csv` answers Stage 8's "which genres deserve a playlist";
 `consolidate_overrides.csv` answers Stage 9's review list (`data/consolidate_review.csv` is machine
 output, regenerated every run — copy a row across, fill in `keep` or `drop`, and it stops coming
-back); `.env` carries `SPOTIFY_CLIENT_ID` for the poller and Stage 8. All are gitignored with a
+back); `running_overrides.csv` carries Stage 10's pins and vetoes;
+`.env` carries `SPOTIFY_CLIENT_ID` for the poller and Stage 8. All are gitignored with a
 tracked `*.example.*` alongside documenting the format. When adding another, follow that pattern rather than introducing
 a config format.
 
@@ -193,6 +197,32 @@ correct.
   field on create, reports `public: true` regardless, and a later `PUT {"public": false}` returns 200
   without changing it. They stay off the server-rendered public profile page, but any playlist is
   fetchable by direct link. Do not claim these playlists are private in docs or descriptions.
+- **The export credits a remix to the ORIGINAL artist, and Stage 1b now parses it back.**
+  `- X Remix` in the title is a performer credit Spotify files under the person being remixed:
+  Halsey holds 134 min that is an Ian Asher speed-garage record, Chrystal holds 205 min that is a
+  NOTION bassline record. 334 tracks / 5,810 min here, only 2.6% of listening but concentrated
+  almost entirely in dance music. `credit_type = 'remixer'` carries the same weight as `featured`
+  through `analyze.py`'s existing `ELSE feature_weight` branch, so no weighting change was needed
+  and the no-time-created-or-destroyed invariant still holds. Two guards matter: `REMIX_FORMAT_STOPLIST`
+  (`- Radio Edit` yields "Radio", which would otherwise become an artist holding 352 min), and
+  `remaster` is NOT a remix type (it captured `"2012 -"` out of `War Pigs - 2012 - Remaster`).
+  A suffix naming no person is still extracted, then fails to resolve and is answered `IGNORE` —
+  junk degrades to a review row, never to bad data.
+- **Stage 10 gates discovery candidates harder than library artists, on purpose.** A weighted share
+  alone is exploitable by a sparse tag vector: one `tech house` vote and no drag tags is 1/1, and
+  Boys Noize and Mr. Oizo were duly offered as speed garage. `RUN_MIN_CANDIDATE_CLUSTER_WEIGHT`
+  applies an absolute floor to strangers only — waived when a NARROW tag carries them, since
+  `bass house(1)` states something `tech house(1)` does not. It must never apply to library artists:
+  hand-supplied tags all carry `OVERRIDE_TAG_COUNT = 1`, so a floor of 2 would exclude every artist
+  answered by hand, John Summit's 36 hours included.
+- **A merely adjacent tag poisons discovery far beyond the tracks it admits.** `electro house` was
+  in `RUN_GARAGE_TAGS` and let in 43 artists (MSTRKRFT, Benny Benassi, Justice, Digitalism). Because
+  Stage 10 seeds ListenBrainz on the cluster's *own top artists*, seeding on Justice and Tiësto
+  returned Mr. Oizo, Boys Noize and Basement Jaxx as "speed garage". Removing one tag fixed the
+  whole discovery pool. Check what a tag admits before adding it.
+- **Stage 10 uses MEDIAN ms_played for duration, not max.** A completed play's `ms_played` is the
+  track's length, but the odd play reports far more than the track runs. `max()` put SLANDER's
+  "Wish I Could Forget" at 9.6 minutes and let one track eat a tenth of the playlist.
 - **Dedupe tracks on the folded title, not the URI.** Spotify presses the album cut, the single and
   the remaster as three distinct URIs, so URI-dedupe alone gives one artist's two slots to the same
   song — the first dry run produced "Papa Roach — Last Resort" twice. `_title_key` drops everything
