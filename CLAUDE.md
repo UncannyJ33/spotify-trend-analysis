@@ -220,6 +220,23 @@ correct.
   Stage 10 seeds ListenBrainz on the cluster's *own top artists*, seeding on Justice and Tiësto
   returned Mr. Oizo, Boys Noize and Basement Jaxx as "speed garage". Removing one tag fixed the
   whole discovery pool. Check what a tag admits before adding it.
+- **Vetoing one track promotes the next one by the same artist.** `RUN_TRACKS_PER_ARTIST` is a cap,
+  so dropping a track frees a slot rather than shrinking the artist's presence. Dropping SLANDER's
+  `Superhuman` pulled in `Back To U` and `GUD VIBRATIONS` and left THREE SLANDER tracks where there
+  had been two. When the artist is the problem rather than the track, the veto must be artist-wide
+  (blank `track_name`); to keep one track by an otherwise-vetoed artist, pin it as well, since
+  `resolve_pins` runs before the veto filter and a pin is the more specific statement.
+- **Stage 10 refuses live recordings, matched structurally.** Crowd noise and a tempo chosen on the
+  night break a run, and none of it is visible to a genre tag — the track is correctly classified and
+  still wrong. `RUN_LIVE_TITLE_RE` anchors on where a pressing note sits (` - live`, `(live`,
+  `live at/from/in`, `unplugged`); a bare `live` substring would take Zeds Dead's and Dustycloud's
+  `Alive`, both of which are in these playlists and both of which belong.
+- **A veto matches the credits, which are not what Spotify shows.** `GUD VIBRATIONS` is an
+  NGHTMRE & SLANDER record and Spotify's `artists` array says so, but the export credits NGHTMRE
+  alone and the title carries no `feat.` or remix marker for `credits.py` to parse — so an artist-wide
+  SLANDER veto does not touch it. Not a bug in the veto; the collaborator is genuinely absent from
+  the data. Verifying a veto against Spotify's live artist list will therefore disagree with the
+  pipeline, and the pipeline is doing what the data supports.
 - **Stage 10 must not use `playlists.assemble`, and the reason only appears at length.** `assemble`
   spaces anchors every `size // len(anchors)` slots — correct for Stage 8 (six anchors, twenty-five
   slots, step 4) and silently degenerate once anchors are the MAJORITY, where the step becomes 1 and

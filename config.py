@@ -348,6 +348,19 @@ RUN_BROAD_TAGS = frozenset({
     "drum and bass", "breakbeat", "glitch hop", "complextro",
 })
 
+# Live recordings are refused outright. Crowd noise, a rambling intro and a
+# tempo the drummer chose on the night all break a run in a way the genre
+# filter cannot see — the track is perfectly on-genre and still wrong.
+#
+# Structural, not a substring: a bare /live/ would take Zeds Dead's "Alive" and
+# Dustycloud's "Alive", both of which are in these playlists and both of which
+# belong. The marker has to sit where a pressing note sits — after " - ", inside
+# a bracket, or in front of a venue.
+RUN_LIVE_TITLE_RE = (
+    r"(?i)( - live\b|\(live\b|\[live\b"
+    r"|\blive (?:at|from|in|session|version)\b|\bunplugged\b)"
+)
+
 RUN_PLAYLIST_NAME_TEMPLATE = "{label} run · Claude"
 RUN_PLAYLIST_DESCRIPTION_TEMPLATE = (
     "{label} — high-intensity tracks for running, {known} from your library "

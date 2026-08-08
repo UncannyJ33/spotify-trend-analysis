@@ -51,6 +51,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 from datetime import date
 
@@ -413,6 +414,20 @@ def load_overrides() -> tuple[list[dict], set[tuple]]:
     return pins, vetoes
 
 
+def is_live(track_name: str) -> bool:
+    """A live recording, which is refused however on-genre it is.
+
+    Crowd noise, a spoken intro and whatever tempo the drummer picked on the
+    night all break a run, and none of that is visible to a genre tag: the
+    track is correctly classified and still wrong.
+
+    Matched structurally rather than as a substring. A bare /live/ would take
+    Zeds Dead's "Alive" and Dustycloud's "Alive" — both in these playlists,
+    both wanted.
+    """
+    return bool(re.search(config.RUN_LIVE_TITLE_RE, track_name or ""))
+
+
 def vetoed(row: dict, vetoes: set[tuple]) -> bool:
     """A veto naming only an artist removes everything by them."""
     a = normalise(row.get("artist_name", ""))
@@ -601,7 +616,8 @@ def build_selections(con, http, sp) -> list[dict]:
         # record, and folding would let a different pressing take the slot.
         pinned = [place(p) for p in resolve_pins(con, pins, label)]
         known_rows = [r for r in select_known(con, label, limit=600)
-                      if not vetoed(r, vetoes) and fresh(r)]
+                      if not vetoed(r, vetoes) and not is_live(r["track_name"])
+                      and fresh(r)]
         picked: list[dict] = []
         for r in known_rows:
             if fresh(r):
@@ -652,7 +668,8 @@ def build_selections(con, http, sp) -> list[dict]:
             on_genre = mb_genre_recordings(http, cand["mbid"], tags, genre_rec_cache)
             for chosen in choose_tracks(tracks, on_genre,
                                         config.RUN_DISCOVERY_TRACKS_PER_ARTIST):
-                if not fresh(chosen) or vetoed(chosen, vetoes):
+                if (not fresh(chosen) or vetoed(chosen, vetoes)
+                        or is_live(chosen.get("track_name", ""))):
                     continue
                 dur = track_duration(sp, chosen["spotify_track_uri"], duration_cache)
                 if got_ms + (dur or 0) > budget_ms:

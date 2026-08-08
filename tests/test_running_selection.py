@@ -212,6 +212,22 @@ unknown = [{"spotify_track_uri": "x", "duration_ms": None}] * 40
 check("unknown durations cannot blow the budget",
       len(running.fill_to_target(unknown, 10 * 60_000)) <= 4, True)
 
+# --- live recordings are refused however on-genre they are --------------
+# Crowd noise and a tempo chosen on the night break a run, and none of that is
+# visible to a genre tag. The trap is that a bare /live/ substring also takes
+# "Alive" — and BOTH playlists contain an "Alive" that belongs (Zeds Dead's and
+# Dustycloud's), so this has to match structurally.
+for title in ["Go Away - Live at iTunes Festival 2011", "Song (Live)",
+              "Song [Live]", "Song - Live", "Track Live at Wembley",
+              "Song - Live From Brixton", "Album Version - Unplugged",
+              "Set - Live Session"]:
+    check(f"live: {title[:38]!r}", running.is_live(title), True)
+
+for title in ["Alive", "Live Your Life", "Livewire", "Olive Branch",
+              "Stayin' Alive", "Deliverance", "Come Alive - VIP Mix"]:
+    check(f"not live: {title!r}", running.is_live(title), False)
+check("empty title is not live", running.is_live(""), False)
+
 # --- interleaving must hold when known tracks are the MAJORITY ----------
 # playlists.assemble spaces anchors by size//len(anchors), which collapses to a
 # step of 1 once anchors outnumber discovery — every anchor first, discovery

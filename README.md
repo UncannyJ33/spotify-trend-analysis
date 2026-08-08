@@ -642,10 +642,23 @@ separates Luude's *Pachamama* (6 plays, 1.4 min each) from his Blair Muir remix
 (5 plays, 3.1 min each) without any genre data at all. It is **not** an attempt
 to infer which plays happened during a run — the export cannot support that.
 
+**Live recordings are refused outright**, however on-genre they are. Crowd noise
+and whatever tempo the drummer picked on the night break a run, and none of that
+is visible to a genre tag. `RUN_LIVE_TITLE_RE` matches structurally rather than
+as a substring — a bare `live` would take Zeds Dead's and Dustycloud's `Alive`,
+both of which are in these playlists and both of which belong.
+
 `running_overrides.csv` takes pins and vetoes. Pins match the **full** title,
 unfolded: this library holds both Insania's `iloveitiloveitiloveit - Garage`
 (23 plays) and Bella Kay's `iloveitiloveitiloveit` (4 plays), and dedupe folds
 them together.
+
+**Vetoing one track promotes the next one by the same artist** — the per-artist
+count is a cap, so a freed slot gets refilled from the same catalogue. Dropping
+SLANDER's `Superhuman` produced *three* SLANDER tracks where there had been two.
+If the artist is the problem rather than the track, veto the artist (blank
+`track_name`), and pin any single track you want to survive it: pins resolve
+before the veto filter, so the more specific statement wins.
 
 Every Stage 8 safety rule is inherited — never deletes, never unfollows, writes
 only to IDs in `data/running_state.json` or an exact name match, and snapshots
