@@ -100,8 +100,10 @@ re-run picks up exactly where it stopped, and later re-runs only spend requests
 on artists they've never seen. You can also cap a session with `--limit 200`.
 
 Every stage prints a report when it finishes — row counts, coverage, what got
-dropped and why. Read it. That output is how you know a stage worked; there's no
-test suite standing between you and a silently wrong number.
+dropped and why. Read it. That output is how you know a stage worked; for these
+pipeline stages there's no test suite standing between you and a silently wrong
+number. (The stages that write to Spotify do have one — plain scripts in
+`tests/`, run from the repo root, no network needed.)
 
 Then the optional extras:
 

@@ -35,14 +35,22 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 Run 1 → 1b → 2 → 3 in order; 4–8 consume Stage 3's output (Stage 8 also needs
 Stage 5's and Stage 7's). Stage 9 is independent of the gap analysis — it reads
 playlists a person built and needs only Stage 2's tags. Stages 2, 5, 6 touch the network; the rest
-are local and cheap to re-run. There is no test suite — each stage ends in a `report()` that prints
-counts, coverage and sanity checks to stdout, and that output is the verification surface. Read it
-before claiming a stage worked.
+are local and cheap to re-run.
 
-For changes to the credit or enrichment SQL, that surface is too coarse to trust alone: build a
+Verification is split. Stages 1–7 have no tests — each ends in a `report()` that prints counts,
+coverage and sanity checks to stdout, and that output is the verification surface; read it before
+claiming a stage worked. The Spotify-writing stages and the override/auth plumbing *do* have tests:
+standalone scripts in `tests/`, no pytest, all offline (fakes and synthetic DuckDB tables, never the
+network). Run them from the repo root — they `sys.path.insert(0, ".")` and fail from anywhere else:
+
+```bash
+for t in tests/test_*.py; do .venv/bin/python "$t" || break; done   # each exits 1 on failure
+```
+
+For changes to the credit or enrichment SQL, the report surface is too coarse to trust alone: build a
 throwaway DuckDB table of synthetic `plays` rows and assert on the output, and fake the `Throttled`
-object rather than hitting MusicBrainz. Both features below were verified that way. Check the
-invariants that fail silently — no listening time created or lost, no double-counted performer.
+object rather than hitting MusicBrainz — `tests/` is the pattern to copy. Check the invariants that
+fail silently — no listening time created or lost, no double-counted performer.
 
 ## Architecture
 
@@ -73,11 +81,13 @@ attribution without recomputing anything. Every consumer must filter on `variant
 figure and taking `mode="light"|"dark"`. `app.py` and `report.py` both import it. Do not write chart
 code in either renderer.
 
-**Three places accept a human answer, and all are files rather than code.** `artist_overrides.csv`
+**Four places accept a human answer, and all are files rather than code.** `artist_overrides.csv`
 answers Stage 2's review list (name → MBID, or `IGNORE` for things that were never artists);
-`playlist_overrides.csv` answers Stage 8's "which genres deserve a playlist"; `.env` carries
-`SPOTIFY_CLIENT_ID` for the poller and Stage 8. All are gitignored with a tracked `*.example.*`
-alongside documenting the format. When adding another, follow that pattern rather than introducing
+`playlist_overrides.csv` answers Stage 8's "which genres deserve a playlist";
+`consolidate_overrides.csv` answers Stage 9's review list (`data/consolidate_review.csv` is machine
+output, regenerated every run — copy a row across, fill in `keep` or `drop`, and it stops coming
+back); `.env` carries `SPOTIFY_CLIENT_ID` for the poller and Stage 8. All are gitignored with a
+tracked `*.example.*` alongside documenting the format. When adding another, follow that pattern rather than introducing
 a config format.
 
 `playlist_overrides.csv` exists because the gap ranking weights by seconds listened, and seconds are
