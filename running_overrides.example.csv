@@ -1,0 +1,41 @@
+playlist,decision,artist_name,track_name,note
+# Stage 10 hand answers. Copy to running_overrides.csv and edit; that file is
+# gitignored because it states personal taste, this one is not. Same split as
+# .env / .env.example and artist_overrides.csv.
+#
+# An override always outranks a computed score.
+#
+# COLUMNS
+#   playlist    which playlist this applies to: the cluster label ("speed
+#               garage" or "dubstep"). BLANK means both.
+#   decision    keep  = pin this track in, whatever the classifier thinks.
+#               drop  = veto it. Leave track_name blank to veto every track
+#                       by that artist.
+#   artist_name the ALBUM artist as it appears in your listening history.
+#   track_name  the FULL title, suffix and all. Not the folded one — see below.
+#   note        free text for your own benefit. Never read by the code.
+#
+# WHY track_name IS THE FULL TITLE
+#   Track dedupe folds a title at the first ' - ', so "Song - Garage" and
+#   "Song" collide. That is correct for dedupe (Spotify presses the album cut,
+#   the single and the remaster as three URIs) and wrong for a pin, where the
+#   suffix IS the record you mean. Pins are matched unfolded against your play
+#   history, so you get the pressing you actually listened to.
+#
+# WHY VETOES EXIST
+#   Genre tags are per ARTIST, so an artist with a mixed catalogue gets one
+#   verdict for all their tracks. Completion rate catches most of it — a track
+#   you skip ranks low on its own. A veto is for the rest.
+#
+# WHAT THIS FILE CANNOT DO
+#   It cannot make an untagged artist eligible: nothing here changes genre
+#   data. An artist missing from the playlists because MusicBrainz never
+#   tagged them is answered in artist_overrides.csv, whose `tags` column
+#   supplies genres by hand. Stage 10's report prints the ones worth fixing,
+#   ranked by listening time.
+#
+# --- examples (inert: delete the # to use one) ---
+# speed garage,keep,Some Artist,Some Track - Garage,the garage mix is the record
+# dubstep,keep,Another Artist,Another Track,
+# ,drop,A Melodic Act,,uniformly too slow to run to
+playlist,decision,artist_name,track_name,note

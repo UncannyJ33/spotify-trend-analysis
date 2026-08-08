@@ -208,6 +208,143 @@ CONSOLIDATE_EDM_BLOCKLIST = (
     "melodic hardcore", "metalcore", "deathcore", "grindcore",
 )
 
+# --- Stage 10: running playlists ---------------------------------------------
+# Unlike Stage 8, which discovers genres you are drifting toward, this stage
+# builds for a purpose: music that sustains a run. Two playlists, because this
+# library splits cleanly into two high-intensity clusters that suit different
+# runs — steady 4x4 garage for distance, drop-driven bass for intervals.
+#
+# There is no BPM here and there cannot be. Spotify's /audio-features and
+# /audio-analysis both answer 403 since the February 2026 rename, and Deezer's
+# ISRC lookup — which matches this library perfectly — carries a real BPM on
+# only 12% of tracks. Raw tempo would also be the wrong signal even if it were
+# available: Zomboy's "Nuclear (Hands Up)" measures 87 BPM because its drums are
+# half-time, and it is exactly the kind of track that carries a run. What is
+# being modelled is sustained intensity, not tempo.
+
+RUNNING_STATE_JSON = DATA_DIR / "running_state.json"   # label -> playlist id
+
+# Hand answers for this stage: pinned tracks and vetoes. Same split as the other
+# four override files — the real one is gitignored because it states personal
+# taste, and running_overrides.example.csv documents the format.
+RUNNING_OVERRIDES_CSV = _path_from_env(
+    "SPOTIFY_RUNNING_OVERRIDES", PROJECT_ROOT / "running_overrides.csv"
+)
+
+# The two clusters. Every tag here was checked against the MusicBrainz genre
+# vocabulary: `riddim`, `uk bass`, `bass music` and `4x4 garage` are NOT
+# MusicBrainz genres and were removed, since they can never match and cannot be
+# supplied by hand either. Riddim artists arrive via dubstep/brostep/tearout.
+# `electro house` is deliberately ABSENT. It reads as a neighbour of speed
+# garage and is not one: it admitted 43 artists — MSTRKRFT, Benny Benassi,
+# Justice, Digitalism — and because discovery seeds on the cluster's own top
+# artists, seeding on Justice and Tiësto returned Mr. Oizo, Boys Noize and
+# Basement Jaxx as "speed garage". A tag that is merely adjacent poisons the
+# discovery pool far beyond the tracks it admits directly.
+RUN_GARAGE_TAGS = (
+    "speed garage", "uk garage", "bassline", "stutter house", "bass house",
+    "tech house", "jackin house", "donk", "2-step",
+    "hard house", "breakbeat hardcore",
+)
+RUN_BASS_TAGS = (
+    "dubstep", "brostep", "tearout", "hybrid trap", "trap edm", "drum and bass",
+    "jungle", "neurofunk", "drumstep", "breakbeat", "glitch hop", "complextro",
+    "hardstyle", "colour bass", "happy hardcore", "gabber",
+)
+
+# Genres that are electronic but do NOT sustain a run. An include-list alone is
+# not enough: ILLENIUM carries dubstep(3) and trap edm(3), so any include-list
+# admits him, while melodic dubstep(3) and future bass(2) are why the playlist
+# sags. Membership is therefore a weighted share, not a set test.
+RUN_DRAG_TAGS = (
+    "melodic dubstep", "future bass", "chillstep", "deep house",
+    "progressive house", "melodic house", "melodic techno", "ambient",
+    "downtempo", "trip hop", "chillout", "lo-fi", "pop", "dance-pop",
+    "electropop", "synth-pop", "hip hop", "rap", "pop rap",
+    "contemporary r&b", "alternative r&b", "r&b", "soul", "rock",
+    "alternative rock", "indie rock", "heavy metal", "latin", "reggaeton",
+    "folk", "singer-songwriter",
+)
+# Bare `trap` appears on 60 of this playlist's tracks and is ambiguous: it names
+# both rap-trap and EDM-trap. It is deliberately in NEITHER list, so it can
+# neither qualify nor disqualify an artist — the specific tags (`trap edm`,
+# `hybrid trap` on one side, `hip hop`, `pop rap` on the other) decide. Same
+# rule as `dance` in the Stage 9 patterns, and for the same reason.
+
+# Tags matching a cluster pattern that are nothing of the kind. Same job as
+# CONSOLIDATE_EDM_BLOCKLIST: `garage rock` is not UK garage and `hardcore punk`
+# is not happy hardcore.
+RUN_TAG_BLOCKLIST = (
+    "garage rock", "garage punk", "hardcore punk", "post-hardcore",
+    "melodic hardcore", "metalcore", "deathcore", "grindcore", "jazz house",
+)
+
+# cluster_weight / (cluster_weight + drag_weight), weighted by tag_count.
+# 0.60 rather than 0.50 because the borderline cases in this library are
+# genuinely borderline: ILLENIUM lands at 0.55 and is the sag being removed.
+RUN_MIN_INTENSITY_SHARE = 0.60
+
+# How far either side of the line to print in the report, so the marginal calls
+# are visible rather than silent.
+RUN_BORDERLINE_BAND = 0.15
+
+# Fill to time, not to a track count: the ask was "an hour and a half to two
+# hours", and Spotify returns duration_ms on every item, so there is no reason
+# to approximate it with a count. 105 min is ~33 tracks at this library's
+# 3.15-minute median.
+RUN_TARGET_MINUTES = 105
+RUN_KNOWN_FRACTION = 2 / 3    # rest is discovery, per the brief
+RUN_TRACKS_PER_ARTIST = 2     # one act must not own a playlist
+RUN_WINDOW_MONTHS = 18        # recent listening, same window as Stage 5/8
+
+# A known track's rank. Listening time says you choose it; the trackdone rate
+# says you let it finish. Both are needed: Luude's "Pachamama" has more plays
+# than his Blair Muir remix and less than half the completion.
+RUN_MIN_TRACKDONE_RATE = 0.45
+
+# Discovery is seeded on the CLUSTER's own top artists, not on Stage 5's
+# library-wide candidate list. Stage 5 seeds across all taste, so its
+# electronic candidates skew canonical — a first dry run offered Basement Jaxx,
+# Busy P and Mr. Oizo as speed garage, and The Prodigy as dubstep. Asking
+# ListenBrainz "who is like Blair Muir" instead returns the right neighbourhood.
+RUN_DISCOVERY_SEEDS = 10        # top cluster artists to ask about
+RUN_MAX_CANDIDATES_TO_TAG = 60  # MusicBrainz lookups per cluster, at 1.1s each
+
+# A share alone cannot judge a STRANGER. Boys Noize and Mr. Oizo carry exactly
+# one cluster tag — `tech house` at count 1 — and no drag tags at all, so the
+# ratio is 1/1 and they scored a perfect 1.00 as speed garage. Discovery
+# candidates must therefore clear an absolute weight too, not just a ratio.
+#
+# Deliberately NOT applied to library artists, and the asymmetry is the point:
+# an artist with 36 hours of listening has earned the benefit of a thin tag
+# vector, and hand-supplied tags all carry OVERRIDE_TAG_COUNT = 1 so a floor of
+# 2 would exclude every artist answered by hand. A stranger has earned nothing —
+# and a wrong discovery track is the expensive mistake here, because it lands
+# mid-run on a listener with no relationship to it.
+RUN_MIN_CANDIDATE_CLUSTER_WEIGHT = 2
+
+# ...but the floor applies only to BROAD tags. One vote for `speed garage` or
+# `bass house` is a real statement about an artist; one vote for `tech house` is
+# not — French electro acts carry it too, which is exactly how Boys Noize and
+# Mr. Oizo scored 1.00. A candidate carrying any NARROW cluster tag qualifies at
+# a single vote; one carrying only these needs the floor.
+#
+# Chris Lorenzo is the honest cost of this rule: he carries `tech house(1)` and
+# nothing else, which is tag-identical to Boys Noize, so no rule can admit one
+# and refuse the other. He is lost until MusicBrainz knows more about him.
+RUN_BROAD_TAGS = frozenset({
+    "tech house", "hard house", "breakbeat hardcore",
+    "drum and bass", "breakbeat", "glitch hop", "complextro",
+})
+
+RUN_PLAYLIST_NAME_TEMPLATE = "{label} run · Claude"
+RUN_PLAYLIST_DESCRIPTION_TEMPLATE = (
+    "{label} — high-intensity tracks for running, {known} from your library "
+    "and {new} you have not heard. No BPM filter: Spotify removed the tempo "
+    "endpoints, and half-time drums make the number lie anyway. "
+    "Built by spotify-trend-analysis · refreshed {date}"
+)
+
 # Fields that must never reach a derived artifact.
 DROPPED_FIELDS = ("ip_addr",)
 
