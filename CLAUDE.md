@@ -28,10 +28,13 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python report.py --open          # Stage 4b → output/report.html
 .venv/bin/python playlists.py --dry-run    # Stage 8 preview — no Spotify writes
 .venv/bin/python playlists.py              # Stage 8 → 4 playlists + data/playlists.parquet
+.venv/bin/python consolidate.py --keep-whole "A" --filter "B"    # Stage 9 dry run
+.venv/bin/python consolidate.py --keep-whole "A" --filter "B" --write   # Stage 9 → new playlist
 ```
 
 Run 1 → 1b → 2 → 3 in order; 4–8 consume Stage 3's output (Stage 8 also needs
-Stage 5's and Stage 7's). Stages 2, 5, 6 touch the network; the rest
+Stage 5's and Stage 7's). Stage 9 is independent of the gap analysis — it reads
+playlists a person built and needs only Stage 2's tags. Stages 2, 5, 6 touch the network; the rest
 are local and cheap to re-run. There is no test suite — each stage ends in a `report()` that prints
 counts, coverage and sanity checks to stdout, and that output is the verification surface. Read it
 before claiming a stage worked.

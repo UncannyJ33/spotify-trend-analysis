@@ -137,6 +137,7 @@ operation.
 | 6. Poll | `python poll.py` (`--status`, `--logout`) | `data/polled_plays.parquet` |
 | 7. Forecast | `python forecast.py` (`--horizon N`) | `data/forecast.parquet`, `data/genre_gaps.parquet` |
 | 8. Playlists | `python playlists.py` (`--dry-run`) | 4 Spotify playlists + `data/playlists.parquet` |
+| 9. Consolidate | `python consolidate.py --keep-whole N --filter N` (`--write`) | one new Spotify playlist + `data/consolidate_review.csv` |
 
 All prefixed with `.venv/bin/`. Stages 2, 5 and 6 use the network; the rest are local.
 
@@ -540,6 +541,44 @@ for playlists never strips the poller's access or vice versa.
 Dropping a genre from the override file stops Stage 8 updating that playlist; it
 does **not** delete it, because this stage has no delete path at all. Orphaned
 playlists stay in your library until you remove them yourself.
+
+### Stage 9 — Consolidating hand-made playlists
+
+Stage 8 builds playlists from the analysis. Stage 9 does the opposite: it reads
+playlists **you** built and merges them into a new one. Some go in whole
+(`--keep-whole`), others are genre-filtered on the way in (`--filter`) so their
+rap and hip-hop don't come along.
+
+```bash
+python consolidate.py --keep-whole "Gym" --keep-whole "Drives" --filter "Old mix" --write
+```
+
+The genre judgement is a weighted balance between two tag families rather than a
+veto or an allow list, because both simpler rules fail on real data. A veto
+("drop anything tagged rap") deletes Daft Punk, who carries one rap tag against
+ninety-two electronic ones. An allow list ("keep anything tagged electronic")
+keeps Kendrick Lamar, one electronic against fifty-eight rap. Weighting puts them
+at 0.01 and 0.97, so `CONSOLIDATE_KEEP_BELOW` and `CONSOLIDATE_DROP_ABOVE` sit in
+empty space rather than cutting through a cluster. Anything between the two
+thresholds lands in `data/consolidate_review.csv` for you to answer by hand in
+`consolidate_overrides.csv` — the same gitignored-file pattern as everywhere else.
+
+Three deliberate differences from Stage 8, all because this stage touches things
+a person made rather than things it made itself:
+
+- **Dry run by default.** Stage 8 writes unprompted, which is right when it only
+  ever touches its own playlists. This one prints what it would do and waits for
+  `--write`.
+- **Names match exactly**, case and trailing spaces included. A near-miss is
+  somebody's other playlist, and reading the wrong source consolidates the wrong
+  music silently.
+- **No source playlist is ever modified**, and nothing is deleted — it shares
+  Stage 8's `Spotify` client, which has no delete verb.
+
+It needs Stage 2's tags and nothing else, so it's independent of the gap
+analysis. It shares the Stage 6 developer app; `playlist-read-collaborative` is
+the one scope it adds, and the union rule means picking it up never costs the
+other stages their access.
 
 ## Tuning it
 
