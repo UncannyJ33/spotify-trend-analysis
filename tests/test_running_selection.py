@@ -212,6 +212,38 @@ unknown = [{"spotify_track_uri": "x", "duration_ms": None}] * 40
 check("unknown durations cannot blow the budget",
       len(running.fill_to_target(unknown, 10 * 60_000)) <= 4, True)
 
+# --- interleaving must hold when known tracks are the MAJORITY ----------
+# playlists.assemble spaces anchors by size//len(anchors), which collapses to a
+# step of 1 once anchors outnumber discovery — every anchor first, discovery
+# stapled on the end. Invisible at 33 tracks; at four hours on a 40-minute run
+# it means the discovery half is never reached.
+kn = [{"spotify_track_uri": f"k{i}", "duration_ms": 200_000} for i in range(45)]
+dis = [{"spotify_track_uri": f"d{i}", "duration_ms": 200_000} for i in range(30)]
+mixed = running.interleave(kn, dis)
+check("interleave keeps every track", len(mixed), 75)
+check("positions are 0..n-1", [t["position"] for t in mixed], list(range(75)))
+check("no track duplicated", len({t["spotify_track_uri"] for t in mixed}), 75)
+check("slots are labelled", {t["slot"] for t in mixed}, {"anchor", "discovery"})
+
+first_third = [t["slot"] for t in mixed[:25]]
+last_third = [t["slot"] for t in mixed[-25:]]
+check("discovery reaches the first third even when outnumbered",
+      "discovery" in first_third, True)
+check("known reaches the last third", "anchor" in last_third, True)
+# The real regression: with a majority-known list, more than half the discovery
+# must appear before the final quarter.
+early_disc = sum(1 for t in mixed[:56] if t["slot"] == "discovery")
+check("most discovery lands before the last quarter", early_disc >= 15, True)
+check("proportions preserved",
+      (sum(1 for t in mixed if t["slot"] == "anchor"),
+       sum(1 for t in mixed if t["slot"] == "discovery")), (45, 30))
+
+check("interleave with no discovery is all anchors",
+      {t["slot"] for t in running.interleave(kn, [])}, {"anchor"})
+check("interleave with no known is all discovery",
+      {t["slot"] for t in running.interleave([], dis)}, {"discovery"})
+check("interleave of nothing is empty", running.interleave([], []), [])
+
 # --- the client must never be able to delete ---------------------------
 check("Spotify client has no delete verb",
       hasattr(running.Spotify, "delete"), False)

@@ -590,10 +590,26 @@ python running.py            # dry run: prints both playlists, writes nothing
 python running.py --write    # build/refresh them
 ```
 
-Two playlists for running, filled to `RUN_TARGET_MINUTES` (105) by *duration*
-rather than by a track count — the ask was "an hour and a half to two hours",
-and Spotify returns `duration_ms` on every item, so there is no reason to
-approximate. Roughly two-thirds from your own history, one-third discovery.
+Two playlists for running, filled to `RUN_TARGET_MINUTES` (240) by *duration*
+rather than by a track count — Spotify returns `duration_ms` on every item, so
+there is no reason to approximate. Roughly 60% from your own history, 40%
+discovery.
+
+**Length is set against repetition, not against the run.** A playlist sized to
+the run is a playlist heard end to end every time; at 30–45 minutes a session,
+four hours is five or six runs before anything repeats. The pool supports that
+without loosening the filter — 220 dubstep and 181 garage tracks qualify from
+the history alone, 11.8 h and 9.2 h before the per-artist cap. Length costs
+variety, not precision.
+
+That length is also why this stage does **not** use `playlists.assemble`. That
+function spaces anchors every `size // len(anchors)` slots, which is right for
+Stage 8's six-in-twenty-five but collapses to a step of 1 once known tracks are
+the majority — every familiar track first, every discovery track stapled to the
+end. Invisible at 33 tracks; at four hours on a 40-minute run it means the
+discovery half is never reached, which is precisely the problem the length is
+meant to solve. `interleave()` takes from whichever pool has consumed less of
+itself instead, so 45 known against 30 discovery stays roughly 3:2 throughout.
 
 **There is no BPM, and BPM would be the wrong signal anyway.** Spotify's
 `/audio-features` and `/audio-analysis` both answer 403 since the February 2026

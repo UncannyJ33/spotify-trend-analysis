@@ -66,7 +66,6 @@ from playlists import (
     SP_API,
     Spotify,
     _title_key,
-    assemble,
     choose_tracks,
     ensure_playlist,
     mb_genre_recordings,
@@ -505,6 +504,41 @@ def fill_to_target(rows: list[dict], target_ms: int) -> list[dict]:
 # --------------------------------------------------------------------------
 
 
+def interleave(known: list[dict], discovery: list[dict]) -> list[dict]:
+    """Mix the two pools in proportion, whichever is larger.
+
+    NOT playlists.assemble, and the difference is load-bearing here. That one
+    spaces anchors every `size // len(anchors)` slots, which is right for Stage
+    8 (six anchors in twenty-five) but collapses to a step of 1 the moment
+    anchors are the majority — every anchor at the front, every discovery track
+    stapled to the end.
+
+    At 33 tracks nobody notices. At four hours, on a 30-45 minute run, it means
+    the discovery half is never reached: the listener hears the same familiar
+    opening every time, which is the exact complaint this length exists to fix.
+
+    So take from whichever pool has consumed less of itself. 45 known against 30
+    discovery comes out roughly 3:2 the whole way down, and it degrades to a
+    plain copy when either pool is empty.
+    """
+    k, d = list(known), list(discovery)
+    out: list[dict] = []
+    ki = di = 0
+    for _ in range(len(k) + len(d)):
+        k_used = ki / len(k) if k else 1.0
+        d_used = di / len(d) if d else 1.0
+        take_known = ki < len(k) and (k_used <= d_used or di >= len(d))
+        if take_known:
+            row = dict(k[ki], slot="anchor")
+            ki += 1
+        else:
+            row = dict(d[di], slot="discovery")
+            di += 1
+        row["position"] = len(out)
+        out.append(row)
+    return out
+
+
 def register_sources(con: duckdb.DuckDBPyConnection) -> None:
     needed = {
         "plays": config.PLAYS_PARQUET,
@@ -566,7 +600,7 @@ def build_selections(con, http, sp) -> list[dict]:
         # Pins are placed first and are exempt from folding: the suffix IS the
         # record, and folding would let a different pressing take the slot.
         pinned = [place(p) for p in resolve_pins(con, pins, label)]
-        known_rows = [r for r in select_known(con, label, limit=200)
+        known_rows = [r for r in select_known(con, label, limit=600)
                       if not vetoed(r, vetoes) and fresh(r)]
         picked: list[dict] = []
         for r in known_rows:
@@ -617,7 +651,7 @@ def build_selections(con, http, sp) -> list[dict]:
                 continue
             on_genre = mb_genre_recordings(http, cand["mbid"], tags, genre_rec_cache)
             for chosen in choose_tracks(tracks, on_genre,
-                                        config.RUN_TRACKS_PER_ARTIST):
+                                        config.RUN_DISCOVERY_TRACKS_PER_ARTIST):
                 if not fresh(chosen) or vetoed(chosen, vetoes):
                     continue
                 dur = track_duration(sp, chosen["spotify_track_uri"], duration_cache)
@@ -652,10 +686,7 @@ def build_selections(con, http, sp) -> list[dict]:
                       f"{sum(t['duration_ms'] for t in topup)/60000:.0f} min")
                 known = known + topup
 
-        # assemble() interleaves so the playlist does not read as two lists
-        # stapled together. It caps on a track count, so give it the count the
-        # duration fill already settled on.
-        tracks = assemble(known, discovery, len(known) + len(discovery))
+        tracks = interleave(known, discovery)
         out.append({"label": label, "tags": tags, "tracks": tracks,
                     "n_known": len(known), "n_new": len(discovery)})
     return out

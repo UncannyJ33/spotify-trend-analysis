@@ -220,6 +220,13 @@ correct.
   Stage 10 seeds ListenBrainz on the cluster's *own top artists*, seeding on Justice and Tiësto
   returned Mr. Oizo, Boys Noize and Basement Jaxx as "speed garage". Removing one tag fixed the
   whole discovery pool. Check what a tag admits before adding it.
+- **Stage 10 must not use `playlists.assemble`, and the reason only appears at length.** `assemble`
+  spaces anchors every `size // len(anchors)` slots — correct for Stage 8 (six anchors, twenty-five
+  slots, step 4) and silently degenerate once anchors are the MAJORITY, where the step becomes 1 and
+  every discovery track lands at the end. At 33 tracks nobody notices. At the 4-hour length, on a
+  30-45 minute run, the listener never reaches the discovery half at all — the exact repetition the
+  length exists to fix. `running.interleave` takes from whichever pool has consumed less of itself,
+  so the ratio holds all the way down. Do not "unify" the two.
 - **Stage 10 uses MEDIAN ms_played for duration, not max.** A completed play's `ms_played` is the
   track's length, but the odd play reports far more than the track runs. `max()` put SLANDER's
   "Wish I Could Forget" at 9.6 minutes and let one track eat a tenth of the playlist.

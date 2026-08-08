@@ -292,10 +292,21 @@ RUN_BORDERLINE_BAND = 0.15
 # hours", and Spotify returns duration_ms on every item, so there is no reason
 # to approximate it with a count. 105 min is ~33 tracks at this library's
 # 3.15-minute median.
-RUN_TARGET_MINUTES = 105
-RUN_KNOWN_FRACTION = 2 / 3    # rest is discovery, per the brief
-RUN_TRACKS_PER_ARTIST = 2     # one act must not own a playlist
-RUN_WINDOW_MONTHS = 18        # recent listening, same window as Stage 5/8
+# Four hours, not the run's length. A playlist sized to the run is a playlist
+# heard end to end every time; at 30-45 minutes a session, four hours is five or
+# six runs before anything repeats. The pool supports it without loosening the
+# genre filter — 220 dubstep and 181 garage tracks qualify from the history
+# alone, 11.8 h and 9.2 h uncapped — so length costs variety, not precision.
+RUN_TARGET_MINUTES = 240
+RUN_KNOWN_FRACTION = 0.6      # rest is discovery; more new music, by request
+RUN_TRACKS_PER_ARTIST = 3     # one act must not own a playlist
+# Discovery stays at 2. Three tracks from an artist you already play is more of
+# a good thing; three from a stranger is three chances to break a run.
+RUN_DISCOVERY_TRACKS_PER_ARTIST = 2
+# 36 months, not 18. Past 36 the pool stops growing (+0.2 h dubstep, +0.0 h
+# garage), and the older material is the part that has NOT been heard lately —
+# which is the whole complaint being answered.
+RUN_WINDOW_MONTHS = 36
 
 # A known track's rank. Listening time says you choose it; the trackdone rate
 # says you let it finish. Both are needed: Luude's "Pachamama" has more plays
@@ -307,8 +318,8 @@ RUN_MIN_TRACKDONE_RATE = 0.45
 # electronic candidates skew canonical — a first dry run offered Basement Jaxx,
 # Busy P and Mr. Oizo as speed garage, and The Prodigy as dubstep. Asking
 # ListenBrainz "who is like Blair Muir" instead returns the right neighbourhood.
-RUN_DISCOVERY_SEEDS = 10        # top cluster artists to ask about
-RUN_MAX_CANDIDATES_TO_TAG = 60  # MusicBrainz lookups per cluster, at 1.1s each
+RUN_DISCOVERY_SEEDS = 20         # top cluster artists to ask about
+RUN_MAX_CANDIDATES_TO_TAG = 150  # MusicBrainz lookups per cluster, at 1.1s each
 
 # A share alone cannot judge a STRANGER. Boys Noize and Mr. Oizo carry exactly
 # one cluster tag — `tech house` at count 1 — and no drag tags at all, so the
