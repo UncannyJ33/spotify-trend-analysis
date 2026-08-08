@@ -102,8 +102,8 @@ on artists they've never seen. You can also cap a session with `--limit 200`.
 Every stage prints a report when it finishes — row counts, coverage, what got
 dropped and why. Read it. That output is how you know a stage worked; for these
 pipeline stages there's no test suite standing between you and a silently wrong
-number. (The stages that write to Spotify do have one — plain scripts in
-`tests/`, run from the repo root, no network needed.)
+number. The stages that write to Spotify do have one — see
+[the tests](#the-tests).
 
 Then the optional extras:
 
@@ -582,6 +582,27 @@ analysis. It shares the Stage 6 developer app; `playlist-read-collaborative` is
 the one scope it adds, and the union rule means picking it up never costs the
 other stages their access.
 
+### The tests
+
+The analysis pipeline, Stages 1–7, has none — every stage prints its report,
+and that output is the verification surface. The stages that write to your
+Spotify account are held to a higher bar, because their reports genuinely
+cannot catch the failures that matter: a filter that drops the right *number*
+of tracks while dropping the wrong ones looks identical in a count.
+
+`tests/` pins that logic instead — Stage 8's selection and within-artist track
+choice, Stage 9's scoring (above all Daft Punk and Kendrick Lamar, the two real
+artists that break the naive genre rules), the never-delete guarantee, each of
+the override files, and the scope arithmetic on the shared Spotify token. They
+are plain scripts, no pytest, and touch no network — Spotify is a fake and the
+tag tables are synthetic. Run them from the repo root:
+
+```bash
+for t in tests/test_*.py; do .venv/bin/python "$t" || break; done
+```
+
+Each prints its checks as it runs and exits non-zero on failure.
+
 ## Tuning it
 
 `config.py` holds every threshold in one place, commented with why each value is
@@ -673,5 +694,5 @@ working afterwards.
 
 ## License
 
-No license file yet — treat it as all rights reserved unless that changes. Fork
-it for your own listening history; ask before republishing.
+MIT — see [LICENSE](LICENSE). It covers the code; your listening history never
+enters the repo in the first place.
