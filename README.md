@@ -140,8 +140,9 @@ operation.
 | 7. Forecast | `python forecast.py` (`--horizon N`) | `data/forecast.parquet`, `data/genre_gaps.parquet` |
 | 8. Playlists | `python playlists.py` (`--dry-run`) | 4 Spotify playlists + `data/playlists.parquet` |
 | 9. Consolidate | `python consolidate.py --keep-whole N --filter N` (`--write`) | one new Spotify playlist + `data/consolidate_review.csv` |
+| 10. Running | `python running.py` (`--write`) | 2 Spotify playlists + `data/running_state.json` |
 
-All prefixed with `.venv/bin/`. Stages 2, 5 and 6 use the network; the rest are local.
+All prefixed with `.venv/bin/`. Stages 2, 5, 6 and 10 use the network; the rest are local.
 
 **Bind the dashboard to localhost.** Streamlit listens on every interface by
 default and prints an external URL on your public IP. This page renders your
@@ -582,6 +583,87 @@ analysis. It shares the Stage 6 developer app; `playlist-read-collaborative` is
 the one scope it adds, and the union rule means picking it up never costs the
 other stages their access.
 
+### Stage 10 — Running playlists
+
+```bash
+python running.py            # dry run: prints both playlists, writes nothing
+python running.py --write    # build/refresh them
+```
+
+Two playlists for running, filled to `RUN_TARGET_MINUTES` (240) by *duration*
+rather than by a track count — Spotify returns `duration_ms` on every item, so
+there is no reason to approximate. Roughly 60% from your own history, 40%
+discovery.
+
+**Length is set against repetition, not against the run.** A playlist sized to
+the run is a playlist heard end to end every time; at 30–45 minutes a session,
+four hours is five or six runs before anything repeats. The pool supports that
+without loosening the filter — 220 dubstep and 181 garage tracks qualify from
+the history alone, 11.8 h and 9.2 h before the per-artist cap. Length costs
+variety, not precision.
+
+That length is also why this stage does **not** use `playlists.assemble`. That
+function spaces anchors every `size // len(anchors)` slots, which is right for
+Stage 8's six-in-twenty-five but collapses to a step of 1 once known tracks are
+the majority — every familiar track first, every discovery track stapled to the
+end. Invisible at 33 tracks; at four hours on a 40-minute run it means the
+discovery half is never reached, which is precisely the problem the length is
+meant to solve. `interleave()` takes from whichever pool has consumed less of
+itself instead, so 45 known against 30 discovery stays roughly 3:2 throughout.
+
+**There is no BPM, and BPM would be the wrong signal anyway.** Spotify's
+`/audio-features` and `/audio-analysis` both answer 403 since the February 2026
+rename, while `/tracks` still answers 200 — a removal, not a permissions
+failure. Deezer's ISRC lookup matched 40/40 sampled tracks and carried a real
+BPM on 5 of them. And tempo lies here: Zomboy's *Nuclear (Hands Up)* measures 87
+BPM because its drums are half-time, and it is exactly the kind of track that
+carries a run. What's modelled is sustained intensity.
+
+**Membership is a weighted share, not a tag list.** ILLENIUM carries
+`dubstep(3)` and `trap edm(3)`, so any include-list admits him — while
+`melodic dubstep(3)` and `future bass(2)` are why a workout playlist sags. So
+`cluster_weight / (cluster_weight + drag_weight)` decides, exactly as Stage 9
+separates rap from electronic, and for the same reason: both naive rules fail on
+real artists in this library.
+
+**Discovery candidates face a harder bar than your own artists**, and the
+asymmetry is deliberate. A stranger with one `tech house` vote and no drag tags
+scores a perfect 1.00 on the ratio alone — that is how Boys Noize and Mr. Oizo
+were first offered as speed garage. Candidates must clear an absolute weight
+too, waived for *narrow* tags where a single vote means something (`bass house`
+does, `tech house` does not). An artist you have played for 36 hours has earned
+the benefit of a thin tag vector; a stranger has not, and a wrong discovery
+track is the expensive mistake because it lands mid-run.
+
+Tags are per *artist*, which this stage cannot fix — per-track MBID resolution
+is the explosion the project has twice declined. What ranks individual tracks is
+your own behaviour: recent hours × the rate you play the track to the end. That
+separates Luude's *Pachamama* (6 plays, 1.4 min each) from his Blair Muir remix
+(5 plays, 3.1 min each) without any genre data at all. It is **not** an attempt
+to infer which plays happened during a run — the export cannot support that.
+
+**Live recordings are refused outright**, however on-genre they are. Crowd noise
+and whatever tempo the drummer picked on the night break a run, and none of that
+is visible to a genre tag. `RUN_LIVE_TITLE_RE` matches structurally rather than
+as a substring — a bare `live` would take Zeds Dead's and Dustycloud's `Alive`,
+both of which are in these playlists and both of which belong.
+
+`running_overrides.csv` takes pins and vetoes. Pins match the **full** title,
+unfolded: this library holds both Insania's `iloveitiloveitiloveit - Garage`
+(23 plays) and Bella Kay's `iloveitiloveitiloveit` (4 plays), and dedupe folds
+them together.
+
+**Vetoing one track promotes the next one by the same artist** — the per-artist
+count is a cap, so a freed slot gets refilled from the same catalogue. Dropping
+SLANDER's `Superhuman` produced *three* SLANDER tracks where there had been two.
+If the artist is the problem rather than the track, veto the artist (blank
+`track_name`), and pin any single track you want to survive it: pins resolve
+before the veto filter, so the more specific statement wins.
+
+Every Stage 8 safety rule is inherited — never deletes, never unfollows, writes
+only to IDs in `data/running_state.json` or an exact name match, and snapshots
+whatever it overwrites into `data/playlists.parquet` first.
+
 ### The tests
 
 The analysis pipeline, Stages 1–7, has none — every stage prints its report,
@@ -592,8 +674,11 @@ of tracks while dropping the wrong ones looks identical in a count.
 
 `tests/` pins that logic instead — Stage 8's selection and within-artist track
 choice, Stage 9's scoring (above all Daft Punk and Kendrick Lamar, the two real
-artists that break the naive genre rules), the never-delete guarantee, each of
-the override files, and the scope arithmetic on the shared Spotify token. They
+artists that break the naive genre rules), Stage 10's intensity classification
+(ILLENIUM, who an include-list admits and a share test refuses) and its remixer
+parsing (`Radio Edit` must never become an artist called "Radio"), the
+never-delete guarantee, each of the override files, and the scope arithmetic on
+the shared Spotify token. They
 are plain scripts, no pytest, and touch no network — Spotify is a fake and the
 tag tables are synthetic. Run them from the repo root:
 

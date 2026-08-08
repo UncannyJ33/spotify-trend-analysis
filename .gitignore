@@ -27,6 +27,11 @@ playlist_overrides.csv
 # documents the format.
 consolidate_overrides.csv
 
+# Your pins and vetoes for the Stage 10 running playlists — named tracks and
+# named artists, so a statement of personal taste like the three above. The
+# tracked running_overrides.example.csv documents the format.
+running_overrides.csv
+
 # ---------------------------------------------------------------------------
 # Private working notes — the original build brief, kept local.
 # ---------------------------------------------------------------------------

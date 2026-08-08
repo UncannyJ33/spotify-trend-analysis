@@ -6,7 +6,11 @@ history that hides ~28% of listening time: 666 distinct performers appear only
 inside track titles, and 389 of them never show up as an album artist at all.
 
 This stage parses `(feat. X)` / `(with X)` out of the title and emits one row
-per (track, performer).
+per (track, performer). It also parses the remixer out of a `- X Remix` suffix,
+which the export hides the same way: Spotify bills a remix to the ORIGINAL
+artist, so an Ian Asher speed-garage rework of a Halsey song reads as pop. That
+is 334 tracks and 5,810 minutes here, concentrated in dance music where remixes
+and edits are how most of the material arrives.
 
     .venv/bin/python credits.py
 
@@ -27,6 +31,9 @@ Caveats on the regex path, by construction:
     Spotify's track metadata stay invisible. This is a floor, not a fix.
   - `(with <producer>)` credits a producer as a performer. Accepted.
   - Parsing is fuzzy; run with --review to eyeball what was extracted.
+  - A remix suffix that names no person ("- BLM REMIX") yields a name that
+    MusicBrainz cannot resolve, so it lands on Stage 2's review list and is
+    answered with IGNORE. Junk degrades to a review row, never to bad data.
 
 Output: data/track_credits.parquet
 """
@@ -57,8 +64,37 @@ LEADING_NOISE_RE = r'^\s*(?:feat\.?|ft\.?|featuring|with)\s*'
 # artist "Suspect (AGB)" is cut to "Suspect (AGB" by the outer match.
 STRAY_BRACKET_RE = r'[\(\)\[\]]'
 
+# A remixer credit in the title suffix: "Halsey - Ian Asher Remix". Spotify
+# bills the ORIGINAL artist as album artist, so the person who actually made
+# the record is credited nowhere — 334 tracks and 5,810 minutes of this
+# library, concentrated in dance music, where remix and edit culture is how
+# most of the good material arrives. Without this, an Ian Asher speed-garage
+# rework of a Halsey song is filed under pop and classified as pop.
+#
+# `remaster` is deliberately NOT a type here: a remaster has no remixer, and
+# including it captured "2012 -" out of "War Pigs - 2012 - Remaster".
+REMIX_TYPE_RE = r'(?:remix|edit|bootleg|flip|vip|rework|refix|mix|dub|version)'
+REMIX_CREDIT_RE = r'\s-\s(.+?)\s' + REMIX_TYPE_RE + r'$'
+
+# Words that describe a FORMAT rather than a person. "Bounce - Radio Edit"
+# matches the pattern above and yields "Radio", which is not an artist; left
+# unchecked it would invent a performer holding 352 minutes of listening.
+# 42 tracks and 883 minutes in this library are rejected here.
+REMIX_FORMAT_STOPLIST = frozenset({
+    "radio", "extended", "club", "original", "instrumental", "album", "single",
+    "acoustic", "live", "dance", "main", "bonus", "deluxe", "sped up", "slowed",
+    "remastered", "remaster", "mono", "stereo", "short", "long", "full",
+    "clean", "dirty", "explicit", "edit", "remix", "alternate", "reprise",
+    "demo", "new", "special", "super", "ultra", "hd", "hq",
+})
+
+# A capture that is only digits and punctuation is a year or a catalogue
+# fragment, not a name.
+REMIX_NON_NAME_RE = r'^[0-9\s\-\.,:]+$'
+
 
 def build_track_credits(con: duckdb.DuckDBPyConnection) -> None:
+    stoplist = ", ".join(f"'{w}'" for w in sorted(REMIX_FORMAT_STOPLIST))
     con.execute(
         f"""
         CREATE OR REPLACE TABLE track_credits AS
@@ -138,6 +174,28 @@ def build_track_credits(con: duckdb.DuckDBPyConnection) -> None:
             FROM parsed
             WHERE credit_blob IS NOT NULL AND credit_blob <> ''
         ),
+        -- The title-suffix remixer. Same floor-not-fix caveat as `featured`:
+        -- it only sees credits Spotify spelled into the title.
+        remixed AS (
+            SELECT
+                spotify_track_uri, track_name, album_artist,
+                played_seconds, n_plays,
+                trim(regexp_extract(track_name, '{REMIX_CREDIT_RE}', 1, 'i'))
+                    AS artist_name
+            FROM unseen
+        ),
+        remixers AS (
+            SELECT * FROM remixed
+            WHERE artist_name IS NOT NULL
+              AND artist_name <> ''
+              -- "Radio Edit" describes a format, not a person.
+              AND lower(artist_name) NOT IN ({stoplist})
+              -- Years and catalogue fragments are not names.
+              AND NOT regexp_matches(artist_name, '{REMIX_NON_NAME_RE}')
+              -- A capture spanning another " - " means the title has more
+              -- structure than this pattern models; refuse rather than guess.
+              AND NOT contains(artist_name, ' - ')
+        ),
         album_artists AS (
             SELECT
                 spotify_track_uri, track_name, album_artist,
@@ -161,8 +219,34 @@ def build_track_credits(con: duckdb.DuckDBPyConnection) -> None:
             WHERE artist_name IS DISTINCT FROM album_artist
             UNION ALL
             SELECT spotify_track_uri, track_name, album_artist, played_seconds,
+                   n_plays, artist_name,
+                   'remixer' AS credit_type, 'export' AS credit_source
+            FROM remixers
+            -- An artist remixing their own record ("Gravagerz - Gravagerz
+            -- Remix") is one performer, not two.
+            WHERE artist_name IS DISTINCT FROM album_artist
+            UNION ALL
+            SELECT spotify_track_uri, track_name, album_artist, played_seconds,
                    n_plays, artist_name, credit_type, 'poller' AS credit_source
             FROM polled
+        ),
+        deduped AS (
+            SELECT * FROM unioned
+            WHERE artist_name IS NOT NULL
+              AND length(artist_name) BETWEEN 2 AND 60
+              -- Drop fragments that are punctuation or stray words, not names.
+              AND regexp_matches(artist_name, '[A-Za-z0-9]')
+            -- One performer, one row per track, whatever the title calls them.
+            -- Stage 3 partitions credit weight by the play's identity, so a
+            -- performer appearing twice would hand that track's listening time
+            -- out twice over — the invariant that fails silently.
+            QUALIFY row_number() OVER (
+                PARTITION BY spotify_track_uri, artist_name
+                ORDER BY CASE credit_type
+                             WHEN 'album_artist' THEN 0
+                             WHEN 'featured'     THEN 1
+                             ELSE 2 END
+            ) = 1
         )
         SELECT
             spotify_track_uri,
@@ -174,11 +258,7 @@ def build_track_credits(con: duckdb.DuckDBPyConnection) -> None:
             played_seconds,
             n_plays,
             count(*) OVER (PARTITION BY spotify_track_uri) AS n_performers
-        FROM unioned
-        WHERE artist_name IS NOT NULL
-          AND length(artist_name) BETWEEN 2 AND 60
-          -- Drop fragments that are punctuation or stray words, not names.
-          AND regexp_matches(artist_name, '[A-Za-z0-9]')
+        FROM deduped
         ORDER BY ALL
         """
     )
@@ -196,6 +276,13 @@ def report(con: duckdb.DuckDBPyConnection, review: bool) -> None:
                 "WHERE credit_type = 'album_artist'")[0]
     n_feat = q("SELECT count(DISTINCT artist_name) FROM track_credits "
                "WHERE credit_type = 'featured'")[0]
+    n_remix = q("SELECT count(DISTINCT artist_name) FROM track_credits "
+                "WHERE credit_type = 'remixer'")[0]
+    n_remix_tracks, remix_secs = q(
+        "SELECT count(*), coalesce(sum(played_seconds), 0) FROM ("
+        "  SELECT DISTINCT spotify_track_uri, played_seconds FROM track_credits"
+        "  WHERE credit_type = 'remixer')"
+    )
     n_new = q(
         """
         SELECT count(*) FROM (
@@ -220,7 +307,13 @@ def report(con: duckdb.DuckDBPyConnection, review: bool) -> None:
     print(f"distinct performers         : {n_artists:,}")
     print(f"  as album artist           : {n_album:,}")
     print(f"  as featured performer     : {n_feat:,}")
+    print(f"  as remixer                : {n_remix:,}")
     print(f"  featured-ONLY (new)       : {n_new:,}   <- invisible in plays today")
+    print(
+        f"\nremixer credits recovered   : {n_remix_tracks:,} tracks, "
+        f"{remix_secs/3600:,.1f} h ({100*remix_secs/total_secs:.1f}% of total)"
+    )
+    print("   (the export bills these to the ORIGINAL artist, not the remixer)")
     print(
         f"\nlistening time on tracks with a parsed feature: "
         f"{feat_secs/3600:,.1f} h ({100*feat_secs/total_secs:.1f}% of total)"
@@ -264,6 +357,16 @@ def report(con: duckdb.DuckDBPyConnection, review: bool) -> None:
         """
         SELECT artist_name, sum(played_seconds)/3600.0 AS h, count(*) AS n
         FROM track_credits WHERE credit_type = 'featured'
+        GROUP BY 1 ORDER BY h DESC LIMIT 12
+        """
+    ).fetchall():
+        print(f"   {a[:38]:<38} {h:>6,.1f} h  {n:>4} tracks")
+
+    print("\n--- Top remixers (the export credits the original artist) ---")
+    for a, h, n in con.execute(
+        """
+        SELECT artist_name, sum(played_seconds)/3600.0 AS h, count(*) AS n
+        FROM track_credits WHERE credit_type = 'remixer'
         GROUP BY 1 ORDER BY h DESC LIMIT 12
         """
     ).fetchall():
