@@ -149,8 +149,11 @@ def build_protected_names(con: duckdb.DuckDBPyConnection) -> str:
         cut AS (
             -- Padded: a name is cut where it sits INSIDE a blob, and there a
             -- separator word at its edge has the whitespace it needs.
+            -- Case-insensitive, because the match below is: the library spells
+            -- "Tones And I" and a title "(feat. Tones and I)", which the
+            -- lowercase " and " cut into "Tones" and a dropped one-letter "I".
             SELECT name, count(*) AS n FROM names
-            WHERE regexp_matches(' ' || name || ' ', '{SPLIT_RE}')
+            WHERE regexp_matches(' ' || name || ' ', '{SPLIT_RE}', 'i')
             GROUP BY name
         )
         -- One spelling per name however a title capitalises it: the one most
@@ -451,8 +454,23 @@ def report(con: duckdb.DuckDBPyConnection, review: bool) -> None:
         f"\nlistening time on tracks with a parsed feature: "
         f"{feat_secs/3600:,.1f} h ({100*feat_secs/total_secs:.1f}% of total)"
     )
+    # What the protection actually did, not how many names it could have done
+    # it for: the library knows dozens of such names, and at the time of
+    # writing a title used one ("Tyler, The Creator", 3 tracks). A featured
+    # export credit can only carry a protected name by way of the protection,
+    # since the splitter cuts every one of them.
     n_protected = q("SELECT count(*) FROM protected_names")[0]
-    print(f"separator-bearing names kept whole: {n_protected:,}")
+    n_kept, n_kept_tracks = q(
+        """
+        SELECT count(DISTINCT t.artist_name), count(DISTINCT t.spotify_track_uri)
+        FROM track_credits t JOIN protected_names p ON p.key = lower(t.artist_name)
+        WHERE t.credit_type = 'featured' AND t.credit_source = 'export'
+        """
+    )
+    print(
+        f"separator-bearing names kept whole: {n_kept:,} on {n_kept_tracks:,} "
+        f"tracks (of {n_protected:,} the library knows)"
+    )
     print(f"\nartists Stage 2 must resolve: {n_artists:,}")
 
     # ---- What the poller repaired -----------------------------------------
