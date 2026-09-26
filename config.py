@@ -413,6 +413,44 @@ RUN_LIVE_TITLE_RE = (
 # every minute: Zomboy's "Nuclear" runs 5.3 minutes and is the model run track.
 RUN_MAX_DISCOVERY_MS = 270_000
 
+# A song has two identities, and Stage 10 needs both. The SONG is the folded
+# title (playlists._title_key): "Drugs I Like (AVELLO Remix)" and "Drugs I
+# Like" are one song. The VERSION drops only the notes that name a PRESSING
+# of the same recording — remaster (with or without a year), radio/extended/
+# original mix or edit, feat./ft./featuring/with credits, mono, stereo, single
+# and album version, explicit, clean — and keeps everything else, so a remix,
+# VIP, flip, rework, bootleg, a person's edit or "sped up" is its own version.
+# Folding on the song alone kept a garage original's remix out of dubstep and
+# split "tell you straight" (70 + 44 plays) into two half-counted rows.
+#
+# A note counts only as a WHOLE segment: a bracket, or a run of " - " segments
+# ending the title. "Song - Clean Bandit Remix" is not a clean pressing.
+# `with` is read as a credit only in Spotify's "(with X)" bracket: a dash
+# segment starting "With" can as easily be a remixer's name.
+# The same pattern runs in DuckDB (RE2) and Python, so it stays inside what
+# both accept: no lookaround, no backreferences, no \b inside a class, and
+# [0-9] and literal spaces rather than \d and \s, whose Unicode reach differs.
+_RUN_NOTE = (
+    r"(?:[0-9]{4} (?:- )?)?(?:digital )?remaster(?:ed)?(?: [0-9]{4})?(?: version)?"
+    r"|radio (?:edit|mix|version)|extended (?:mix|version|edit)"
+    r"|original (?:mix|version)|(?:mono|stereo)(?: version| mix)?"
+    r"|single version|album version|explicit|clean"
+)
+_RUN_NOTE_BRACKET = (
+    r" *[(\[] *(?:" + _RUN_NOTE
+    + r"|(?:feat\. *|ft\. *|(?:feat|ft|featuring|with) +)[^()\[\]]+) *[)\]]"
+)
+RUN_PRESSING_NOTE_RE = (
+    r"(?i)" + _RUN_NOTE_BRACKET
+    + r"|(?: +[-–—] +(?:" + _RUN_NOTE
+    + r"|(?:feat\. *|ft\. *|(?:feat|ft|featuring) +)[^()\[\]–—-]+))+"
+    + r"(?:" + _RUN_NOTE_BRACKET + r")* *$"
+)
+# One version per song per playlist, and completion picks it — but not on a
+# handful of plays. A remix finished 2 times out of 2 is not evidence against
+# an original finished 6 out of 10.
+RUN_MIN_VERSION_PLAYS = 3
+
 RUN_PLAYLIST_NAME_TEMPLATE = "{label} run · Claude"
 RUN_PLAYLIST_DESCRIPTION_TEMPLATE = (
     "{label} — high-intensity tracks for running, {known} from your library "

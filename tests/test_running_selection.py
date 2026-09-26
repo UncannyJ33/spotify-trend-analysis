@@ -355,6 +355,127 @@ check("John Summit's Subtronics remix is dubstep only",
 check("...and his own light years stays garage",
       pool_clusters("uri:light"), ["speed garage"])
 
+# --- song identity: pressings fold, remixes don't (C7) ------------------
+# Two keys. version_key drops only PRESSING notes (remaster, radio edit,
+# feat. ...), so the album cut and the single are one record while a remix
+# stays its own. song_key is playlists._title_key, which drops every suffix.
+# The folded title used to be the only key, so a garage original kept its own
+# remix out of dubstep, and "tell you straight" was two half-counted rows.
+VERSION_PAIRS = [
+    # (a, b, same version?)
+    ("Drugs I Like (AVELLO Remix)", "Drugs I Like", False),
+    ("War Pigs - 2012 - Remaster", "War Pigs", True),
+    ("Song - Radio Edit", "Song", True),
+    ("Song - Extended Mix", "Song", True),
+    ("Song (feat. X)", "Song", True),
+    ("Song - Remastered 2011", "Song", True),
+    ("Song (with X) - Radio Edit", "Song", True),
+    ("Song - Radio Edit (feat. X)", "Song", True),
+    ("Song - Sped Up", "Song", False),
+    ("Song - VIP", "Song", False),
+    ("iloveitiloveitiloveit - Garage", "iloveitiloveitiloveit", False),
+    # `clean` is a pressing note only when it is the whole segment.
+    ("Song - Clean Bandit Remix", "Song", False),
+    ("Song (Clean)", "Song", True),
+    # A title that is nothing but a note keeps its full form, not "".
+    ("(Remastered)", "", False),
+]
+for a, b, same in VERSION_PAIRS:
+    check(f"version_key: {a!r} {'==' if same else '!='} {b!r}",
+          running.version_key(a) == running.version_key(b), same)
+check("a remix is a different version of the SAME song",
+      running._title_key("Drugs I Like (AVELLO Remix)"),
+      running._title_key("Drugs I Like"))
+
+# One regex, two engines. DuckDB compiles RE2, which refuses lookaround and
+# backreferences that Python accepts, and a key that disagrees between the pool
+# (SQL) and the dedupe (Python) fails silently.
+titles = sorted({t for a, b, _ in VERSION_PAIRS for t in (a, b)}
+                | {"Inéz — Cañón", "東京 - Radio Edit", "Song - X Remix - Radio Edit",
+                   "Song  -  Radio Edit", "Song (feat. Jay-Z) [Explicit]"})
+sql_keys = dict(duckdb.connect().execute(
+    f"SELECT t, {running.version_key_sql('t')} FROM (SELECT unnest(?) AS t)",
+    [titles]).fetchall())
+for t in titles:
+    check(f"SQL version_key agrees with Python on {t!r}",
+          sql_keys[t], running.version_key(t))
+
+vp = duckdb.connect()
+vp.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Subtronics',  'dubstep', 4, TRUE),
+  ('Nuclear Act', 'dubstep', 4, TRUE)
+) t(artist_name, tag, tag_count, is_genre)""")
+running.build_artist_clusters(vp)
+vp.execute("""
+CREATE TABLE plays (spotify_track_uri VARCHAR, track_name VARCHAR,
+    artist_name VARCHAR, played_seconds DOUBLE, reason_end VARCHAR, month DATE,
+    ms_played BIGINT, ms_played_estimated BOOLEAN)""")
+
+def add_plays(uri, title, artist, n, n_done, secs):
+    vp.execute("""
+        INSERT INTO plays SELECT ?, ?, ?, ?,
+               CASE WHEN i < ? THEN 'trackdone' ELSE 'fwdbtn' END,
+               DATE '2026-06-01', 200000, FALSE
+        FROM range(?) t(i)""", [uri, title, artist, secs, n_done, n])
+
+# Two pressings of one version: counted whole, under the most-played URI.
+add_plays("uri:me1", "Mixed Evidence", "Subtronics", 3, 3, 200.0)
+add_plays("uri:me2", "Mixed Evidence - Radio Edit", "Subtronics", 1, 1, 200.0)
+# The remix finishes far more often than the original, which has more hours:
+# completion, not hours, decides which version of a song the playlist takes.
+add_plays("uri:orig", "Tune", "Nuclear Act", 26, 14, 400.0)
+add_plays("uri:rmx", "Tune (Other Remix)", "Nuclear Act", 39, 36, 100.0)
+# ...but not on two plays: 2/2 is not evidence against 6/10.
+add_plays("uri:o2", "Other Tune", "Nuclear Act", 10, 6, 200.0)
+add_plays("uri:vip", "Other Tune - VIP", "Nuclear Act", 2, 2, 200.0)
+vp.execute("""
+CREATE TABLE track_credits AS
+SELECT DISTINCT spotify_track_uri, artist_name, 'album_artist' AS credit_type,
+       'export' AS credit_source
+FROM plays""")
+running.build_known_pool(vp)
+
+def vp_rows(where):
+    cols = ["spotify_track_uri", "n_plays", "uris"]
+    return [dict(zip(cols, r)) for r in vp.execute(
+        f"SELECT {', '.join(cols)} FROM known_pool WHERE {where} "
+        "ORDER BY spotify_track_uri").fetchall()]
+
+me = vp_rows("album_artist = 'Subtronics'")
+check("two URIs of one version are one pool row", len(me), 1)
+check("...with the plays summed", me and me[0]["n_plays"], 4)
+check("...under the most-played pressing", me and me[0]["spotify_track_uri"], "uri:me1")
+check("...and every pressing's URI kept", me and me[0]["uris"], ["uri:me1", "uri:me2"])
+check("within a cluster the 0.92-done remix beats the 0.54-done original",
+      [r["spotify_track_uri"] for r in vp_rows("track_name LIKE 'Tune%'")],
+      ["uri:rmx"])
+check("a 2-play remix does not beat the original",
+      [r["spotify_track_uri"] for r in vp_rows("track_name LIKE 'Other Tune%'")],
+      ["uri:o2"])
+
+# Across the two playlists a song is judged by VERSION: an original placed in
+# garage no longer blocks its remix from dubstep. Within one playlist it is
+# still one version per song.
+pl = running.Placements()
+orig = {"spotify_track_uri": "u:o", "artist_name": "SIDEPIECE",
+        "track_name": "Drugs I Like"}
+remix = {"spotify_track_uri": "u:r", "artist_name": "SIDEPIECE",
+         "track_name": "Drugs I Like (AVELLO Remix)"}
+single = {"spotify_track_uri": "u:s", "artist_name": "SIDEPIECE",
+          "track_name": "Drugs I Like - Radio Edit"}
+pl.place(orig)
+check("in garage, the original's remix is a second version: refused",
+      pl.fresh(remix), False)
+pl.new_playlist()
+check("in dubstep, the remix is fresh", pl.fresh(remix), True)
+check("...but another pressing of the placed original is not",
+      pl.fresh(single), False)
+check("...nor the same URI", pl.fresh(dict(remix, spotify_track_uri="u:o")), False)
+pl.place(remix)
+pl.release(remix)
+check("a released row can be offered again", pl.fresh(remix), True)
+
 # --- overrides ----------------------------------------------------------
 # A veto naming only an artist removes all of their tracks.
 vetoes = {(running.normalise("Subtronics"), running.normalise(""))}

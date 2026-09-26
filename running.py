@@ -118,6 +118,105 @@ CLUSTERS = (
 
 
 # --------------------------------------------------------------------------
+# Song identity — a SONG and a VERSION are different keys
+# --------------------------------------------------------------------------
+
+# What a version key throws away once pressing notes are gone: ASCII
+# punctuation and space, plus the typographic marks Spotify titles carry.
+# Spelled as code points both engines read alike; \W would not do, since
+# Python's is Unicode-aware and RE2's is ASCII-only. Non-ASCII letters stay,
+# so a title in another script does not fold to "".
+_VERSION_FOLD_RE = r"[\x00-\x2f\x3a-\x40\x5b-\x60\x7b-\x7f\xa0‘’“”–—…]+"
+
+
+def version_key(title: str) -> str:
+    """The RECORDING a title names: pressing notes dropped, remixes kept.
+
+    config.RUN_PRESSING_NOTE_RE says what a pressing note is. The song key,
+    playlists._title_key, folds harder and drops every suffix; the two
+    together let a playlist hold one version of a song while the other
+    playlist holds a different one. version_key_sql is the same key in DuckDB,
+    and a test holds the two to the same answers.
+    """
+    t = title or ""
+    head = re.sub(config.RUN_PRESSING_NOTE_RE, "", t)
+    # A title that is only a note ("(Remastered)") keeps its full form rather
+    # than folding to "" and matching every other such title.
+    return (re.sub(_VERSION_FOLD_RE, "", head.lower())
+            or re.sub(_VERSION_FOLD_RE, "", t.lower()))
+
+
+def version_key_sql(col: str) -> str:
+    """version_key as a DuckDB expression over the column `col`."""
+    note = config.RUN_PRESSING_NOTE_RE.replace("'", "''")
+    fold = _VERSION_FOLD_RE.replace("'", "''")
+    return (f"coalesce(nullif(regexp_replace(lower(regexp_replace("
+            f"{col}, '{note}', '', 'g')), '{fold}', '', 'g'), ''), "
+            f"regexp_replace(lower({col}), '{fold}', '', 'g'))")
+
+
+def register_song_key(con: duckdb.DuckDBPyConnection) -> None:
+    """song_key(title) in SQL — playlists._title_key itself, not a copy.
+
+    Its normalise() folds accents through NFKD and drops "the" and "and",
+    which DuckDB cannot reproduce, and a second definition is exactly how two
+    keys for one idea drift apart.
+    """
+    if not con.execute("SELECT count(*) FROM duckdb_functions() "
+                       "WHERE function_name = 'song_key'").fetchone()[0]:
+        con.create_function("song_key", _title_key, ["VARCHAR"], "VARCHAR")
+
+
+class Placements:
+    """What is already placed, in this playlist or the other one.
+
+    Three keys, because Spotify presses one recording as several URIs and one
+    song as several recordings:
+    - the URI;
+    - (artist, version_key), across BOTH playlists. The album cut, the single
+      and the remaster are one record, and the first dry run duly listed
+      jigitz's 'tell you straight' twice in one playlist;
+    - (artist, song_key), within the CURRENT playlist only. One version of a
+      song per playlist — but an original placed in garage no longer keeps its
+      own remix out of dubstep, which the folded title alone used to do.
+    """
+
+    def __init__(self) -> None:
+        self.uris: set[str] = set()
+        self.versions: set[tuple] = set()
+        self.songs: set[tuple] = set()
+
+    def new_playlist(self) -> None:
+        self.songs = set()
+
+    @staticmethod
+    def _keys(row: dict) -> tuple[tuple, tuple]:
+        artist = normalise(row.get("artist_name") or "")
+        title = row.get("track_name") or ""
+        return (artist, version_key(title)), (artist, _title_key(title))
+
+    def fresh(self, row: dict) -> bool:
+        version, song = self._keys(row)
+        return (row.get("spotify_track_uri") not in self.uris
+                and version not in self.versions and song not in self.songs)
+
+    def place(self, row: dict) -> dict:
+        version, song = self._keys(row)
+        self.uris.add(row.get("spotify_track_uri"))
+        self.versions.add(version)
+        self.songs.add(song)
+        return row
+
+    def release(self, row: dict) -> None:
+        """Un-claim a row the duration fill turned away, so the other
+        playlist can still be offered it."""
+        version, song = self._keys(row)
+        self.uris.discard(row.get("spotify_track_uri"))
+        self.versions.discard(version)
+        self.songs.discard(song)
+
+
+# --------------------------------------------------------------------------
 # Classification — which artists belong to which cluster
 # --------------------------------------------------------------------------
 
@@ -245,12 +344,21 @@ def classify_tags(tags: list[dict], min_weight: int = 0,
 
 
 def build_known_pool(con: duckdb.DuckDBPyConnection) -> None:
-    """Tracks from the listener's own recent history, per cluster.
+    """Versions from the listener's own recent history, per cluster.
 
     The join is on track_credits, NOT on plays.artist_name, so a track counts
     for the artists actually on it. That is the whole reason Stage 1b learned
     to parse `- X Remix`: without it a Halsey track remixed by Ian Asher is
     judged on Halsey's tags.
+
+    ONE ROW PER VERSION, not per URI. Spotify presses the album cut, the single
+    and the remaster as distinct URIs, and per URI "tell you straight" was two
+    rows on 70 and 44 plays, each judged on part of its evidence. Pressings are
+    grouped on (album artist, version_key): plays, hours and completions are
+    summed, credits are the union over every pressing (the poller may have
+    seen one and not another), and the row carries the most-played URI, which
+    is what the playlist will play. `uris` keeps the rest. A remix is its own
+    version, so it is judged on its own plays.
 
     POLLED PLAYS COUNT AS TIME, NOT AS EVIDENCE. A polled row carries an
     estimated ms_played and a NULL reason_end, so read as completion every one
@@ -265,16 +373,17 @@ def build_known_pool(con: duckdb.DuckDBPyConnection) -> None:
     export's coverage and lost 1,801 plays (82.6 h) off the far end. There is no
     upper bound, so polled plays past the horizon are still counted.
 
-    Duration is the MEDIAN completed export play; failing that, a polled
-    ms_played, which the poller records as the whole track's length.
+    Duration is the representative pressing's MEDIAN completed export play;
+    failing that, a polled ms_played, which the poller records as the whole
+    track's length; failing that, the median over its other pressings.
 
     WHICH CREDITS MAY PLACE A TRACK. The album artist, a remixer, or a feature
     the poller saw. A feature from the export is Stage 1b's title regex — a
     guess — and never admits on its own: Todd Edwards' 0.54 h in this window is
     two Daft Punk edits he is guessed onto, and that guess is how he reached
-    the garage seeds at all. A blanket ban on features would be wrong the other way, eroding every
-    remixer keep as polling grows, because credits.py types every non-first
-    poller artist as `featured`, remixers included.
+    the garage seeds at all. A blanket ban on features would be wrong the other
+    way, eroding every remixer keep as polling grows, because credits.py types
+    every non-first poller artist as `featured`, remixers included.
 
     A remix belongs to its REMIXER's run. Habstrakt's bass house put "The One -
     NGHTMRE Remix" in garage; the record is NGHTMRE's. So when the title's
@@ -286,14 +395,20 @@ def build_known_pool(con: duckdb.DuckDBPyConnection) -> None:
     dubstep) neither admits nor refuses. There is no drag test on the known
     side: a hand tag on a singer must never move a track the listener plays.
 
+    ONE VERSION PER SONG PER CLUSTER. Where an album artist's original and its
+    remix both qualify, the one listened through more often takes the slot, as
+    long as it has RUN_MIN_VERSION_PLAYS plays behind it: "Drugs I Like (AVELLO
+    Remix)" over the original it outlasts, but not a remix finished twice.
+
     The per-artist cap is keyed on the ALBUM artist. A remixer who also has
     their own releases is capped on those separately, which is why Blair Muir
     can bring REHAB and Disturbia while his Luude remix counts against Luude.
     """
+    register_song_key(con)
     con.execute(
         f"""
         CREATE OR REPLACE TABLE known_pool AS
-        WITH recent AS (
+        WITH per_uri AS (
             SELECT
                 p.spotify_track_uri,
                 any_value(p.track_name)  AS track_name,
@@ -301,12 +416,10 @@ def build_known_pool(con: duckdb.DuckDBPyConnection) -> None:
                 -- Completion evidence: export plays only.
                 count(*) FILTER (WHERE NOT p.ms_played_estimated) AS n_plays,
                 count(*)                                          AS n_plays_all,
+                count(*) FILTER (WHERE NOT p.ms_played_estimated
+                                   AND p.reason_end = 'trackdone') AS n_done,
                 -- Polled estimates count as time.
                 sum(p.played_seconds) / 3600.0 AS hours,
-                coalesce(
-                    avg(CASE WHEN p.reason_end = 'trackdone' THEN 1.0 ELSE 0 END)
-                        FILTER (WHERE NOT p.ms_played_estimated),
-                    0) AS done_rate,
                 -- MEDIAN, not max. A completed play's ms_played is the track's
                 -- duration, but the odd play reports far more than the track
                 -- runs (a paused stream that kept counting). max() took
@@ -325,32 +438,63 @@ def build_known_pool(con: duckdb.DuckDBPyConnection) -> None:
                              - INTERVAL {config.RUN_WINDOW_MONTHS} MONTH
             GROUP BY 1
         ),
+        members AS (
+            -- Every pressing points at its version's representative: the
+            -- most-played URI, which is the one the playlist carries.
+            SELECT *,
+                   first_value(spotify_track_uri) OVER (
+                       PARTITION BY coalesce(lower(album_artist), ''),
+                                    {version_key_sql('track_name')}
+                       ORDER BY n_plays_all DESC, hours DESC, spotify_track_uri
+                   ) AS rep_uri
+            FROM per_uri
+        ),
+        grouped AS (
+            SELECT rep_uri AS spotify_track_uri,
+                   list(spotify_track_uri ORDER BY spotify_track_uri) AS uris,
+                   sum(n_plays)::BIGINT     AS n_plays,
+                   sum(n_plays_all)::BIGINT AS n_plays_all,
+                   sum(n_done)::BIGINT      AS n_done,
+                   sum(hours)               AS hours,
+                   median(duration_ms)      AS any_duration_ms
+            FROM members
+            GROUP BY 1
+        ),
+        recent AS (
+            SELECT g.spotify_track_uri, p.track_name, p.album_artist, g.uris,
+                   g.n_plays, g.n_plays_all, g.hours,
+                   coalesce(g.n_done / nullif(g.n_plays, 0), 0) AS done_rate,
+                   coalesce(p.duration_ms, g.any_duration_ms)   AS duration_ms
+            FROM grouped g
+            JOIN per_uri p USING (spotify_track_uri)
+        ),
         admitting AS (
-            -- The credits allowed to place a track in a cluster.
-            SELECT r.spotify_track_uri, c.artist_name, ac.cluster,
-                   ac.garage_w + ac.bass_w AS w
-            FROM recent r
-            JOIN track_credits c USING (spotify_track_uri)
+            -- The credits allowed to place a version in a cluster, over every
+            -- pressing's credits.
+            SELECT DISTINCT m.rep_uri AS spotify_track_uri, c.artist_name,
+                   ac.cluster, ac.garage_w + ac.bass_w AS w
+            FROM members m
+            JOIN track_credits c ON c.spotify_track_uri = m.spotify_track_uri
             JOIN artist_clusters ac ON ac.artist_name = c.artist_name
             WHERE ac.cluster IS NOT NULL
               AND (c.credit_type IN ('album_artist', 'remixer')
                    OR (c.credit_type = 'featured' AND c.credit_source = 'poller'))
         ),
         routed AS (
-            -- The remixer the TITLE names, when they are an admitting cluster
-            -- artist on the record. regexp_extract gives '' on no match, and
-            -- no credited name is that short.
+            -- The remixer a pressing's TITLE names, when they are an admitting
+            -- cluster artist on the record. regexp_extract gives '' on no
+            -- match, and no credited name is that short.
             SELECT a.spotify_track_uri,
                    first(a.cluster ORDER BY a.w DESC, a.cluster) AS remix_cluster
             FROM admitting a
-            JOIN recent r USING (spotify_track_uri)
+            JOIN members m ON m.rep_uri = a.spotify_track_uri
             WHERE lower(trim(a.artist_name)) = lower(trim(
-                      regexp_extract(r.track_name, '{REMIX_CREDIT_RE}', 1, 'i')))
+                      regexp_extract(m.track_name, '{REMIX_CREDIT_RE}', 1, 'i')))
             GROUP BY 1
         ),
         credited AS (
             SELECT r.*, a.cluster,
-                   -- One row per (track, cluster): a track crediting three
+                   -- One row per (version, cluster): a track crediting three
                    -- qualifying artists is one track, not three.
                    row_number() OVER (
                        PARTITION BY r.spotify_track_uri, a.cluster
@@ -360,22 +504,35 @@ def build_known_pool(con: duckdb.DuckDBPyConnection) -> None:
             JOIN admitting a USING (spotify_track_uri)
             LEFT JOIN routed x USING (spotify_track_uri)
             WHERE x.remix_cluster IS NULL OR a.cluster = x.remix_cluster
+        ),
+        scored AS (
+            SELECT
+                spotify_track_uri, track_name, album_artist, cluster, uris,
+                n_plays, n_plays_all, hours, done_rate, duration_ms,
+                -- Laplace-smoothed completion. A track played once and
+                -- finished is not evidence of the same strength as one
+                -- finished forty times, and (done+1)/(n+2) says so without
+                -- discarding the single play. n is the EXPORT count, so a
+                -- polled-only track sits at 0.5.
+                (done_rate * n_plays + 1) / (n_plays + 2) AS done_smoothed,
+                hours * ((done_rate * n_plays + 1) / (n_plays + 2)) AS score
+            FROM credited
+            WHERE rn = 1
+              -- A track skipped repeatedly is not a track that carries a run.
+              -- Applied only where there is enough evidence to mean anything,
+              -- and polled plays are not evidence.
+              AND NOT (n_plays >= 3
+                       AND done_rate < {config.RUN_MIN_TRACKDONE_RATE})
         )
-        SELECT
-            spotify_track_uri, track_name, album_artist, cluster,
-            n_plays, n_plays_all, hours, done_rate, duration_ms,
-            -- Laplace-smoothed completion. A track played once and finished is
-            -- not evidence of the same strength as one finished forty times,
-            -- and (done+1)/(n+2) says so without discarding the single play.
-            -- n is the EXPORT count, so a polled-only track sits at 0.5.
-            (done_rate * n_plays + 1) / (n_plays + 2) AS done_smoothed,
-            hours * ((done_rate * n_plays + 1) / (n_plays + 2)) AS score
-        FROM credited
-        WHERE rn = 1
-          -- A track skipped repeatedly is not a track that carries a run.
-          -- Applied only where there is enough evidence to mean anything,
-          -- and polled plays are not evidence.
-          AND NOT (n_plays >= 3 AND done_rate < {config.RUN_MIN_TRACKDONE_RATE})
+        SELECT * FROM scored
+        -- One version per song per cluster, chosen after the skip floor so a
+        -- floored original leaves the slot to its remix.
+        QUALIFY row_number() OVER (
+            PARTITION BY cluster, coalesce(lower(album_artist), ''),
+                         song_key(track_name)
+            ORDER BY n_plays >= {config.RUN_MIN_VERSION_PLAYS} DESC,
+                     done_smoothed DESC, score DESC, spotify_track_uri
+        ) = 1
         ORDER BY ALL
         """
     )
@@ -932,33 +1089,16 @@ def build_selections(con, http, sp) -> list[dict]:
     # Shared across BOTH playlists. These are meant to be compared on real
     # runs, so a track — or an artist — appearing in both makes the comparison
     # say less. The first dry run put The Prodigy and Breathe Carolina in each.
-    used_uris: set[str] = set()
-    used_songs: set[str] = set()
+    # Placements says what "the same track" means; see its docstring.
+    placed = Placements()
+    fresh, place = placed.fresh, placed.place
     used_discovery_artists: set[str] = set()
-
-    def fresh(row: dict) -> bool:
-        """Not already placed, in this playlist or the other one.
-
-        Song identity is the FOLDED title, not the URI: Spotify presses the
-        album cut, the single and the extended mix as distinct URIs, and the
-        first dry run duly listed jigitz's 'tell you straight' twice in one
-        playlist.
-        """
-        uri = row.get("spotify_track_uri")
-        song = (normalise(row.get("artist_name") or ""),
-                _title_key(row.get("track_name") or ""))
-        return uri not in used_uris and song not in used_songs
-
-    def place(row: dict) -> dict:
-        used_uris.add(row.get("spotify_track_uri"))
-        used_songs.add((normalise(row.get("artist_name") or ""),
-                        _title_key(row.get("track_name") or "")))
-        return row
 
     out = []
     for cluster in CLUSTERS:
         label, tags = cluster["label"], list(cluster["tags"])
         print(f"\n{pretty(label)} run")
+        placed.new_playlist()
 
         # Pins are placed first and are exempt from folding: the suffix IS the
         # record, and folding would let a different pressing take the slot.
@@ -976,9 +1116,7 @@ def build_selections(con, http, sp) -> list[dict]:
         kept = {k["spotify_track_uri"] for k in known}
         for r in pinned + picked:
             if r["spotify_track_uri"] not in kept:
-                used_uris.discard(r["spotify_track_uri"])
-                used_songs.discard((normalise(r.get("artist_name") or ""),
-                                    _title_key(r.get("track_name") or "")))
+                placed.release(r)
         print(f"  {len(known)} known tracks "
               f"({sum(1 for k in known if k.get('pinned'))} pinned), "
               f"{sum(k['duration_ms'] for k in known)/60000:.0f} min")
