@@ -141,7 +141,9 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection,
                    sum(p.played_seconds) / 3600.0 AS hours
             FROM plays p
             WHERE p.spotify_track_uri IS NOT NULL
-              AND p.month >= (SELECT max(month) FROM plays)
+              -- The export horizon, not the latest play: a polled row past the
+              -- export's coverage would slide the window forward.
+              AND p.month >= {config.ANALYSIS_HORIZON_SQL}
                              - INTERVAL {config.ANCHOR_WINDOW_MONTHS} MONTH
               AND EXISTS (
                   SELECT 1 FROM artist_tags t
@@ -451,21 +453,27 @@ def sp_artist_tracks(sp, artist: str, cache: dict) -> list[dict]:
     per-artist cap downstream stays keyed on one spelling.
 
     An empty answer caches like any other: an artist Spotify does not carry is
-    asked once, not once per run.
+    asked once, not once per run. A FAILED request is not an answer — a 429,
+    an error envelope or no response at all used to be written as "no tracks",
+    and an append-only cache never asked again. Records now carry the status;
+    an empty one from before that may have been a failure, so it is asked once
+    more and the new record wins.
     """
     key = normalise(artist)
-    if key in cache:
-        return [dict(t, artist_name=artist) for t in cache[key]["tracks"]]
+    hit = cache.get(key)
+    if hit and ("status" in hit or hit["tracks"]):
+        return [dict(t, artist_name=artist) for t in hit["tracks"]]
     resp = sp.get("/search", params={
         "q": f'artist:"{artist.replace(chr(34), "")}"',
         "type": "track", "limit": SP_SEARCH_LIMIT,
     })
-    items = (resp.get("tracks", {}).get("items", [])
-             if isinstance(resp, dict) and "_status" not in resp else [])
+    if not isinstance(resp, dict) or "_status" in resp:
+        return []
+    items = (resp.get("tracks") or {}).get("items", [])
     tracks = [{"track_name": it.get("name"), "spotify_track_uri": it.get("uri")}
               for it in items
               if it.get("uri") and _artist_match(it, artist)]
-    rec = {"key": key, "artist": artist, "tracks": tracks}
+    rec = {"key": key, "artist": artist, "status": 200, "tracks": tracks}
     append_jsonl(ARTIST_TRACKS_CACHE, rec)
     cache[key] = rec
     return [dict(t, artist_name=artist) for t in tracks]
@@ -494,7 +502,8 @@ def _alive(resp) -> bool:
     return bool(isinstance(resp, dict) and "_status" not in resp and resp.get("id"))
 
 
-def ensure_playlist(sp, tag: str, name: str, state: dict) -> str:
+def ensure_playlist(sp, tag: str, name: str, state: dict,
+                    aliases: tuple[str, ...] = ()) -> str:
     """Resolve the playlist this stage owns for `tag`, creating if needed.
 
     Identity is the stored ID — immune to the user renaming things. The name
@@ -503,21 +512,34 @@ def ensure_playlist(sp, tag: str, name: str, state: dict) -> str:
     playlist, and adopting it would mean this stage overwrites something a
     person built. Creating a duplicate is the cheap mistake; overwriting is
     the expensive one.
+
+    `aliases` are names the playlist carried before a rename (Stage 10's
+    garage run was "speed garage run · Claude"), tried in order after `name`
+    and just as exactly. The current name wins wherever it sits in the
+    listing; an alias is adopted only when nothing carries the current name,
+    so lost state after a rename finds the old playlist instead of creating
+    a second. Stage 8 passes none.
     """
     entry = state.get(tag) or {}
     if entry.get("id"):
         if _alive(sp.get(f"/playlists/{entry['id']}", params={"fields": "id,name"})):
             return entry["id"]
 
+    under_alias: dict[str, str] = {}
     page = sp.get("/me/playlists", params={"limit": 50})
     while isinstance(page, dict) and "_status" not in page:
         for item in page.get("items", []):
             if item.get("name") == name:
                 return item["id"]
+            if item.get("name") in aliases:
+                under_alias.setdefault(item["name"], item["id"])
         nxt = page.get("next")
         if not nxt:
             break
         page = sp.get(nxt.removeprefix(SP_API), params=None)
+    for alias in aliases:
+        if alias in under_alias:
+            return under_alias[alias]
 
     # POST /me/playlists, not /users/{uid}/playlists — the per-user endpoints
     # were removed in Feb 2026 and the old path now 403s.

@@ -3,29 +3,55 @@ playlist,decision,artist_name,track_name,note
 # gitignored because it states personal taste, this one is not. Same split as
 # .env / .env.example and artist_overrides.csv.
 #
-# An override always outranks a computed score.
+# An override always outranks a computed score. A row whose FIRST cell starts
+# with # is a comment.
 #
 # COLUMNS
-#   playlist    which playlist this applies to: the cluster label ("speed
-#               garage" or "dubstep"). BLANK means both.
-#   decision    keep  = pin this track in, whatever the classifier thinks.
-#               drop  = veto it. Leave track_name blank to veto every track
-#                       by that artist.
-#   artist_name the ALBUM artist as it appears in your listening history.
-#   track_name  the FULL title, suffix and all. Not the folded one — see below.
+#   playlist    which playlist this applies to, by the cluster's label or its
+#               title, case aside: "speed garage" or "garage & house" (one
+#               playlist, renamed), and "dubstep". BLANK means both. The label
+#               is what running_state.json and the archive are keyed on and
+#               never changes; the title is only what Spotify shows, so a row
+#               written with either keeps working across a rename. A value
+#               that is neither is warned about and the row skipped.
+#   decision    keep     = pin this track in, whatever the classifier thinks.
+#               drop     = veto it. Leave track_name blank to veto every track
+#                          by that artist. A drop applies to BOTH playlists,
+#                          whatever the playlist column says.
+#               discover = offer this act's tracks as new music. See below.
+#               prefer   = use one of your own playlists as a tie-breaker.
+#                          See below.
+#   artist_name keep:     the ALBUM artist as it appears in your listening
+#                         history.
+#               drop:     any artist credited on the track (see below).
+#               discover: the act's name as Spotify spells it.
+#               prefer:   BLANK. Every other row type needs an artist; this
+#                         one names a playlist instead.
+#   track_name  keep/drop: the FULL title, suffix and all. Not the folded one
+#                          — see below.
+#               prefer:    the playlist's exact name.
 #   note        free text for your own benefit. Never read by the code.
 #
 # WHY track_name IS THE FULL TITLE
-#   Track dedupe folds a title at the first ' - ', so "Song - Garage" and
-#   "Song" collide. That is correct for dedupe (Spotify presses the album cut,
-#   the single and the remaster as three URIs) and wrong for a pin, where the
-#   suffix IS the record you mean. Pins are matched unfolded against your play
-#   history, so you get the pressing you actually listened to.
+#   Within a playlist, track dedupe keeps one version of each song and folds a
+#   title at the first ' - ', so "Song - Garage" and "Song" collide. That is
+#   correct for dedupe (Spotify presses the album cut, the single and the
+#   remaster as three URIs) and wrong for a pin, where the suffix IS the record
+#   you mean. Pins are matched unfolded against your play history, so you get
+#   the pressing you actually listened to.
 #
 # WHY VETOES EXIST
 #   Genre tags are per ARTIST, so an artist with a mixed catalogue gets one
 #   verdict for all their tracks. Completion rate catches most of it — a track
 #   you skip ranks low on its own. A veto is for the rest.
+#
+# A VETO MATCHES EVERY CREDIT ON THE TRACK, NOT ONLY THE ALBUM ARTIST
+#   Features and remixers included. Vetoing an artist removes everything they
+#   are ON: a record by someone else that features them goes too. On new music
+#   the credits are Spotify's own. On your own tracks they are what your
+#   history and Stage 1b's title parsing know, which is not always what Spotify
+#   shows: a collaborator absent from both the export's artist field and the
+#   title stays invisible to a veto until the poller has seen the track.
 #
 # VETOING ONE TRACK CAN MAKE THINGS WORSE
 #   The per-artist cap means dropping a track frees a slot, and the next track
@@ -37,15 +63,37 @@ playlist,decision,artist_name,track_name,note
 #   more specific than a blanket drop and outranks it: pins are resolved before
 #   the veto filter runs.
 #
+# DISCOVER ROWS
+#   Name an act MusicBrainz never tagged, which no genre test can admit, and
+#   its tracks are offered as new music ahead of every other discovery source.
+#   A discover row must name its playlist: a blank one is warned about and
+#   skipped rather than read as "both". It skips the genre test, since your
+#   answer outranks a computed one, but every track still passes the same
+#   checks as any other new music: no live recordings, nothing over 4.5
+#   minutes, nothing you have already started, nothing led or remixed by a
+#   pop, rap or melodic act. A drop on the same artist wins.
+#
+# PREFER ROWS
+#   Name a playlist you built by hand for running. Its tracks are a prior the
+#   score cannot see: a member's score is multiplied by 1 + RUN_PREFER_MARGIN
+#   (1.25), so it overtakes a non-member scoring less than a quarter above it.
+#   A tie-breaker, not a pin: a vetoed member is still vetoed, and nothing is
+#   added that would not have qualified anyway. artist_name is BLANK and
+#   track_name carries the playlist name, exactly, case and all. If no
+#   playlist has that exact name the run warns and carries on without the
+#   boost.
+#
 # WHAT THIS FILE CANNOT DO
-#   It cannot make an untagged artist eligible: nothing here changes genre
-#   data. An artist missing from the playlists because MusicBrainz never
-#   tagged them is answered in artist_overrides.csv, whose `tags` column
-#   supplies genres by hand. Stage 10's report prints the ones worth fixing,
-#   ranked by listening time.
+#   A discover row can add an untagged act to DISCOVERY. Nothing here makes an
+#   untagged artist's own plays eligible for the known side: that needs genre
+#   data, which lives in artist_overrides.csv, whose `tags` column supplies
+#   genres by hand. Stage 10's report prints the artists worth fixing, ranked
+#   by listening time.
 #
 # --- examples (inert: delete the # to use one) ---
-# speed garage,keep,Some Artist,Some Track - Garage,the garage mix is the record
+# garage & house,keep,Some Artist,Some Track - Garage,the garage mix is the record
 # dubstep,keep,Another Artist,Another Track,
 # ,drop,A Melodic Act,,uniformly too slow to run to
+# speed garage,discover,An Untagged Scene Act,,label or title both work
+# ,prefer,,My Running Mix,hand-built; breaks near-ties toward its tracks
 playlist,decision,artist_name,track_name,note

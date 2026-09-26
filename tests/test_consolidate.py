@@ -238,6 +238,146 @@ check("added_at carried through", all(r["added_at"] for r in got), True)
 config.CONSOLIDATE_OVERRIDES_CSV, config.CONSOLIDATE_REVIEW_CSV = _saved_ov, _saved_rv
 
 
+print("\nresolve_missing — Stage 2's override file, and only real answers cached")
+
+# Offline: Throttled is replaced by a fake that counts requests, and every
+# cache and override file lives in a temp dir.
+import json  # noqa: E402
+from collections import Counter  # noqa: E402
+
+import enrich  # noqa: E402
+
+_saved_paths = (enrich.CACHE_FILE, config.ARTIST_OVERRIDES_CSV,
+                consolidate.CONSOLIDATE_CACHE, enrich.Throttled)
+enrich.CACHE_FILE = _tmp / "artist_resolution.jsonl"
+config.ARTIST_OVERRIDES_CSV = _tmp / "artist_overrides.csv"
+consolidate.CONSOLIDATE_CACHE = _tmp / "consolidate_artists.jsonl"
+WRONG, TION, QUIET = ("11111111-2222-4333-8444-555555555555",
+                      "22222222-3333-4444-8555-666666666666",
+                      "33333333-4444-4555-8666-777777777777")
+
+
+class FakeResponse:
+    def __init__(self, body, status_code=200):
+        self._body, self.status_code = body, status_code
+    def json(self):
+        return self._body
+
+
+class FakeMB:
+    """MusicBrainz search and release groups. `down` names what is failing."""
+    def __init__(self, down=()):
+        self.down, self.calls = set(down), Counter()
+    def get(self, url, **kw):
+        if url == enrich.MB_SEARCH_URL:
+            name = kw["params"]["query"].split('"')[1]
+            self.calls[f"search {name}"] += 1
+            if "search" in self.down:
+                return FakeResponse({}, 503)
+            mbid = {"Tion Wayne": TION, "Quiet Act": QUIET}.get(name)
+            return FakeResponse({"artists": [
+                {"id": mbid, "name": name, "score": 100, "tags": []}] if mbid else []})
+        if url == enrich.MB_RELEASE_GROUP_URL:
+            mbid = kw["params"]["artist"]
+            self.calls[f"release-group {mbid}"] += 1
+            if "release-group" in self.down:
+                return FakeResponse({}, 503)
+            tags = [{"name": "uk drill", "count": 4}] if mbid == TION else []
+            return FakeResponse({"release-groups": [{"tags": tags}]})
+        raise AssertionError(f"unexpected request: {url}")
+
+
+def resolve(names, http):
+    enrich.Throttled = lambda interval: http
+    w = {}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        consolidate.resolve_missing(names, w)
+    return w, buf.getvalue()
+
+
+def stage9_cached():
+    if not consolidate.CONSOLIDATE_CACHE.exists():
+        return []
+    return [json.loads(l)["artist_name"] for l in
+            consolidate.CONSOLIDATE_CACHE.read_text(encoding="utf-8").splitlines()]
+
+
+# enrich writes IGNORE and NONE over its cache in memory only, so the raw cache
+# still holds the auto-match each row was written to throw away.
+RAP = [{"tag": "gangsta rap", "count": 9}]
+for name in ("Wrong Match", "Not An Artist", "Known"):
+    enrich.append_cache({"artist_name": name, "source": "musicbrainz",
+                         "status": "resolved", "mbid": WRONG,
+                         "tags": RAP if name != "Known" else
+                         [{"tag": "techno", "count": 5}]})
+consolidate.CONSOLIDATE_CACHE.write_text(json.dumps(
+    {"artist_name": "Stage9 Match", "status": "resolved", "mbid": WRONG,
+     "tags": RAP}) + "\n", encoding="utf-8")
+config.ARTIST_OVERRIDES_CSV.write_text(
+    "artist_name,mbid,note,tags\n"
+    "Wrong Match,NONE,no MusicBrainz entry; was matching someone else,\n"
+    "Not An Artist,IGNORE,not an artist,\n"
+    "Playlist Only,none,never cached anywhere,\n"
+    "Stage9 Match,NONE,Stage 9 matched it before the row existed,\n",
+    encoding="utf-8")
+
+http = FakeMB()
+w, out = resolve(["Wrong Match", "Not An Artist", "Playlist Only",
+                  "Stage9 Match", "Known"], http)
+check("NONE over a cached wrong match: not scored on its tags",
+      "wrongmatch" in w, False)
+check("IGNORE over a cached match: not scored", "notanartist" in w, False)
+check("NONE over Stage 9's own cached match: not scored either",
+      "stage9match" in w, False)
+check("an answered name is never searched", dict(http.calls), {})
+check("an unanswered cached name is still read for free",
+      (w.get("known") or {}).get("edm_w"), 5.0)
+check("the answered names are counted in the run line",
+      "4 answered IGNORE/NONE" in out, True)
+
+# A failed release-group request is not an answer. Folding it into [] cached
+# "resolved, untagged", and this cache is read before the network, so one
+# outage left Tion Wayne unscorable on every later run.
+http = FakeMB(down={"release-group"})
+w, _ = resolve(["Tion Wayne"], http)
+check("release-group failure: unscorable this run", "tionwayne" in w, False)
+check("release-group failure: nothing cached", "Tion Wayne" in stage9_cached(), False)
+
+http = FakeMB()
+w, _ = resolve(["Tion Wayne"], http)
+check("next run asks again, search and release groups",
+      dict(http.calls), {"search Tion Wayne": 1, f"release-group {TION}": 1})
+check("...and scores him on what they return", (w.get("tionwayne") or {}).get("rap_w"), 4.0)
+check("...which is now cached", stage9_cached().count("Tion Wayne"), 1)
+
+http = FakeMB()
+w, _ = resolve(["Tion Wayne"], http)
+check("a cached answer costs nothing", dict(http.calls), {})
+check("...and still scores", (w.get("tionwayne") or {}).get("rap_w"), 4.0)
+
+# An empty 200 IS an answer: releases exist and nobody tagged them.
+http = FakeMB()
+w, _ = resolve(["Quiet Act"], http)
+check("untagged release groups: unscorable", "quietact" in w, False)
+check("...but cached, since MusicBrainz answered", "Quiet Act" in stage9_cached(), True)
+http = FakeMB()
+resolve(["Quiet Act"], http)
+check("...so the next run spends nothing", dict(http.calls), {})
+
+# A failed search is the same mistake one step earlier.
+consolidate.CONSOLIDATE_CACHE.unlink()
+http = FakeMB(down={"search"})
+w, _ = resolve(["Tion Wayne"], http)
+check("search failure: nothing cached", stage9_cached(), [])
+http = FakeMB()
+resolve(["Tion Wayne"], http)
+check("...so the next run searches again", http.calls["search Tion Wayne"], 1)
+
+(enrich.CACHE_FILE, config.ARTIST_OVERRIDES_CSV,
+ consolidate.CONSOLIDATE_CACHE, enrich.Throttled) = _saved_paths
+
+
 print("\nthe standing invariant")
 
 # Spotify has no delete-playlist API at all, only unfollow. Stage 8's client

@@ -5,6 +5,9 @@ Tag coverage in this library falls monotonically with listening time: 100% of
 resolve perfectly and still contribute nothing, and the smaller the act the
 likelier that is. This is the only path by which a genre enters the project by
 hand rather than by lookup, so it has to refuse bad input loudly.
+
+The last section covers the other side of that file: the names resolution must
+refuse, so that they reach the review list the file answers.
 """
 import sys
 sys.path.insert(0, ".")
@@ -136,6 +139,377 @@ check("a real MBID still pins",
 check("tags-only row is not mistaken for a pin",
       ov[enrich.normalise("NoMbid")]["mbid"] is None
       and not ov[enrich.normalise("NoMbid")]["ignore"], True)
+
+# --------------------------------------------------------------------------
+# NONE: a real artist with no MusicBrainz entry, whose name was auto-matched to
+# somebody else BEFORE the row was written. A blank mbid cannot fix that: the
+# tags-only path leaves resolution alone, the name is never searched again, and
+# the hand tags end up hung on the wrong MBID. Three research-pass rows were in
+# exactly this state — PLAT. on the vaporwave ＰＬＡＴ, Unconscious Mind on a
+# Canadian black-metal band, emerge on a dark-ambient act — and the MBID is
+# what seeds ListenBrainz, so discovery ran on a stranger's neighbours while
+# the genres looked right.
+# --------------------------------------------------------------------------
+import contextlib
+import io
+import json
+from collections import Counter
+
+import duckdb
+
+WRONG = "11111111-2222-4333-8444-555555555555"      # the other artists' MBIDs
+WRONG2 = "66666666-7777-4888-9999-aaaaaaaaaaaa"
+ORGANIC = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+PIN = "e142ed6b-3b35-40e6-92fc-722bbb497dc1"
+
+enrich.CACHE_FILE = d / "artist_resolution.jsonl"
+enrich.REVIEW_PARQUET = d / "artist_review.parquet"
+enrich.RESOLUTION_PARQUET = d / "artist_resolution.parquet"
+enrich.config.ARTIST_TAGS_PARQUET = d / "artist_tags.parquet"
+
+
+class FakeResponse:
+    status_code = 200
+    def __init__(self, body):
+        self._body = body
+    def json(self):
+        return self._body
+
+
+class FakeHttp:
+    """Serves the one MBID pin and counts everything, so a NONE row that spends
+    a request, or a backfill that reaches a wrong MBID, shows up as a count."""
+    def __init__(self):
+        self.calls = Counter()
+    def get(self, url, **kw):
+        if url == enrich.MB_RELEASE_GROUP_URL:
+            self.calls["release-group"] += 1
+            return FakeResponse({"release-groups": [{"tags": [{"name": "pop"}]}]})
+        if url.startswith(enrich.MB_SEARCH_URL + "/"):
+            self.calls["lookup"] += 1
+            return FakeResponse({"id": PIN, "name": "Pinned",
+                                 "genres": [{"name": "pop", "count": 2}]})
+        raise AssertionError(f"unexpected request: {url}")
+
+
+def seed(recs):
+    for name, rec in recs.items():
+        enrich.append_cache({"artist_name": name, "score": None,
+                             "matched_name": None, "n_candidates": 0, **rec})
+
+
+def run(http, artists):
+    """One enrich.py pass, in main()'s order, minus the search for new names."""
+    cache = enrich.load_cache()
+    overrides = enrich.load_overrides()
+    enrich.purge_stale_overrides(cache, overrides)
+    stats = enrich.apply_overrides(http, artists, cache, overrides)
+    enrich.backfill_untagged(http, cache)
+    enrich.apply_override_tags(cache, overrides, VOCAB)
+    return cache, stats
+
+
+ROWS = [
+    "PlatLike,NONE,was matching a different artist; no correct entry exists,indie pop|pop",
+    "BareNone,none,real artist; MusicBrainz has nothing,",
+    "MixedCase,None,,pop",
+    "Typo,NON,meant NONE,pop",
+    "Suppressed,IGNORE,not an artist,",
+    f"Pinned,{PIN},right artist,",
+    "TagsOnly,,no MB entry,pop rap",
+]
+csv_path.write_text("artist_name,mbid,note,tags\n" + "\n".join(ROWS) + "\n",
+                    encoding="utf-8")
+
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    ov = enrich.load_overrides()
+k = enrich.normalise
+
+check("NONE is accepted", ov.get(k("PlatLike"), {}).get("none"), True)
+check("NONE pins nothing", ov.get(k("PlatLike"), {}).get("mbid", "missing"), None)
+check("NONE is not IGNORE", ov.get(k("PlatLike"), {}).get("ignore"), False)
+check("NONE keeps its tags", ov.get(k("PlatLike"), {}).get("tags"), ["indie pop", "pop"])
+check("NONE with no tags is accepted, not skipped",
+      ov.get(k("BareNone"), {}).get("none"), True)
+check("lowercase none is accepted, tags empty", ov.get(k("BareNone"), {}).get("tags"), [])
+check("mixed-case None is accepted", ov.get(k("MixedCase"), {}).get("none"), True)
+check("NON is refused", k("Typo") in ov, False)
+check("the refusal names NONE as a valid value",
+      "'NON' is neither a UUID, IGNORE nor NONE" in out.getvalue(), True)
+check("IGNORE is not NONE", ov.get(k("Suppressed"), {}).get("none"), False)
+check("an MBID row is not NONE", ov.get(k("Pinned"), {}).get("none"), False)
+check("a blank mbid is not upgraded to NONE", ov.get(k("TagsOnly"), {}).get("none"), False)
+
+# The cache as the research pass found it: two names auto-matched to the wrong
+# artist, one of them untagged (so the backfill would go and fetch the WRONG
+# artist's release-group tags), plus the rows that must behave as before.
+seed({
+    "PlatLike": {"source": "musicbrainz", "status": "resolved", "mbid": WRONG,
+                 "matched_name": "ＰＬＡＴ", "n_candidates": 3,
+                 "tags": [{"tag": "vaporwave", "count": 5}]},
+    "BareNone": {"source": "musicbrainz", "status": "resolved", "mbid": WRONG2,
+                 "matched_name": "Bare None", "n_candidates": 1, "tags": []},
+    "TagsOnly": {"source": "musicbrainz", "status": "not_found", "mbid": None, "tags": []},
+    "Organic": {"source": "musicbrainz", "status": "resolved", "mbid": ORGANIC,
+                "tags": [{"tag": "indie pop", "count": 4}]},
+    "Abe Act": {"source": "musicbrainz", "status": "not_found", "mbid": None, "tags": []},
+    "Zed Act": {"source": "musicbrainz", "status": "not_found", "mbid": None, "tags": []},
+})
+HOURS = {"Organic": 10, "Pinned": 6, "PlatLike": 5, "BareNone": 4, "MixedCase": 3,
+         "TagsOnly": 2.5, "Zed Act": 1, "Abe Act": 1, "Suppressed": 0.5}
+ARTISTS = list(HOURS)
+before = enrich.CACHE_FILE.read_text(encoding="utf-8")
+
+http = FakeHttp()
+cache, stats = run(http, ARTISTS)
+
+plat = cache["PlatLike"]
+check("NONE over a wrong match: status no_entry", plat["status"], "no_entry")
+check("NONE over a wrong match: the wrong MBID is gone", plat["mbid"], None)
+check("NONE over a wrong match: override provenance", plat["source"], "override")
+check("NONE over a wrong match: the hand tags, not the wrong artist's",
+      [t["tag"] for t in plat["tags"]], ["indie pop", "pop"])
+check("NONE without tags: no_entry and untagged",
+      (cache["BareNone"]["status"], cache["BareNone"]["tags"]), ("no_entry", []))
+check("NONE for a name never cached still answers it",
+      cache.get("MixedCase", {}).get("status"), "no_entry")
+check("NONE is counted under its own stat", stats.get("no_entry"), 3)
+check("NONE costs no request, and the backfill never reaches the wrong MBID",
+      dict(http.calls), {"lookup": 1})
+appended = [json.loads(l)["artist_name"] for l in
+            enrich.CACHE_FILE.read_text(encoding="utf-8")[len(before):].splitlines()]
+check("NONE is never written to the cache; only the MBID pin is", appended, ["Pinned"])
+
+# The rows that were already here behave exactly as before.
+check("IGNORE unchanged", (cache["Suppressed"]["status"], stats["ignored"]), ("ignored", 1))
+check("MBID pin unchanged",
+      (cache["Pinned"]["status"], cache["Pinned"]["mbid"], cache["Pinned"]["source"]),
+      ("resolved", PIN, "override"))
+check("tags-only unchanged: resolution left alone, genres supplied",
+      (cache["TagsOnly"]["status"], [t["tag"] for t in cache["TagsOnly"]["tags"]],
+       stats["tags_only"]),
+      ("not_found", ["pop rap"], 1))
+
+# --------------------------------------------------------------------------
+# no_entry is a resolution status, not an absence: the review list must not
+# bring back a name the override file answered. Both review sites.
+# --------------------------------------------------------------------------
+con = duckdb.connect()
+con.execute("CREATE TABLE artist_weight (artist_name VARCHAR, listening_hours DOUBLE)")
+con.executemany("INSERT INTO artist_weight VALUES (?, ?)", list(HOURS.items()))
+enrich.write_outputs(con, cache, VOCAB)
+
+res = {n: (m, s, src) for n, m, s, src in duckdb.sql(
+    f"SELECT artist_name, mbid, status, source FROM '{enrich.RESOLUTION_PARQUET}'"
+).fetchall()}
+check("artist_resolution: PlatLike has no MBID",
+      res["PlatLike"], (None, "no_entry", "override"))
+check("artist_tags: the hand tags carry no MBID either",
+      duckdb.sql(f"SELECT DISTINCT mbid FROM '{enrich.config.ARTIST_TAGS_PARQUET}' "
+                 "WHERE artist_name = 'PlatLike'").fetchall(), [(None,)])
+review = [r[0] for r in duckdb.sql(
+    f"SELECT artist_name FROM '{enrich.REVIEW_PARQUET}'").fetchall()]
+# TagsOnly stays: a blank mbid says nothing about resolution, as before. Ties on
+# hours break on the name, so the file is a total order.
+check("artist_review.parquet excludes no_entry and ignored", review,
+      ["TagsOnly", "Abe Act", "Zed Act"])
+
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    enrich.report(con)
+listed = out.getvalue().split("REVIEW LIST", 1)[1].split("full review list", 1)[0]
+check("report's review list excludes no_entry and ignored",
+      [n for n in ("PlatLike", "BareNone", "MixedCase", "Suppressed") if n in listed], [])
+check("report's review list still shows real gaps",
+      all(n in listed for n in ("TagsOnly", "Abe Act", "Zed Act")), True)
+
+# --------------------------------------------------------------------------
+# Removing the NONE row lets the cached record show again — last write wins,
+# exactly as with IGNORE, because neither answer is ever cached. That is
+# deliberate: the row IS the answer, and deleting it withdraws the answer. Do
+# not "fix" this into a purge; to un-resolve a name, keep its NONE row.
+# --------------------------------------------------------------------------
+csv_path.write_text("artist_name,mbid,note,tags\n"
+                    + "\n".join(r for r in ROWS if not r.startswith("PlatLike")) + "\n",
+                    encoding="utf-8")
+http = FakeHttp()
+cache, stats = run(http, ARTISTS)
+check("row removed: the cached match shows again",
+      (cache["PlatLike"]["status"], cache["PlatLike"]["mbid"]), ("resolved", WRONG))
+check("row removed: costs no request", sum(http.calls.values()), 0)
+
+# --------------------------------------------------------------------------
+# A tags-only row for a name the cache has NEVER seen. main() left every
+# overridden name out of the search, tags-only rows included, so the name was
+# never searched, never got a record, and apply_override_tags — which walks the
+# cache — had nothing to hang the genres on. The row vanished without a warning.
+# `¥$` (11 h) is that case: credits.py dropped it until Stage 1b learned to keep
+# non-ASCII album artists, so it has never been cached. Blank mbid means
+# "resolution runs; genres supplied", so the name must be searched like any
+# other; only a row that ANSWERS the name (MBID, IGNORE, NONE) skips the search.
+#
+# Through main() itself, since the bug lived in main's todo list. Every path is
+# a temp file and Throttled is a fake that refuses anything unexpected.
+# --------------------------------------------------------------------------
+e2e = d / "e2e"
+enrich.config.DATA_DIR = e2e / "data"
+enrich.config.CACHE_DIR = e2e / "cache"
+enrich.config.OUTPUT_DIR = e2e / "output"
+enrich.config.ensure_dirs()
+enrich.CACHE_FILE = e2e / "cache" / "artist_resolution.jsonl"
+enrich.GENRE_VOCAB_FILE = e2e / "cache" / "vocab.txt"
+enrich.GENRE_VOCAB_FILE.write_text("\n".join(sorted(VOCAB)) + "\n", encoding="utf-8")
+enrich.REVIEW_PARQUET = e2e / "artist_review.parquet"
+enrich.RESOLUTION_PARQUET = e2e / "artist_resolution.parquet"
+enrich.config.ARTIST_TAGS_PARQUET = e2e / "artist_tags.parquet"
+enrich.config.ARTIST_OVERRIDES_CSV = e2e / "overrides.csv"
+
+duckdb.sql(f"""COPY (SELECT * FROM (VALUES
+        ('Tiny Act', 7200.0), ('Known', 3600.0), ('Pinned', 1800.0),
+        ('Never Seen None', 900.0), ('Various Artists', 600.0)
+    ) t(artist_name, played_seconds)) TO '{enrich.config.DATA_DIR / "track_credits.parquet"}'
+    (FORMAT PARQUET)""")
+enrich.config.ARTIST_OVERRIDES_CSV.write_text(
+    "artist_name,mbid,note,tags\n"
+    "Tiny Act,,no MB entry,pop rap\n"
+    f"Pinned,{PIN},right artist,\n"
+    "Never Seen None,NONE,real artist; MusicBrainz has nothing,indie pop\n"
+    "Various Artists,IGNORE,not an artist,\n", encoding="utf-8")
+enrich.append_cache({"artist_name": "Known", "source": "musicbrainz",
+                     "status": "resolved", "mbid": ORGANIC, "score": 100,
+                     "matched_name": "Known", "n_candidates": 1,
+                     "tags": [{"tag": "pop", "count": 3}]})
+
+
+class SearchHttp(FakeHttp):
+    """FakeHttp plus the name search, answering 'no such artist' for everyone."""
+    def __init__(self):
+        super().__init__()
+        self.searched = []
+    def get(self, url, **kw):
+        if url == enrich.MB_SEARCH_URL:
+            self.calls["search"] += 1
+            self.searched.append(kw["params"]["query"])
+            return FakeResponse({"artists": []})
+        return super().get(url, **kw)
+
+
+def run_main():
+    http = SearchHttp()
+    real_throttled, real_argv = enrich.Throttled, sys.argv
+    enrich.Throttled = lambda interval: http
+    sys.argv = ["enrich.py"]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            enrich.main()
+    finally:
+        enrich.Throttled, sys.argv = real_throttled, real_argv
+    tags = duckdb.sql(
+        f"SELECT artist_name, tag, source FROM '{enrich.config.ARTIST_TAGS_PARQUET}' "
+        "ORDER BY ALL").fetchall()
+    status = dict(duckdb.sql(
+        f"SELECT artist_name, status FROM '{enrich.RESOLUTION_PARQUET}'").fetchall())
+    return http, tags, status
+
+
+http, tags, status = run_main()
+check("uncached tags-only name: searched, and nothing else is",
+      http.searched, ['artist:"Tiny Act" OR alias:"Tiny Act"'])
+check("uncached tags-only name: the search's answer is its resolution",
+      status.get("Tiny Act"), "not_found")
+check("uncached tags-only name: its hand tags reach artist_tags",
+      [t for t in tags if t[0] == "Tiny Act"], [("Tiny Act", "pop rap", "override")])
+check("MBID, NONE and IGNORE rows still answer the name without a search",
+      (http.calls["lookup"], status.get("Pinned"), status.get("Never Seen None"),
+       status.get("Various Artists")), (1, "resolved", "no_entry", "ignored"))
+
+http, tags, status = run_main()
+check("second run: the tags-only name is cached, so zero requests",
+      sum(http.calls.values()), 0)
+check("second run: its hand tags are still applied",
+      [t for t in tags if t[0] == "Tiny Act"], [("Tiny Act", "pop rap", "override")])
+
+# --------------------------------------------------------------------------
+# A name the fold throws away must never exact-match — the resolution side of
+# the review list the override file answers. normalise() keeps only [a-z0-9]:
+# an all-non-Latin name folds to '' and so does every non-Latin candidate, so
+# all of them compared equal; `¥$` folds to 's' and a candidate literally named
+# "S" was an exact primary match. Such a name must land on the review list as
+# ambiguous, for a hand answer (an MBID or NONE), never as `resolved`.
+# --------------------------------------------------------------------------
+class CandidateHttp:
+    """The name search only, answering every query with a fixed candidate list."""
+    def __init__(self, artists):
+        self.artists, self.calls = artists, 0
+    def get(self, url, **kw):
+        if url != enrich.MB_SEARCH_URL:
+            raise AssertionError(f"unexpected request: {url}")
+        self.calls += 1
+        return FakeResponse({"artists": self.artists})
+
+
+def tagged(mbid, name, score, aliases=(), tag="rock"):
+    return {"id": mbid, "name": name, "score": score,
+            "aliases": [{"name": a} for a in aliases],
+            "tags": [{"name": tag, "count": 5}]}
+
+
+NON_LATIN = [tagged(WRONG, "Кино", 100, tag="post-punk"),
+             tagged(WRONG2, "坂本龍一", 95, aliases=["さかもと りゅういち"])]
+S_LIKE = [tagged(WRONG, "S", 100, tag="indie rock"),
+          tagged(WRONG2, "Somebody Else", 80, aliases=["S"])]
+
+for name, cands, why in (
+    ("Кино", NON_LATIN, "an all-Cyrillic name (folds to '')"),
+    ("ヨルシカ", NON_LATIN, "an all-Japanese name (folds to '')"),
+    ("¥$", S_LIKE, "¥$ against a candidate named, and one aliased, 'S'"),
+    ("¥$", NON_LATIN, "¥$ against non-Latin candidates"),
+    ("M", [tagged(WRONG, "MØ", 100, tag="electropop")],
+     "a candidate whose own name folds away ('MØ' -> 'm')"),
+):
+    http = CandidateHttp(cands)
+    rec = enrich.resolve_via_musicbrainz(http, name)
+    check(f"{why}: not resolved",
+          (rec["status"], rec["mbid"], rec["tags"]), ("ambiguous", None, []))
+    check(f"{why}: the nearest candidate is kept for the reviewer",
+          (rec["matched_name"], rec["n_candidates"], http.calls),
+          (cands[0]["name"], len(cands), 1))
+
+# The rule must not cost the names that resolve today.
+for name, cands, want in (
+    # How the real cache holds him: non-Latin primary name, Latin alias.
+    ("Valentin Silvestrov",
+     [tagged(ORGANIC, "Валентин Сильвестров", 100, aliases=["Valentin Silvestrov"])],
+     ORGANIC),
+    ("Snøw", [tagged(ORGANIC, "Snøw", 90)], ORGANIC),          # loses 1 of 4
+    ("The xx", [tagged(ORGANIC, "The xx", 100)], ORGANIC),     # the/and is not loss
+    ("ＰＬＡＴ", [tagged(ORGANIC, "PLAT", 100)], ORGANIC),       # NFKD folds, not drops
+    ("S", S_LIKE, WRONG),     # a genuine 'S' still matches its own name
+):
+    rec = enrich.resolve_via_musicbrainz(CandidateHttp(cands), name)
+    check(f"{name!r} still resolves", (rec["status"], rec["mbid"]), ("resolved", want))
+
+for name, want in (("¥$", True), ("Кино", True), ("MØ", True), ("The The", True),
+                   ("BTS (방탄소년단)", True), ("", True),
+                   ("M", False), ("Snøw", False), ("The xx", False),
+                   ("A$AP Rocky", False), ("Florence + The Machine", False),
+                   ("Beyoncé", False), ("AC/DC", False)):
+    check(f"fold_discards_name({name!r})", enrich.fold_discards_name(name), want)
+
+# And the consequence that matters: ambiguous is on the review list.
+cache = {n: enrich.resolve_via_musicbrainz(CandidateHttp(c), n)
+         for n, c in (("¥$", S_LIKE), ("Кино", NON_LATIN))}
+con = duckdb.connect()
+con.execute("CREATE TABLE artist_weight (artist_name VARCHAR, listening_hours DOUBLE)")
+con.executemany("INSERT INTO artist_weight VALUES (?, ?)", [("¥$", 11.0), ("Кино", 1.0)])
+enrich.write_outputs(con, cache, VOCAB)
+check("both land on artist_review.parquet, by hours",
+      [r[0] for r in duckdb.sql(f"SELECT artist_name FROM '{enrich.REVIEW_PARQUET}'")
+       .fetchall()], ["¥$", "Кино"])
+check("neither reaches artist_tags",
+      duckdb.sql(f"SELECT count(*) FROM '{enrich.config.ARTIST_TAGS_PARQUET}'")
+      .fetchone()[0], 0)
 
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)

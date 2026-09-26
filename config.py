@@ -49,6 +49,13 @@ TAG_TRENDS_PARQUET = DATA_DIR / "tag_trends.parquet"
 MIN_MS_PLAYED = 30_000
 
 # --- Analysis parameters ----------------------------------------------------
+# The analysis horizon: the last month the EXPORT covers. Polled plays past it
+# are provisional — estimated ms_played, NULL reason_end, and a 50-item page
+# that can silently drop plays — so no trend, share or window is anchored on
+# them. ingest.merge_polled's coverage cut, applied to time. Every
+# "(SELECT max(month) FROM plays)" in a stage is this instead.
+ANALYSIS_HORIZON_SQL = "(SELECT max(month) FROM plays WHERE NOT ms_played_estimated)"
+
 # What a featured credit is worth relative to the album artist's 1.0. Stage 3
 # computes BOTH variants and stores them side by side, so the dashboard can
 # toggle without re-running anything. 0.0 reproduces the spec's original
@@ -241,14 +248,20 @@ RUNNING_OVERRIDES_CSV = _path_from_env(
 # artists, seeding on Justice and Tiësto returned Mr. Oizo, Boys Noize and
 # Basement Jaxx as "speed garage". A tag that is merely adjacent poisons the
 # discovery pool far beyond the tracks it admits directly.
+#
+# `breakbeat` and `breakbeat hardcore` are absent for the same reason: broken
+# beats are not run music. They carried The Prodigy into dubstep, and the cost of
+# removing them lands on library artists, not strangers — jigitz (5.9 h, tagged
+# breakbeat|future garage|house by hand) now classifies to neither run and comes
+# back only as pins; K Theory (0.7 h), MALUGI (0.4 h) and the Chemical Brothers
+# leave too. That list is the check before the change, not after it.
 RUN_GARAGE_TAGS = (
     "speed garage", "uk garage", "bassline", "stutter house", "bass house",
-    "tech house", "jackin house", "donk", "2-step",
-    "hard house", "breakbeat hardcore",
+    "tech house", "jackin house", "donk", "2-step", "hard house",
 )
 RUN_BASS_TAGS = (
     "dubstep", "brostep", "tearout", "hybrid trap", "trap edm", "drum and bass",
-    "jungle", "neurofunk", "drumstep", "breakbeat", "glitch hop", "complextro",
+    "jungle", "neurofunk", "drumstep", "glitch hop", "complextro",
     "hardstyle", "colour bass", "happy hardcore", "gabber",
 )
 
@@ -256,6 +269,14 @@ RUN_BASS_TAGS = (
 # not enough: ILLENIUM carries dubstep(3) and trap edm(3), so any include-list
 # admits him, while melodic dubstep(3) and future bass(2) are why the playlist
 # sags. Membership is therefore a weighted share, not a set test.
+#
+# The last four are the soft or off-shape side of a cluster's own neighbours,
+# each named for the act that proved it: `liquid funk` is drum and bass with the
+# intensity taken out (Netsky), `big beat` is The Prodigy's home genre (21 votes,
+# more than his breakbeat), `future garage` is garage's ambient offshoot, and
+# `psytrance` (18 votes) had Infected Mushroom next in line for a dubstep slot.
+# All four are in the MusicBrainz genre vocabulary, so they can match and be
+# supplied by hand.
 RUN_DRAG_TAGS = (
     "melodic dubstep", "future bass", "chillstep", "deep house",
     "progressive house", "melodic house", "melodic techno", "ambient",
@@ -264,6 +285,7 @@ RUN_DRAG_TAGS = (
     "contemporary r&b", "alternative r&b", "r&b", "soul", "rock",
     "alternative rock", "indie rock", "heavy metal", "latin", "reggaeton",
     "folk", "singer-songwriter",
+    "liquid funk", "big beat", "future garage", "psytrance",
 )
 # Bare `trap` appears on 60 of this playlist's tracks and is ambiguous: it names
 # both rap-trap and EDM-trap. It is deliberately in NEITHER list, so it can
@@ -300,6 +322,13 @@ RUN_BORDERLINE_BAND = 0.15
 RUN_TARGET_MINUTES = 240
 RUN_KNOWN_FRACTION = 0.6      # rest is discovery; more new music, by request
 RUN_TRACKS_PER_ARTIST = 3     # one act must not own a playlist
+# A `prefer` row in running_overrides.csv names a playlist the listener built
+# by hand for running (Workout · Claude). Its members are a run-fit prior the
+# score cannot see: a member's score is multiplied by 1 + this, so it beats a
+# non-member only when within 25% of it — a near-tie breaker, not a pin. The
+# evaluation's weak known tracks (Pretty Low, Buried A Friend) are exactly the
+# near-ties it exists to settle, and neither is in Workout. Vetoes still win.
+RUN_PREFER_MARGIN = 0.25
 # Discovery stays at 2. Three tracks from an artist you already play is more of
 # a good thing; three from a stranger is three chances to break a run.
 RUN_DISCOVERY_TRACKS_PER_ARTIST = 2
@@ -313,13 +342,45 @@ RUN_WINDOW_MONTHS = 36
 # than his Blair Muir remix and less than half the completion.
 RUN_MIN_TRACKDONE_RATE = 0.45
 
+# When discovery cannot fill its share, known tracks take the time back — but
+# only ones scoring at least this. Matt Sassari's "Give It To Me - Full Vocal
+# Mix" (0.186) went in as filler. A playlist may therefore come in under
+# RUN_TARGET_MINUTES, and the report prints by how much: a few minutes short
+# beats minutes of what the listener skips.
+RUN_TOPUP_MIN_SCORE = 0.20
+
 # Discovery is seeded on the CLUSTER's own top artists, not on Stage 5's
 # library-wide candidate list. Stage 5 seeds across all taste, so its
 # electronic candidates skew canonical — a first dry run offered Basement Jaxx,
 # Busy P and Mr. Oizo as speed garage, and The Prodigy as dubstep. Asking
 # ListenBrainz "who is like Blair Muir" instead returns the right neighbourhood.
-RUN_DISCOVERY_SEEDS = 20         # top cluster artists to ask about
+# Seeds are counted by ANSWER: an artist ListenBrainz knows nothing about is
+# skipped and the next one down takes the slot, so 20 means 20 real lists.
+RUN_DISCOVERY_SEEDS = 20         # cluster artists with a non-empty answer
 RUN_MAX_CANDIDATES_TO_TAG = 150  # MusicBrainz lookups per cluster, at 1.1s each
+
+# A seed must have been LISTENED to, not just credited. Todd Edwards has 0.54 h
+# in the window — his only known-pool tracks are two Daft Punk edits he is
+# featured on — yet a join per tag row made him garage seed #17, and his
+# neighbours brought thirteen tracks (Crazy Love, Beauty And A Beat, Don't Stop
+# The Music). The one-row-per-artist join and this floor both remove him.
+# An hour, not a share of the cluster's score: a 1% floor would pass Sammy Virji
+# (1.43 h) by 0.001 and fail Knock2 (1.48 h), both of whom belong.
+RUN_MIN_SEED_HOURS = 1.0
+
+# The FIRST discovery supply after hand-named acts is the listener's own
+# cluster artists' tracks he has never started. Once the seed fixes cut Todd
+# Edwards' chain, garage discovery fell from 21 tracks to about 9, and the known
+# top-up would have quietly turned RUN_KNOWN_FRACTION into ~0.9; the evaluation's
+# evidence is that an unplayed Sammy Virji record ("Up & Down") was a keep where
+# the strangers were not. SJ's call (2026-09-26): when new music runs short,
+# fill with more of his own, and never keep a weak stranger just to hold the
+# quota. So library artists take up to FRACTION of the discovery budget BEFORE
+# strangers, one track each, then whatever strangers leave, up to
+# TRACKS_PER_ARTIST each. ARTISTS is how far down the seed ranking to look.
+RUN_LIBRARY_DISCOVERY_ARTISTS = 30
+RUN_LIBRARY_DISCOVERY_FRACTION = 0.25    # 0 gives SJ's literal "only when short"
+RUN_LIBRARY_DISCOVERY_TRACKS_PER_ARTIST = 2
 
 # A share alone cannot judge a STRANGER. Boys Noize and Mr. Oizo carry exactly
 # one cluster tag — `tech house` at count 1 — and no drag tags at all, so the
@@ -344,9 +405,18 @@ RUN_MIN_CANDIDATE_CLUSTER_WEIGHT = 2
 # nothing else, which is tag-identical to Boys Noize, so no rule can admit one
 # and refuse the other. He is lost until MusicBrainz knows more about him.
 RUN_BROAD_TAGS = frozenset({
-    "tech house", "hard house", "breakbeat hardcore",
-    "drum and bass", "breakbeat", "glitch hop", "complextro",
+    "tech house", "hard house", "drum and bass", "glitch hop", "complextro",
 })
+
+# ...and a stranger's SHARE must clear a higher line than a library artist's.
+# 0.60 is right for the library, where listening has already vouched for the
+# artist; for a stranger it admitted Netsky (drum and bass 10 against liquid
+# funk 3: 0.77), Rusko, Modestep and Basement Jaxx, four acts the evaluation
+# wanted out. 0.85 refuses all four and keeps every discovery keep —
+# Pendulum 0.97, Bassnectar 0.92, NERO 0.89 — and also refuses Slushii and
+# Pixel Terror (0.67), which the normalised seed ranking would otherwise lift.
+# Library classification (build_artist_clusters) stays on RUN_MIN_INTENSITY_SHARE.
+RUN_MIN_CANDIDATE_SHARE = 0.85
 
 # Live recordings are refused outright. Crowd noise, a rambling intro and a
 # tempo the drummer chose on the night all break a run in a way the genre
@@ -361,13 +431,70 @@ RUN_LIVE_TITLE_RE = (
     r"|\blive (?:at|from|in|session|version)\b|\bunplugged\b)"
 )
 
-RUN_PLAYLIST_NAME_TEMPLATE = "{label} run · Claude"
+# A DISCOVERY track may run at most 4.5 minutes; known tracks are exempt. A
+# stranger's track is heard cold, mid-run, and a long one is a long bet: the cap
+# took Bass Head (6.4 min), Dead Limit, Experience, Destiny and Where's Your
+# Head At out of the dubstep run. Deviance and Vindicate were keeps and went
+# too — that is the price. It also stands in for the release-year gate this
+# stage deliberately lacks, since Spotify's release_date is often a reissue
+# date. Known tracks stay exempt because the listener has already vouched for
+# every minute: Zomboy's "Nuclear" runs 5.3 minutes and is the model run track.
+RUN_MAX_DISCOVERY_MS = 270_000
+
+# A song has two identities, and Stage 10 needs both. The SONG is the folded
+# title (playlists._title_key): "Drugs I Like (AVELLO Remix)" and "Drugs I
+# Like" are one song. The VERSION drops only the notes that name a PRESSING
+# of the same recording — remaster (with or without a year), radio/extended/
+# original mix or edit, feat./ft./featuring/with credits, mono, stereo, single
+# and album version, explicit, clean — and keeps everything else, so a remix,
+# VIP, flip, rework, bootleg, a person's edit or "sped up" is its own version.
+# Folding on the song alone kept a garage original's remix out of dubstep and
+# split "tell you straight" (70 + 44 plays) into two half-counted rows.
+#
+# A note counts only as a WHOLE segment: a bracket, or a run of " - " segments
+# ending the title. "Song - Clean Bandit Remix" is not a clean pressing.
+# `with` is read as a credit only in Spotify's "(with X)" bracket: a dash
+# segment starting "With" can as easily be a remixer's name.
+# The same pattern runs in DuckDB (RE2) and Python, so it stays inside what
+# both accept: no lookaround, no backreferences, no \b inside a class, and
+# [0-9] and literal spaces rather than \d and \s, whose Unicode reach differs.
+_RUN_NOTE = (
+    r"(?:[0-9]{4} (?:- )?)?(?:digital )?remaster(?:ed)?(?: [0-9]{4})?(?: version)?"
+    r"|radio (?:edit|mix|version)|extended (?:mix|version|edit)"
+    r"|original (?:mix|version)|(?:mono|stereo)(?: version| mix)?"
+    r"|single version|album version|explicit|clean"
+)
+_RUN_NOTE_BRACKET = (
+    r" *[(\[] *(?:" + _RUN_NOTE
+    + r"|(?:feat\. *|ft\. *|(?:feat|ft|featuring|with) +)[^()\[\]]+) *[)\]]"
+)
+RUN_PRESSING_NOTE_RE = (
+    r"(?i)" + _RUN_NOTE_BRACKET
+    + r"|(?: +[-–—] +(?:" + _RUN_NOTE
+    + r"|(?:feat\. *|ft\. *|(?:feat|ft|featuring) +)[^()\[\]–—-]+))+"
+    + r"(?:" + _RUN_NOTE_BRACKET + r")* *$"
+)
+# One version per song per playlist, and completion picks it — but not on a
+# handful of plays. A remix finished 2 times out of 2 is not evidence against
+# an original finished 6 out of 10.
+RUN_MIN_VERSION_PLAYS = 3
+
+# Named by the cluster's TITLE, not its label (running.CLUSTERS has both): the
+# label is the identity and never changes; the title is display and may.
+RUN_PLAYLIST_NAME_TEMPLATE = "{title} run · Claude"
 RUN_PLAYLIST_DESCRIPTION_TEMPLATE = (
-    "{label} — high-intensity tracks for running, {known} from your library "
+    "{title} — high-intensity tracks for running, {known} from your library "
     "and {new} you have not heard. No BPM filter: Spotify removed the tempo "
     "endpoints, and half-time drums make the number lie anyway. "
     "Built by spotify-trend-analysis · refreshed {date}"
 )
+# Names a run playlist carried before a rename, keyed on the cluster LABEL.
+# The garage run became "garage & house" on 2026-09-26, because tech house and
+# John Summit stay in it. With the stored ID lost, an exact match on the new
+# name alone would find nothing and create a second playlist; these are tried
+# after it, exactly, case and all. The rename itself happens on the next
+# --write, in place: same ID, same URL, same followers.
+RUN_PLAYLIST_LEGACY_NAMES = {"speed garage": ("speed garage run · Claude",)}
 
 # Fields that must never reach a derived artifact.
 DROPPED_FIELDS = ("ip_addr",)

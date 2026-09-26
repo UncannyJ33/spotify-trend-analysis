@@ -87,6 +87,23 @@ def append_jsonl(path, rec: dict) -> None:
         os.fsync(fh.fileno())
 
 
+def cached_answer(cache: dict, key: str, field: str) -> list | None:
+    """The cached answer for `key`, or None when it still needs a request.
+
+    Only real answers are cached: an HTTP 200, stamped `"status": 200`, and an
+    empty 200 is as final as a full one. A record with an empty list and NO
+    status predates that rule and may have been a 503 that outlasted
+    Throttled's retries, written down as "nobody is similar" and never asked
+    again (about 30 of 150 seeds on the last write). It is re-asked once; the
+    new record, appended after it, wins on reload. A legacy record with a
+    non-empty list is an answer — a failure never produced one.
+    """
+    rec = cache.get(key)
+    if rec is None or ("status" not in rec and not rec.get(field)):
+        return None
+    return rec[field]
+
+
 # --------------------------------------------------------------------------
 # The taste vector
 # --------------------------------------------------------------------------
@@ -136,23 +153,58 @@ def cosine(a: dict[str, float], b: dict[str, float]) -> float:
 
 
 def build_seeds(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str, float]]:
-    """(artist_name, mbid, weight) for recent, resolved, well-listened artists."""
+    """(artist_name, mbid, weight) for recent, resolved, well-listened artists.
+
+    Weight is the artist's listening time INSIDE the window, each play split
+    across its performers the way Stage 3 splits it. This used to sum
+    track_credits.played_seconds — the track's all-time total — once per
+    windowed play, so a seed weighed all-time seconds x recent plays: one
+    recent listen to a 2019 favourite with 100 hours behind it outranked a
+    month of what is actually on now.
+    """
+    feature_w = config.CREDIT_VARIANTS[config.DEFAULT_VARIANT]
     rows = con.execute(
         f"""
-        WITH recent AS (
-            SELECT c.artist_name, sum(c.played_seconds) AS secs
-            FROM track_credits c
-            JOIN plays p USING (spotify_track_uri)
-            WHERE p.month >= (
-                SELECT max(month) - INTERVAL '{config.SEED_WINDOW_MONTHS} months'
-                FROM plays)
+        -- The window anchors on the export horizon, not max(month) FROM plays:
+        -- one polled play in a later month would otherwise drag the whole
+        -- window forward and drop the oldest export months. No upper bound,
+        -- so polled plays past the horizon still count as recent listening
+        -- (the same rule as Stage 10's known pool).
+        WITH windowed AS (
+            SELECT row_number() OVER () AS play_id, spotify_track_uri, played_seconds
+            FROM plays
+            WHERE month >= {config.ANALYSIS_HORIZON_SQL}
+                           - INTERVAL '{config.SEED_WINDOW_MONTHS} months'
+        ),
+        play_credits AS (
+            SELECT p.play_id, c.artist_name, p.played_seconds,
+                   CASE c.credit_type WHEN 'album_artist' THEN 1.0
+                                      ELSE {feature_w} END AS raw_w
+            FROM windowed p
+            JOIN track_credits c USING (spotify_track_uri)
+        ),
+        -- Normalised across the performers of ONE play (its row, as in
+        -- analyze.build_credit_weights), so a featured guest gets 0.5 / 1.5
+        -- of the play and no listening time is created. The even-split
+        -- fallback only fires under an album_artist_only default, for a play
+        -- whose album-artist credit is missing.
+        split AS (
+            SELECT artist_name, played_seconds,
+                   coalesce(raw_w / nullif(sum(raw_w) OVER w, 0),
+                            1.0 / count(*) OVER w) AS credit_w
+            FROM play_credits
+            WINDOW w AS (PARTITION BY play_id)
+        ),
+        recent AS (
+            SELECT artist_name, sum(played_seconds * credit_w) AS secs
+            FROM split
             GROUP BY 1
         )
         SELECT r.artist_name, a.mbid, r.secs
         FROM recent r
         JOIN artist_resolution a USING (artist_name)
         WHERE a.mbid IS NOT NULL AND a.status = 'resolved'
-        ORDER BY r.secs DESC
+        ORDER BY r.secs DESC, r.artist_name
         LIMIT {config.N_SEEDS}
         """
     ).fetchall()
@@ -161,26 +213,32 @@ def build_seeds(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str, float]]:
 
 
 def fetch_similar(http: Throttled, mbid: str, cache: dict) -> list[dict]:
-    """Similar artists for one seed, cached so re-runs cost nothing."""
-    if mbid in cache:
-        return cache[mbid]["similar"]
+    """Similar artists for one seed, cached so re-runs cost nothing.
+
+    Only a 200 is cached (see cached_answer). A failure returns [] and writes
+    nothing, so the next run asks again rather than believing the seed has no
+    neighbours.
+    """
+    hit = cached_answer(cache, mbid, "similar")
+    if hit is not None:
+        return hit
     r = http.get(
         LB_SIMILAR_URL, params={"artist_mbids": mbid, "algorithm": LB_ALGORITHM}
     )
-    similar = []
-    if r is not None and r.status_code == 200:
-        try:
-            payload = r.json()
-        except ValueError:
-            payload = []
-        rows = payload if isinstance(payload, list) else payload.get("data", [])
-        similar = [
-            {"mbid": x["artist_mbid"], "name": x.get("name") or "",
-             "score": float(x.get("score") or 0),
-             "comment": x.get("comment") or ""}
-            for x in rows if x.get("artist_mbid")
-        ]
-    rec = {"seed_mbid": mbid, "similar": similar}
+    if r is None or r.status_code != 200:
+        return []
+    try:
+        payload = r.json()
+    except ValueError:
+        return []   # a 200 with no readable body is not an answer either
+    rows = payload if isinstance(payload, list) else payload.get("data", [])
+    similar = [
+        {"mbid": x["artist_mbid"], "name": x.get("name") or "",
+         "score": float(x.get("score") or 0),
+         "comment": x.get("comment") or ""}
+        for x in rows if x.get("artist_mbid")
+    ]
+    rec = {"seed_mbid": mbid, "similar": similar, "status": 200}
     append_jsonl(SIMILAR_CACHE, rec)
     cache[mbid] = rec
     return similar
@@ -193,23 +251,30 @@ def fetch_candidate_tags(http: Throttled, mbid: str, vocab: set[str],
     `inc=genres` returns MusicBrainz's curated genre list directly; raw tags are
     the fallback, filtered against the same vocabulary Stage 2 uses so both
     sides of the comparison live in one namespace.
+
+    Cached on a 200 only, like fetch_similar: an untagged artist is an answer,
+    a 503 is not.
     """
-    if mbid in cache:
-        return cache[mbid]["tags"]
+    hit = cached_answer(cache, mbid, "tags")
+    if hit is not None:
+        return hit
     r = http.get(f"{MB_ARTIST_URL}/{mbid}",
                  params={"inc": "tags+genres", "fmt": "json"})
-    tags: list[dict] = []
-    if r is not None and r.status_code == 200:
+    if r is None or r.status_code != 200:
+        return []
+    try:
         d = r.json()
-        genres = d.get("genres") or []
-        if genres:
-            tags = [{"tag": g["name"].casefold(), "count": max(g.get("count") or 0, 0)}
-                    for g in genres if g.get("name")]
-        else:
-            tags = [{"tag": t["name"].casefold(), "count": max(t.get("count") or 0, 0)}
-                    for t in (d.get("tags") or [])
-                    if t.get("name") and (not vocab or t["name"].casefold() in vocab)]
-    rec = {"mbid": mbid, "tags": tags}
+    except ValueError:
+        return []
+    genres = d.get("genres") or []
+    if genres:
+        tags = [{"tag": g["name"].casefold(), "count": max(g.get("count") or 0, 0)}
+                for g in genres if g.get("name")]
+    else:
+        tags = [{"tag": t["name"].casefold(), "count": max(t.get("count") or 0, 0)}
+                for t in (d.get("tags") or [])
+                if t.get("name") and (not vocab or t["name"].casefold() in vocab)]
+    rec = {"mbid": mbid, "tags": tags, "status": 200}
     append_jsonl(CANDIDATE_TAG_CACHE, rec)
     cache[mbid] = rec
     return tags
@@ -317,8 +382,9 @@ def main() -> None:
         sorted(taste.items(), key=lambda kv: -kv[1])[:8]))
 
     seeds = build_seeds(con)
-    print(f"\nSeeds: {len(seeds)} artists from the last "
-          f"{config.SEED_WINDOW_MONTHS} months")
+    horizon = con.execute(f"SELECT {config.ANALYSIS_HORIZON_SQL}").fetchone()[0]
+    print(f"\nSeeds: {len(seeds)} artists from the {config.SEED_WINDOW_MONTHS} "
+          f"months to {horizon:%Y-%m} (the export horizon)")
 
     # Everything already listened to, by MBID and by folded name, so a
     # candidate cannot slip back in under a different spelling.
@@ -328,12 +394,15 @@ def main() -> None:
         "SELECT DISTINCT artist_name FROM track_credits").fetchall()}
 
     sim_cache = load_jsonl(SIMILAR_CACHE, "seed_mbid")
-    todo = [s for s in seeds if s[1] not in sim_cache]
+    todo = [s for s in seeds if cached_answer(sim_cache, s[1], "similar") is None]
+    legacy = sum(1 for s in todo if s[1] in sim_cache)
     if todo and not args.report:
         print(f"Querying ListenBrainz for {len(todo)} seeds "
-              f"(~{len(todo)*MB_MIN_INTERVAL/60:.0f} min) ...")
+              f"({legacy} legacy empty entries re-asked once, "
+              f"~{len(todo)*MB_MIN_INTERVAL/60:.0f} min) ...")
     for i, (name, mbid, _) in enumerate(seeds, 1):
-        if args.report and mbid not in sim_cache:
+        # --report stays offline: a legacy entry is read as it stands.
+        if args.report and cached_answer(sim_cache, mbid, "similar") is None:
             continue
         fetch_similar(http, mbid, sim_cache)
         if i % 25 == 0:
@@ -358,12 +427,14 @@ def main() -> None:
     shortlist = ranked[: config.MAX_CANDIDATES_TO_TAG]
 
     tag_cache = load_jsonl(CANDIDATE_TAG_CACHE, "mbid")
-    need = [m for m, _ in shortlist if m not in tag_cache]
+    need = [m for m, _ in shortlist if cached_answer(tag_cache, m, "tags") is None]
+    legacy = sum(1 for m in need if m in tag_cache)
     if need and not args.report:
         print(f"Tagging top {len(shortlist)} candidates "
-              f"({len(need)} uncached, ~{len(need)*MB_MIN_INTERVAL/60:.0f} min) ...")
+              f"({len(need)} uncached, {legacy} of them legacy empty entries "
+              f"re-asked once, ~{len(need)*MB_MIN_INTERVAL/60:.0f} min) ...")
     for i, (mbid, _) in enumerate(shortlist, 1):
-        if args.report and mbid not in tag_cache:
+        if args.report and cached_answer(tag_cache, mbid, "tags") is None:
             continue
         fetch_candidate_tags(http, mbid, vocab, tag_cache)
         if i % 50 == 0:
@@ -377,8 +448,10 @@ def main() -> None:
     results_df = pd.DataFrame(results)
     con.register("results_df", results_df)
     con.execute("CREATE OR REPLACE TABLE recommendations AS SELECT * FROM results_df")
+    # A total order that keeps reading order: score alone leaves ties for the
+    # parallel sort to break arbitrarily, and mbid is unique per row.
     con.execute(
-        f"COPY (SELECT * FROM recommendations ORDER BY score DESC) "
+        f"COPY (SELECT * FROM recommendations ORDER BY score DESC, mbid) "
         f"TO '{config.RECOMMENDATIONS_PARQUET}' (FORMAT PARQUET, COMPRESSION ZSTD)")
 
     print()

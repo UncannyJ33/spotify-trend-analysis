@@ -152,9 +152,19 @@ def resolve_missing(names: list[str], weights: dict) -> int:
     search resolves but leaves untagged falls back to release-group tags, which
     is the pass that gives Tion Wayne his `drill`/`uk drill` and ArrDee his.
     A name MusicBrainz cannot resolve stays unscorable and goes to review.
+
+    Stage 2's override file comes before all three. IGNORE and NONE are applied
+    by enrich in memory and never cached, so its raw cache still holds whatever
+    the search matched before the row was written — for NONE, the very
+    auto-match the row exists to throw away (PLAT. sat on the vaporwave ＰＬＡＴ,
+    Unconscious Mind on a Canadian black-metal band). An answered name with no
+    hand tags has none in artist_tags.parquet, so it arrives here, and reading
+    the raw cache scored its tracks on a stranger's genres. It is answered:
+    unscorable, never looked up in either cache, never searched.
     """
-    from enrich import (MB_MIN_INTERVAL, Throttled, load_cache,
-                        resolve_via_musicbrainz, tags_from_release_groups)
+    from enrich import (MB_MIN_INTERVAL, Throttled, fetch_release_group_tags,
+                        load_cache, resolve_via_musicbrainz)
+    from enrich import load_overrides as load_artist_overrides
 
     mine = {}
     if CONSOLIDATE_CACHE.exists():
@@ -167,27 +177,44 @@ def resolve_missing(names: list[str], weights: dict) -> int:
                 mine[rec["artist_name"]] = rec
 
     stage2 = load_cache()
-    http, resolved, spent = None, 0, 0
+    answered = {k for k, ov in load_artist_overrides().items()
+                if ov["ignore"] or ov.get("none")}
+    http, resolved, spent, by_hand = None, 0, 0, 0
     for name in names:
+        if normalise(name) in answered:
+            by_hand += 1
+            continue
         rec = mine.get(name) or stage2.get(name)
         if rec is None:
             if http is None:
                 http = Throttled(MB_MIN_INTERVAL)
                 config.ensure_dirs()
             rec = resolve_via_musicbrainz(http, name)
-            if rec.get("mbid") and not rec.get("tags"):
-                rec["tags"] = tags_from_release_groups(http, rec["mbid"])
-                rec["source"] = "release-groups"
-            with CONSOLIDATE_CACHE.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
             spent += 1
+            # Only an answer is cached, as in enrich.backfill_untagged. The old
+            # fold-to-[] form wrote a failed release-group request down as
+            # "resolved, untagged", and this cache is read before the network,
+            # so one outage left the artist unscorable on every later run. A
+            # failed search is the same mistake one step earlier.
+            answer = rec.get("status") != "error"
+            if rec.get("mbid") and not rec.get("tags"):
+                tags = fetch_release_group_tags(http, rec["mbid"])
+                answer = tags is not None
+                rec["tags"] = tags or []
+                rec["source"] = "release-groups"
+            if answer:
+                with CONSOLIDATE_CACHE.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
         if rec.get("tags"):
             weights[normalise(name)] = _weights_from_tags(name, rec["tags"])
             resolved += 1
     print(f"  resolved {resolved}/{len(names)} previously untagged artists "
-          f"({spent} MusicBrainz lookup(s) spent)")
+          f"({spent} MusicBrainz lookup(s) spent"
+          + (f", {by_hand} answered IGNORE/NONE in "
+             f"{config.ARTIST_OVERRIDES_CSV.name}" if by_hand else "")
+          + ")")
     return resolved
 
 

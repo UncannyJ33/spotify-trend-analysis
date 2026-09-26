@@ -30,6 +30,8 @@ CREATE TABLE plays AS SELECT * FROM (VALUES
   ('Folkie',     'Quiet Song',   'uri:folk',  1000.0, DATE '2026-06-01'),
   ('Popper',     'Bright Song',  'uri:pop',   2000.0, DATE '2026-06-01')
 ) t(artist_name, track_name, spotify_track_uri, played_seconds, month)""")
+# Stage 3's horizon excludes estimated (polled) rows; these are all export rows.
+con.execute("ALTER TABLE plays ADD COLUMN ms_played_estimated BOOLEAN DEFAULT FALSE")
 con.execute("""
 CREATE TABLE artist_tags AS SELECT * FROM (VALUES
   ('Subtronics', 'dubstep', 5, TRUE), ('Excision', 'dubstep', 3, TRUE),
@@ -90,6 +92,26 @@ check("blend ranks across the whole blend, not per tag",
       blend[0]["artist_name"], "Popper")
 check("empty tag list yields no anchors",
       playlists.select_anchor_tracks(con, []), [])
+
+# The anchor window ends at the EXPORT's last month. A polled play is a
+# provisional row past the export's coverage; anchored on it, the window slid
+# forward and the 09-25 re-run dropped Tame Impala's "Let It Happen".
+hz = duckdb.connect()
+hz.execute(f"""
+CREATE TABLE plays AS SELECT * FROM (VALUES
+  ('Subtronics', 'Recent',    'uri:recent', 3600.0, DATE '2026-06-01', FALSE),
+  ('Subtronics', 'Window Edge', 'uri:edge', 1800.0,
+   (DATE '2026-06-01' - INTERVAL {playlists.config.ANCHOR_WINDOW_MONTHS} MONTH)::DATE,
+   FALSE),
+  ('Subtronics', 'Polled',    'uri:polled', 200.0,  DATE '2026-09-01', TRUE)
+) t(artist_name, track_name, spotify_track_uri, played_seconds, month,
+    ms_played_estimated)""")
+hz.execute("""CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Subtronics', 'dubstep', 5, TRUE)) t(artist_name, tag, tag_count, is_genre)""")
+hz_uris = {a["spotify_track_uri"]
+           for a in playlists.select_anchor_tracks(hz, ["dubstep"])}
+check("a later polled row leaves an 18-month-old export play in the window",
+      "uri:edge" in hz_uris, True)
 
 cands = playlists.select_candidates(con, ["dubstep"], TAG_CACHE)
 check("gap-tag filter applied", [c["artist_name"] for c in cands],
