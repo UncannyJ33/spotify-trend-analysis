@@ -589,13 +589,6 @@ def fetch_release_group_tags(http: Throttled, mbid: str) -> list[dict] | None:
             sorted(totals.items(), key=lambda kv: -kv[1])]
 
 
-def tags_from_release_groups(http: Throttled, mbid: str) -> list[dict]:
-    """The same, with a failure folded into []. Kept for its one outside caller,
-    consolidate.resolve_missing, which takes a list — and so cannot tell an
-    outage from an untagged artist. It should move to the None-returning form."""
-    return fetch_release_group_tags(http, mbid) or []
-
-
 def recovered_by_backfill(rec: dict) -> bool:
     """Did this record's tags come from its release groups? Either marker says so."""
     return bool(rec.get("tags")) and (
