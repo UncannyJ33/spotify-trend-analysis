@@ -66,7 +66,7 @@ from datetime import date
 import duckdb
 
 import config
-from consolidate import gentle_token
+from consolidate import find_playlist, gentle_token, read_playlist
 from credits import REMIX_CREDIT_RE, REMIX_FORMAT_STOPLIST, REMIX_NON_NAME_RE
 from enrich import MB_MIN_INTERVAL, Throttled, load_genre_vocabulary, normalise
 from playlists import (
@@ -539,25 +539,82 @@ def build_known_pool(con: duckdb.DuckDBPyConnection) -> None:
 
 
 def select_known(con: duckdb.DuckDBPyConnection, label: str,
-                 limit: int) -> list[dict]:
-    """Top-scoring known tracks for one cluster, capped per album artist."""
+                 limit: int | None = None) -> list[dict]:
+    """One cluster's known tracks in score order, UNCAPPED.
+
+    The per-artist cap used to run here, in SQL, before any filter — so a
+    vetoed, live or already-placed track still took one of its artist's three
+    slots, and vetoing a track shrank the artist instead of promoting their
+    next one. The cap now runs after the filters (eligible_known).
+
+    `credited` is every artist on the record, over every pressing's credits,
+    as a LIST — the veto reads it. An artist-wide ILLENIUM veto left Dillon
+    Francis' "Don't Let Me Let Go" in the dubstep run because ILLENIUM is on it
+    only as a feature. `uris` is every pressing, for the prefer match.
+    """
     cols = ["spotify_track_uri", "track_name", "artist_name", "duration_ms",
-            "hours", "done_rate", "n_plays", "score"]
+            "hours", "done_rate", "n_plays", "score", "uris", "credited"]
     rows = con.execute(
         f"""
-        SELECT spotify_track_uri, track_name, album_artist AS artist_name,
-               duration_ms, hours, done_rate, n_plays, score
-        FROM known_pool
-        WHERE cluster = ?
-        QUALIFY row_number() OVER (
-            PARTITION BY album_artist ORDER BY score DESC, spotify_track_uri
-        ) <= {config.RUN_TRACKS_PER_ARTIST}
-        ORDER BY score DESC, spotify_track_uri
-        LIMIT {limit}
+        WITH pool AS (
+            SELECT * FROM known_pool WHERE cluster = ?
+        ),
+        members AS (
+            SELECT spotify_track_uri, unnest(uris) AS member_uri FROM pool
+        ),
+        credited AS (
+            SELECT m.spotify_track_uri,
+                   list(DISTINCT c.artist_name ORDER BY c.artist_name) AS credited
+            FROM members m
+            JOIN track_credits c ON c.spotify_track_uri = m.member_uri
+            GROUP BY 1
+        )
+        SELECT p.spotify_track_uri, p.track_name, p.album_artist AS artist_name,
+               p.duration_ms, p.hours, p.done_rate, p.n_plays, p.score, p.uris,
+               coalesce(c.credited, []::VARCHAR[]) AS credited
+        FROM pool p
+        LEFT JOIN credited c USING (spotify_track_uri)
+        ORDER BY p.score DESC, p.spotify_track_uri
+        {'' if limit is None else f'LIMIT {int(limit)}'}
         """,
         [label],
     ).fetchall()
     return [dict(zip(cols, r)) for r in rows]
+
+
+def cap_per_artist(rows, cap: int, already=()):
+    """At most `cap` rows per album artist, taken in the order given.
+
+    A GENERATOR, and build_selections relies on that: the rows it filters are
+    judged one at a time, after the row before was placed, so a row refused by
+    a veto, the live test or fresh() never reaches the count at all. That is
+    what makes "vetoing one track promotes the next one by the same artist"
+    true. `already` is what was placed first (the pins), which holds its
+    artist's slots too — one act must not own a playlist, hand-picked or not.
+    Keyed on the normalised name, so Skrillex and SKRILLEX share one cap.
+    """
+    counts: dict[str, int] = {}
+    for r in already:
+        key = normalise(r.get("artist_name") or "")
+        counts[key] = counts.get(key, 0) + 1
+    for r in rows:
+        key = normalise(r.get("artist_name") or "")
+        if counts.get(key, 0) >= cap:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        yield r
+
+
+def eligible_known(rows, vetoes: set[tuple], is_fresh, pinned=()):
+    """The known side's filters, in the one order that works: veto, then live,
+    then fresh, THEN the per-artist cap. Lazy all the way down, so a caller
+    placing each row as it arrives has that placement seen by the rows
+    behind it."""
+    return cap_per_artist(
+        (r for r in rows
+         if not vetoed(r, vetoes) and not is_live(r.get("track_name"))
+         and is_fresh(r)),
+        config.RUN_TRACKS_PER_ARTIST, already=pinned)
 
 
 # --------------------------------------------------------------------------
@@ -698,8 +755,8 @@ def cluster_candidates(con, http, label: str, tag_cache: dict,
     return out
 
 
-def load_overrides() -> tuple[list[dict], set[tuple]]:
-    """(pins, vetoes) from running_overrides.csv.
+def load_overrides() -> dict:
+    """{pins, vetoes, prefer} from running_overrides.csv.
 
     Pins carry the FULL track title, not the folded one. `_title_key` drops
     everything from the first ' - ', and this library contains both Insania's
@@ -707,30 +764,42 @@ def load_overrides() -> tuple[list[dict], set[tuple]]:
     'iloveitiloveitiloveit' (4 plays). Folding the pin would let the wrong one
     take the slot.
 
-    A blank `playlist` applies to both.
+    A `prefer` row names a playlist, not an artist: `,prefer,,<exact playlist
+    name>,note`, the name in `track_name`. So the "no artist, skip" guard is
+    scoped to the row types that need one — applied to every row, it dropped
+    each prefer row without a word.
+
+    A blank `playlist` applies to both. A row whose FIRST cell starts with '#'
+    is a comment, which is how the example file's rows are disabled — reading
+    only the artist cell let "# ,drop,A Melodic Act,," through as a veto.
     """
-    pins: list[dict] = []
-    vetoes: set[tuple] = set()
+    out: dict = {"pins": [], "vetoes": set(), "prefer": []}
     if not config.RUNNING_OVERRIDES_CSV.exists():
-        return pins, vetoes
+        return out
 
     with config.RUNNING_OVERRIDES_CSV.open(encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
+            playlist = (row.get("playlist") or "").strip()
             decision = (row.get("decision") or "").strip().lower()
             artist = (row.get("artist_name") or "").strip()
-            if not artist or artist.startswith("#") or decision not in {"keep", "drop"}:
+            track = (row.get("track_name") or "").strip()
+            if playlist.startswith("#") or artist.startswith("#"):
                 continue
-            entry = {
-                "playlist": (row.get("playlist") or "").strip(),
-                "artist_name": artist,
-                "track_name": (row.get("track_name") or "").strip(),
-                "note": (row.get("note") or "").strip(),
-            }
-            if decision == "keep":
-                pins.append(entry)
-            else:
-                vetoes.add((normalise(artist), normalise(entry["track_name"])))
-    return pins, vetoes
+            entry = {"playlist": playlist, "artist_name": artist,
+                     "track_name": track,
+                     "note": (row.get("note") or "").strip()}
+            if decision == "prefer":
+                if not track:
+                    print("  ! a prefer row names no playlist in track_name; "
+                          "skipped")
+                    continue
+                out["prefer"].append(entry)
+            elif decision in {"keep", "drop"} and artist:
+                if decision == "keep":
+                    out["pins"].append(entry)
+                else:
+                    out["vetoes"].add((normalise(artist), normalise(track)))
+    return out
 
 
 def is_live(track_name: str) -> bool:
@@ -748,10 +817,66 @@ def is_live(track_name: str) -> bool:
 
 
 def vetoed(row: dict, vetoes: set[tuple]) -> bool:
-    """A veto naming only an artist removes everything by them."""
-    a = normalise(row.get("artist_name", ""))
-    t = normalise(row.get("track_name", ""))
-    return (a, t) in vetoes or (a, "") in vetoes
+    """A veto naming only an artist removes everything they are ON.
+
+    Every credit is tested — the row's artist and each name in `credited`,
+    features included — artist-wide and as (name, title). An album-artist-only
+    veto left "Don't Let Me Let Go" in the dubstep run under an artist-wide
+    ILLENIUM veto, because he is on it as a feature.
+    """
+    t = normalise(row.get("track_name") or "")
+    names = [row.get("artist_name") or "", *(row.get("credited") or [])]
+    return any((a, t) in vetoes or (a, "") in vetoes
+               for a in {normalise(n) for n in names})
+
+
+def prefer_members(sp, names: list[str]) -> dict[str, set]:
+    """What the `prefer` playlists hold: their URIs, and (lead artist, song
+    key) pairs so a different pressing of a member still counts.
+
+    Read-only, through Stage 9's exact-name lookup. Its hard errors — no
+    playlist of that exact name, two of them, a failed listing — are right
+    for Stage 9, where a wrong source consolidates the wrong music. Here the
+    playlist is only a tie-breaker, so a failure is a warning and the boost is
+    simply absent: the selection is then exactly what it would be without the
+    row.
+    """
+    members: dict[str, set] = {"uris": set(), "songs": set()}
+    for name in names:
+        try:
+            tracks = read_playlist(sp, find_playlist(sp, name)["id"])
+        except SystemExit as e:
+            print(f"  ! prefer {name!r} skipped, no boost applied: {e}")
+            continue
+        for t in tracks:
+            members["uris"].add(t["spotify_track_uri"])
+            if t.get("artists"):
+                members["songs"].add((normalise(t["artists"][0]),
+                                      _title_key(t.get("track_name") or "")))
+    return members
+
+
+def apply_prefer(rows: list[dict], members: dict[str, set],
+                 margin: float = config.RUN_PREFER_MARGIN) -> list[dict]:
+    """Boost members by 1 + margin and re-rank; the input rows are untouched.
+
+    A member is any pressing's URI in the playlist, or the same album artist
+    and song. It runs before the filters, so a boosted member still has to
+    clear the veto, the live test and the cap like everything else; pins never
+    pass through here.
+    """
+    uris, songs = members.get("uris") or set(), members.get("songs") or set()
+    if not uris and not songs:
+        return list(rows)
+    out = []
+    for r in rows:
+        key = (normalise(r.get("artist_name") or ""),
+               _title_key(r.get("track_name") or ""))
+        if (uris & {r.get("spotify_track_uri"), *(r.get("uris") or [])}
+                or key in songs):
+            r = dict(r, score=float(r["score"]) * (1 + margin), preferred=True)
+        out.append(r)
+    return sorted(out, key=lambda r: (-r["score"], r["spotify_track_uri"]))
 
 
 def resolve_pins(con: duckdb.DuckDBPyConnection, pins: list[dict],
@@ -952,8 +1077,7 @@ def gate_discovery(tracks: list[dict], cand: dict, pinned_id: str | None,
             continue
 
         row = dict(t, artist_name=name, credited=credited)
-        if (any(vetoed({"artist_name": n, "track_name": title}, vetoes)
-                for n in [name, *credited]) or not is_fresh(row)):
+        if vetoed(row, vetoes) or not is_fresh(row):
             continue
 
         rc = remix_credit(title)
@@ -1082,9 +1206,14 @@ def build_selections(con, http, sp) -> list[dict]:
     vocab = load_genre_vocabulary(http)
     drag = drag_artists(con)
 
-    pins, vetoes = load_overrides()
+    overrides = load_overrides()
+    pins, vetoes = overrides["pins"], overrides["vetoes"]
     target_ms = config.RUN_TARGET_MINUTES * 60_000
     known_ms = int(target_ms * config.RUN_KNOWN_FRACTION)
+
+    # Each prefer playlist is read once, however many runs it applies to.
+    prefer_sets = {name: prefer_members(sp, [name]) for name in dict.fromkeys(
+        p["track_name"] for p in overrides["prefer"])}
 
     # Shared across BOTH playlists. These are meant to be compared on real
     # runs, so a track — or an artist — appearing in both makes the comparison
@@ -1103,13 +1232,30 @@ def build_selections(con, http, sp) -> list[dict]:
         # Pins are placed first and are exempt from folding: the suffix IS the
         # record, and folding would let a different pressing take the slot.
         pinned = [place(p) for p in resolve_pins(con, pins, label)]
-        known_rows = [r for r in select_known(con, label, limit=600)
-                      if not vetoed(r, vetoes) and not is_live(r["track_name"])
-                      and fresh(r)]
-        picked: list[dict] = []
-        for r in known_rows:
-            if fresh(r):
-                picked.append(place(r))
+
+        # The prefer boost re-ranks before anything is filtered, so a member
+        # still has to clear every filter below; pins never pass through it.
+        names = [p["track_name"] for p in overrides["prefer"]
+                 if not p["playlist"] or p["playlist"] == label]
+        members = {"uris": set(), "songs": set()}
+        for n in dict.fromkeys(names):
+            members["uris"] |= prefer_sets[n]["uris"]
+            members["songs"] |= prefer_sets[n]["songs"]
+        known_rows = apply_prefer(select_known(con, label), members)
+        prefer = None
+        if names:
+            prefer = {"names": list(dict.fromkeys(names)),
+                      "members": len(members["uris"]),
+                      "boosted": sum(1 for r in known_rows if r.get("preferred"))}
+            print(f"  {' + '.join(prefer['names'])}: {prefer['members']} "
+                  f"members, {prefer['boosted']} boosted")
+
+        # Veto, live, fresh, THEN the per-artist cap — so a filtered row never
+        # holds a slot, and dropping one track promotes that artist's next.
+        # eligible_known is lazy: each row is judged after the one before it
+        # was placed.
+        picked = [place(r) for r in eligible_known(known_rows, vetoes, fresh,
+                                                   pinned)]
         known = fill_to_target(pinned + picked, known_ms)
         # Anything the duration fill rejected must not stay claimed, or it
         # cannot be offered to the other playlist.
@@ -1191,7 +1337,8 @@ def build_selections(con, http, sp) -> list[dict]:
 
         tracks = interleave(known, discovery)
         out.append({"label": label, "tags": tags, "tracks": tracks,
-                    "n_known": len(known), "n_new": len(discovery)})
+                    "n_known": len(known), "n_new": len(discovery),
+                    "prefer": prefer})
     return out
 
 
@@ -1335,6 +1482,10 @@ def report(con, selections: list[dict], dry: bool) -> None:
         print(f"\n--- {config.RUN_PLAYLIST_NAME_TEMPLATE.format(label=sel['label'])}")
         print(f"    {len(sel['tracks'])} tracks, {mins:.0f} min "
               f"({sel['n_known']} known + {sel['n_new']} new)")
+        if sel.get("prefer"):
+            p = sel["prefer"]
+            print(f"    {' + '.join(p['names'])}: {p['members']} members, "
+                  f"{p['boosted']} boosted")
         for t in sel["tracks"]:
             flag = "*" if t.get("pinned") else (
                 "+" if t.get("slot") == "discovery" else " ")

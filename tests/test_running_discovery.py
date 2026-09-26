@@ -527,7 +527,10 @@ running.build_artist_clusters(lcon)
 lcon.execute("""
 CREATE TABLE known_pool (spotify_track_uri VARCHAR, track_name VARCHAR,
     album_artist VARCHAR, cluster VARCHAR, duration_ms DOUBLE, hours DOUBLE,
-    done_rate DOUBLE, n_plays BIGINT, score DOUBLE)""")
+    done_rate DOUBLE, n_plays BIGINT, score DOUBLE, uris VARCHAR[])""")
+lcon.execute("""
+CREATE TABLE track_credits (spotify_track_uri VARCHAR, artist_name VARCHAR,
+    credit_type VARCHAR, credit_source VARCHAR)""")
 
 
 class LoopSp:
@@ -572,6 +575,124 @@ check("the discovery row carries its credits", new[0]["credited"],
       ["Garage Stranger", "Feat Person"])
 check("a search-supplied length costs no /tracks call; a missing one costs one",
       loop_sp.calls, ["/search", "/tracks/nolen"])
+
+# --- the known side, end to end: C3, C8 and D1 through build_selections ---
+# test_running_selection.py pins each filter; this pins the ORDER they run in
+# inside build_selections, which is where a cap-before-filter bug lives.
+kcon = duckdb.connect()
+kcon.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Dillon Francis', CAST(NULL AS VARCHAR), 'dubstep',   3, TRUE),
+  ('Four Act',       NULL,                  'dubstep',   3, TRUE),
+  ('Other Act',      NULL,                  'dubstep',   3, TRUE),
+  ('Garage Feat',    NULL,                  'uk garage', 3, TRUE)
+) t(artist_name, mbid, tag, tag_count, is_genre)""")
+running.build_artist_clusters(kcon)
+kcon.execute("""
+CREATE TABLE known_pool AS SELECT * FROM (VALUES
+  ('uri:ddlm', 'Don''t Let Me Let Go', 'Dillon Francis', 'dubstep', 200000.0, 1.0, 1.0, 9::BIGINT, 0.90::DOUBLE, ['uri:ddlm']),
+  -- Four Act's top track also carries a garage act (a poller-seen feature),
+  -- so it sits in both pools and the garage run, built first, takes it.
+  ('uri:f1', 'Four Tune 1', 'Four Act', 'speed garage', 200000.0, 1.0, 1.0, 9, 0.80, ['uri:f1']),
+  ('uri:f1', 'Four Tune 1', 'Four Act', 'dubstep',      200000.0, 1.0, 1.0, 9, 0.80, ['uri:f1']),
+  ('uri:f2', 'Four Tune 2', 'Four Act', 'dubstep',      200000.0, 1.0, 1.0, 9, 0.70, ['uri:f2']),
+  ('uri:f3', 'Four Tune 3', 'Four Act', 'dubstep',      200000.0, 1.0, 1.0, 9, 0.60, ['uri:f3']),
+  ('uri:f4', 'Four Tune 4', 'Four Act', 'dubstep',      200000.0, 1.0, 1.0, 9, 0.50, ['uri:f4']),
+  -- In the Workout playlist, at 0.9x of Four Tune 4.
+  ('uri:w',  'Workout Tune', 'Other Act', 'dubstep',    200000.0, 1.0, 1.0, 9, 0.45, ['uri:w'])
+) t(spotify_track_uri, track_name, album_artist, cluster, duration_ms, hours,
+    done_rate, n_plays, score, uris)""")
+kcon.execute("""
+CREATE TABLE track_credits AS SELECT * FROM (VALUES
+  ('uri:ddlm', 'Dillon Francis', 'album_artist', 'export'),
+  ('uri:ddlm', 'ILLENIUM',       'featured',     'poller'),
+  ('uri:f1', 'Four Act',    'album_artist', 'export'),
+  ('uri:f1', 'Garage Feat', 'featured',     'poller'),
+  ('uri:f2', 'Four Act', 'album_artist', 'export'),
+  ('uri:f3', 'Four Act', 'album_artist', 'export'),
+  ('uri:f4', 'Four Act', 'album_artist', 'export'),
+  ('uri:w',  'Other Act', 'album_artist', 'export')
+) t(spotify_track_uri, artist_name, credit_type, credit_source)""")
+kcon.execute("""
+CREATE TABLE plays (spotify_track_uri VARCHAR, track_name VARCHAR,
+    artist_name VARCHAR, played_seconds DOUBLE, reason_end VARCHAR, month DATE,
+    ms_played BIGINT, ms_played_estimated BOOLEAN)""")
+kcon.execute("CREATE TABLE plays_raw AS SELECT *, 'music' AS content_type FROM plays")
+
+
+class WorkoutSp:
+    """Answers only what prefer_members reads; `listing` None means the
+    playlist list itself fails."""
+    def __init__(self, listing):
+        self.listing = listing
+        self.calls = []
+    def get(self, path, params=None):
+        self.calls.append(path)
+        if path == "/me/playlists":
+            if self.listing is None:
+                return {"_status": 503, "_body": "unavailable"}
+            return {"items": self.listing, "next": None}
+        if path.startswith("/playlists/pl-w/items"):
+            return {"items": [{"added_at": "", "item": {
+                "uri": "uri:w", "name": "Workout Tune",
+                "artists": [{"name": "Other Act"}]}}], "next": None}
+        if path == "/search":
+            return {"tracks": {"items": []}}
+        failures.append(f"unexpected Spotify call {path}")
+        return None
+
+
+def run_known(overrides: str, sp) -> dict:
+    config.RUNNING_OVERRIDES_CSV.write_text(
+        "playlist,decision,artist_name,track_name,note\n" + overrides,
+        encoding="utf-8")
+    saved = (running.cluster_candidates, running.load_genre_vocabulary)
+    running.cluster_candidates = lambda *a: []
+    running.load_genre_vocabulary = lambda http: set()
+    try:
+        sels = running.build_selections(kcon, NoNetwork(), sp)
+    finally:
+        running.cluster_candidates, running.load_genre_vocabulary = saved
+        config.RUNNING_OVERRIDES_CSV.unlink()
+    return {s["label"]: [t["spotify_track_uri"]
+                         for t in sorted(s["tracks"], key=lambda t: t["position"])]
+            for s in sels}
+
+
+base = run_known("", WorkoutSp([]))
+check("with no overrides the featured-ILLENIUM track is in dubstep",
+      "uri:ddlm" in base["dubstep"], True)
+check("garage, built first, takes the track both pools hold",
+      base["speed garage"], ["uri:f1"])
+check("...and the dubstep row it consumed promotes Four Act's 4th",
+      [u for u in base["dubstep"] if u.startswith("uri:f")],
+      ["uri:f2", "uri:f3", "uri:f4"])
+
+vetoed_sel = run_known(",drop,ILLENIUM,,\n", WorkoutSp([]))
+check("an artist-wide veto on a featured credit removes it from dubstep",
+      "uri:ddlm" in vetoed_sel["dubstep"], False)
+check("...leaving everything else where it was",
+      vetoed_sel["dubstep"], [u for u in base["dubstep"] if u != "uri:ddlm"])
+
+# A `prefer` row has no artist: the old "no artist, skip" guard would have
+# thrown it away before it was read.
+prefer_row = ",prefer,,Workout · Claude,D1 near-tie prior\n"
+failing = WorkoutSp(None)
+check("find_playlist failing leaves the selection identical to no prefer row",
+      run_known(prefer_row, failing), base)
+check("...having asked, and warned rather than exited",
+      failing.calls.count("/me/playlists") >= 1, True)
+boosted = run_known(prefer_row, WorkoutSp([{"id": "pl-w", "name": "Workout · Claude"}]))
+check("a member within the margin now leads the non-member it trailed",
+      boosted["dubstep"].index("uri:w") < boosted["dubstep"].index("uri:f4"), True)
+check("...and only the order changed",
+      sorted(boosted["dubstep"]), sorted(base["dubstep"]))
+check("a veto still removes a member",
+      "uri:w" in run_known(prefer_row + ",drop,Other Act,Workout Tune,\n",
+                           WorkoutSp([{"id": "pl-w", "name": "Workout · Claude"}])
+                           )["dubstep"], False)
+check("a commented-out example row is inert",
+      run_known("# ,drop,ILLENIUM,,example\n", WorkoutSp([])), base)
 
 shutil.rmtree(_TMP, ignore_errors=True)
 if failures:

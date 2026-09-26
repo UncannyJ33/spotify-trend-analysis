@@ -490,6 +490,194 @@ check("track veto is exact",
       running.vetoed({"artist_name": "Subtronics", "track_name": "Scream Saver"},
                      track_veto), False)
 
+# --- a veto reads every credit; the cap comes after the filters (C3, C8) --
+# The veto used to test the album artist only, so an artist-wide ILLENIUM veto
+# left Dillon Francis' "Don't Let Me Let Go" — ILLENIUM on it as a feature — in
+# the dubstep run. And the per-artist cap ran in SQL before any filter, so a
+# vetoed, live or already-placed track still used up one of its artist's three
+# slots: vetoing one track SHRANK the artist instead of promoting the next.
+N = running.normalise
+vc = duckdb.connect()
+vc.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Dillon Francis', 'dubstep', 3, TRUE),
+  ('ILLENIUM',       'dubstep', 3, TRUE),
+  ('ILLENIUM',       'melodic dubstep', 3, TRUE),
+  ('ILLENIUM',       'future bass', 2, TRUE),
+  ('NGHTMRE',        'dubstep', 3, TRUE),
+  ('Other Act',      'dubstep', 3, TRUE),
+  ('Four Act',       'dubstep', 3, TRUE),
+  ('Live Act',       'dubstep', 3, TRUE)
+) t(artist_name, tag, tag_count, is_genre)""")
+running.build_artist_clusters(vc)
+vc.execute("""
+CREATE TABLE plays (spotify_track_uri VARCHAR, track_name VARCHAR,
+    artist_name VARCHAR, played_seconds DOUBLE, reason_end VARCHAR, month DATE,
+    ms_played BIGINT, ms_played_estimated BOOLEAN)""")
+
+def vc_plays(uri, title, artist, n):
+    vc.execute("""
+        INSERT INTO plays SELECT ?, ?, ?, 200.0, 'trackdone', DATE '2026-06-01',
+               200000, FALSE FROM range(?)""", [uri, title, artist, n])
+
+# Two pressings of one record, so `credited` must be the union over both.
+vc_plays("uri:ddlm",  "Don't Let Me Let Go", "Dillon Francis", 9)
+vc_plays("uri:ddlm2", "Don't Let Me Let Go - Radio Edit", "Dillon Francis", 2)
+vc_plays("uri:baf",   "Buried A Friend", "Other Act", 8)
+vc_plays("uri:oth",   "Something Else",  "Other Act", 7)
+for i, n in enumerate((6, 5, 4, 3), start=1):
+    vc_plays(f"uri:f{i}", f"Four Tune {i}", "Four Act", n)
+vc_plays("uri:l1", "Big Tune (Live)", "Live Act", 6)
+for i, n in enumerate((5, 4, 3), start=2):
+    vc_plays(f"uri:l{i}", f"Live Act Tune {i}", "Live Act", n)
+vc.execute("""
+CREATE TABLE track_credits AS
+SELECT DISTINCT spotify_track_uri, artist_name, 'album_artist' AS credit_type,
+       'export' AS credit_source
+FROM plays""")
+vc.execute("""INSERT INTO track_credits VALUES
+  ('uri:ddlm2', 'ILLENIUM', 'featured', 'poller'),
+  ('uri:baf',   'NGHTMRE',  'featured', 'export')""")
+running.build_known_pool(vc)
+vk = running.select_known(vc, "dubstep")
+vk_by = {r["spotify_track_uri"]: r for r in vk}
+
+check("select_known carries every credit, over every pressing",
+      vk_by["uri:ddlm"]["credited"], ["Dillon Francis", "ILLENIUM"])
+check("...as a LIST, never a joined string",
+      type(vk_by["uri:ddlm"]["credited"]), list)
+check("...and every pressing's URI", vk_by["uri:ddlm"]["uris"],
+      ["uri:ddlm", "uri:ddlm2"])
+check("select_known no longer caps: all four of Four Act's tracks come back",
+      sum(1 for r in vk if r["artist_name"] == "Four Act"), 4)
+check("...in score order, ties on the URI",
+      [r["score"] for r in vk] == sorted((r["score"] for r in vk), reverse=True),
+      True)
+
+def eligible(rows, vetoes=frozenset(), fresh=lambda r: True, pinned=()):
+    return [r["spotify_track_uri"]
+            for r in running.eligible_known(rows, set(vetoes), fresh, pinned)]
+
+got = eligible(vk, {(N("ILLENIUM"), "")})
+check("an artist-wide veto on a FEATURED credit removes the track",
+      "uri:ddlm" in got, False)
+check("...and touches nothing that does not credit them",
+      "uri:oth" in got and "uri:f1" in got, True)
+got = eligible(vk, {(N("NGHTMRE"), N("Buried A Friend"))})
+check("a (credited name, title) veto matches through `credited`",
+      ("uri:baf" in got, "uri:oth" in got), (False, True))
+check("vetoed() itself reads `credited`",
+      running.vetoed(vk_by["uri:baf"], {(N("NGHTMRE"), "")}), True)
+check("...and tolerates a row without it",
+      running.vetoed({"artist_name": "NGHTMRE", "track_name": "X"},
+                     {(N("NGHTMRE"), "")}), True)
+
+four = lambda got: [u for u in got if u.startswith("uri:f")]
+check("with no filter, the cap keeps an artist's top three",
+      four(eligible(vk)), ["uri:f1", "uri:f2", "uri:f3"])
+check("a vetoed track promotes the artist's 4th, who still ends with 3",
+      four(eligible(vk, {(N("Four Act"), N("Four Tune 2"))})),
+      ["uri:f1", "uri:f3", "uri:f4"])
+check("a live-titled track promotes the next by the same artist",
+      [u for u in eligible(vk) if u.startswith("uri:l")],
+      ["uri:l2", "uri:l3", "uri:l4"])
+check("a track the other playlist already placed promotes the next too",
+      four(eligible(vk, fresh=lambda r: r["spotify_track_uri"] != "uri:f1")),
+      ["uri:f2", "uri:f3", "uri:f4"])
+check("a pin by the artist holds one of their three slots",
+      four(eligible(vk, pinned=[{"artist_name": "Four Act"}])),
+      ["uri:f1", "uri:f2"])
+
+# fresh() is asked lazily, after the previous row was placed: one playlist's
+# own placements are seen by the rows behind them, and a row refused that way
+# costs no slot either.
+placed = set()
+def fresh_once(r):
+    return r["track_name"] not in placed
+out = []
+# Another act, so the cap cannot be what refuses the duplicate.
+for r in running.eligible_known(vk + [dict(vk_by["uri:f1"], artist_name="Dup Act",
+                                           spotify_track_uri="uri:f1-dup")],
+                                set(), fresh_once):
+    placed.add(r["track_name"]); out.append(r["spotify_track_uri"])
+check("fresh() is evaluated after each placement, not up front",
+      "uri:f1-dup" in out, False)
+
+caps = [{"artist_name": a} for a in ("Skrillex", "SKRILLEX", "Skrillex", "Skrillex")]
+check("cap_per_artist keys on the normalised name",
+      len(list(running.cap_per_artist(caps, 3))), 3)
+
+# --- the Workout near-tie boost (D1) ------------------------------------
+# A hand-built playlist of what the listener actually runs to is a prior: a
+# member beats a non-member only when it is within RUN_PREFER_MARGIN of it.
+M = config.RUN_PREFER_MARGIN
+check("RUN_PREFER_MARGIN is 0.25", M, 0.25)
+
+def prefer_rows(member_score):
+    return [
+        {"spotify_track_uri": "u:non", "artist_name": "A", "track_name": "Non",
+         "score": 1.0, "uris": ["u:non"]},
+        {"spotify_track_uri": "u:mem", "artist_name": "B", "track_name": "Mem",
+         "score": member_score, "uris": ["u:mem-single", "u:mem"]},
+    ]
+members = {"uris": {"u:mem-single"}, "songs": set()}
+check("a member at 0.81x a non-member's score beats it",
+      [r["spotify_track_uri"] for r in running.apply_prefer(prefer_rows(0.81), members, M)],
+      ["u:mem", "u:non"])
+check("...one at 0.79x does not",
+      [r["spotify_track_uri"] for r in running.apply_prefer(prefer_rows(0.79), members, M)],
+      ["u:non", "u:mem"])
+check("any pressing's URI makes a member",
+      [r.get("preferred", False) for r in running.apply_prefer(prefer_rows(0.5), members, M)],
+      [False, True])
+by_song = {"uris": set(), "songs": {(N("B"), running._title_key("Mem - Radio Edit"))}}
+check("...and so does (lead artist, song key)",
+      running.apply_prefer(prefer_rows(0.9), by_song, M)[0]["spotify_track_uri"],
+      "u:mem")
+check("the boost does not touch the input rows",
+      prefer_rows(0.81)[1]["score"], 0.81)
+check("no members leaves the order alone",
+      [r["spotify_track_uri"] for r in running.apply_prefer(
+          prefer_rows(0.99), {"uris": set(), "songs": set()}, M)],
+      ["u:non", "u:mem"])
+check("a vetoed member is still absent",
+      [r["spotify_track_uri"] for r in running.eligible_known(
+          running.apply_prefer(prefer_rows(0.9), members, M),
+          {(N("B"), N("Mem"))}, lambda r: True)],
+      ["u:non"])
+
+
+class PlaylistSp:
+    """consolidate.find_playlist / read_playlist, answered from a dict."""
+    def __init__(self, playlists):
+        self.playlists = playlists      # name -> list of (uri, title, [artists])
+        self.calls = []
+    def get(self, path, params=None):
+        self.calls.append(path)
+        if path == "/me/playlists":
+            return {"items": [{"id": f"pl-{i}", "name": n}
+                              for i, n in enumerate(self.playlists)], "next": None}
+        for i, (n, tracks) in enumerate(self.playlists.items()):
+            if path.startswith(f"/playlists/pl-{i}/items"):
+                return {"items": [{"added_at": "", "item": {
+                    "uri": u, "name": t, "artists": [{"name": a} for a in arts]}}
+                    for u, t, arts in tracks], "next": None}
+        return {"_status": 404}
+
+psp = PlaylistSp({"Workout · Claude": [
+    ("u:1", "Nuclear (Hands Up)", ["Zomboy"]),
+    ("u:2", "Tough - Gravagerz Remix", ["Gravagerz", "Other"])]})
+mem = running.prefer_members(psp, ["Workout · Claude"])
+check("prefer_members reads the playlist's URIs",
+      mem["uris"], {"u:1", "u:2"})
+check("...and (lead artist, song key) pairs",
+      mem["songs"], {(N("Zomboy"), running._title_key("Nuclear (Hands Up)")),
+                     (N("Gravagerz"), running._title_key("Tough - Gravagerz Remix"))})
+check("...read-only: it only ever GETs", hasattr(psp, "put"), False)
+missing = running.prefer_members(psp, ["Workout · claude"])
+check("a name that is not an exact match is a warning, not an exit",
+      missing, {"uris": set(), "songs": set()})
+
 # --- fill to a duration target -----------------------------------------
 rows = [{"spotify_track_uri": f"u{i}", "duration_ms": 200_000} for i in range(20)]
 filled = running.fill_to_target(rows, 1_000_000)      # exactly 5 fit

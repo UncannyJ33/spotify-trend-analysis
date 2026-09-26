@@ -322,6 +322,13 @@ RUN_BORDERLINE_BAND = 0.15
 RUN_TARGET_MINUTES = 240
 RUN_KNOWN_FRACTION = 0.6      # rest is discovery; more new music, by request
 RUN_TRACKS_PER_ARTIST = 3     # one act must not own a playlist
+# A `prefer` row in running_overrides.csv names a playlist the listener built
+# by hand for running (Workout · Claude). Its members are a run-fit prior the
+# score cannot see: a member's score is multiplied by 1 + this, so it beats a
+# non-member only when within 25% of it — a near-tie breaker, not a pin. The
+# evaluation's weak known tracks (Pretty Low, Buried A Friend) are exactly the
+# near-ties it exists to settle, and neither is in Workout. Vetoes still win.
+RUN_PREFER_MARGIN = 0.25
 # Discovery stays at 2. Three tracks from an artist you already play is more of
 # a good thing; three from a stranger is three chances to break a run.
 RUN_DISCOVERY_TRACKS_PER_ARTIST = 2
