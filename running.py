@@ -49,6 +49,13 @@ DISCOVERY IS JUDGED PER TRACK.
     so nothing could tell. Each pick is now read against Spotify's own credit
     list first — gate_discovery has the rules and the cases behind each.
 
+NEW MUSIC COMES FROM THE LISTENER'S OWN ARTISTS FIRST.
+    Hand-named acts, then unplayed tracks by his own cluster artists (up to a
+    quarter of the discovery budget), then strangers, then more of his own
+    artists, then known tracks. When new music runs short the playlist fills
+    with more of what he already plays; a weak stranger is never kept just to
+    hold the quota. build_selections has the order and the reason.
+
 Outputs: two playlists, data/running_state.json, rows in data/playlists.parquet
 """
 
@@ -62,6 +69,7 @@ import re
 import sys
 import unicodedata
 from datetime import date
+from functools import partial
 
 import duckdb
 
@@ -623,7 +631,8 @@ def eligible_known(rows, vetoes: set[tuple], is_fresh, pinned=()):
 
 
 def cluster_seed_artists(con: duckdb.DuckDBPyConnection, label: str,
-                         vetoes: set[tuple]) -> list[dict]:
+                         vetoes: set[tuple],
+                         with_unresolved: bool = False) -> list[dict]:
     """This cluster's own artists, ranked by what their tracks earn in the known
     pool — ONE row per MusicBrainz artist.
 
@@ -638,14 +647,20 @@ def cluster_seed_artists(con: duckdb.DuckDBPyConnection, label: str,
     was dubstep seed #6 after being vetoed off the playlist itself; seeding on a
     rejected artist asks ListenBrainz for more of exactly what was rejected.
 
-    Task 8's library-artist discovery reads this list too, so the ranking is
-    total — ties broken on mbid — and unlimited; callers take what they need.
+    Library-artist discovery (library_discovery) reads this list too, so the
+    ranking is total — ties broken on mbid, then name — and unlimited; callers
+    take what they need. It passes `with_unresolved`: an artist with no MBID
+    has nothing to ask ListenBrainz, but their own unplayed tracks are as good
+    a supply as anyone's, and hand-tagged acts (nate band, AVELLO) are often
+    exactly the ones MusicBrainz never resolved. Each is its own row, keyed
+    on the name, with mbid None.
     """
     rows = con.execute(
         f"""
         WITH a AS (
             SELECT artist_name, any_value(mbid) AS mbid
-            FROM artist_tags WHERE mbid IS NOT NULL
+            FROM artist_tags
+            {'' if with_unresolved else 'WHERE mbid IS NOT NULL'}
             GROUP BY 1
         ),
         per_name AS (
@@ -666,14 +681,15 @@ def cluster_seed_artists(con: duckdb.DuckDBPyConnection, label: str,
                        AS artist_name,
                    sum(score) AS score, sum(hours) AS hours
             FROM per_name
-            GROUP BY mbid
+            -- An unresolved artist is one row per name: NULL is no identity.
+            GROUP BY mbid, CASE WHEN mbid IS NULL THEN artist_name END
             HAVING sum(hours) >= {config.RUN_MIN_SEED_HOURS}
         )
         SELECT s.mbid, s.artist_name, s.score, s.hours,
                (SELECT list(a.artist_name ORDER BY a.artist_name)
                 FROM a WHERE a.mbid = s.mbid) AS names
         FROM seeds s
-        ORDER BY s.score DESC, s.mbid
+        ORDER BY s.score DESC, s.mbid, s.artist_name
         """,
         [label, label],
     ).fetchall()
@@ -756,13 +772,18 @@ def cluster_candidates(con, http, label: str, tag_cache: dict,
 
 
 def load_overrides() -> dict:
-    """{pins, vetoes, prefer} from running_overrides.csv.
+    """{pins, vetoes, discover, prefer} from running_overrides.csv.
 
     Pins carry the FULL track title, not the folded one. `_title_key` drops
     everything from the first ' - ', and this library contains both Insania's
     'iloveitiloveitiloveit - Garage' (23 plays) and Bella Kay's
     'iloveitiloveitiloveit' (4 plays). Folding the pin would let the wrong one
     take the slot.
+
+    A `discover` row names an act for ONE playlist's discovery — a scene act
+    MusicBrainz never tagged (Kanine, Bru-C), which no share test can admit.
+    It must name its playlist: a hand-named act is a claim about one run, so a
+    blank one is warned about and skipped rather than read as "both".
 
     A `prefer` row names a playlist, not an artist: `,prefer,,<exact playlist
     name>,note`, the name in `track_name`. So the "no artist, skip" guard is
@@ -773,7 +794,8 @@ def load_overrides() -> dict:
     is a comment, which is how the example file's rows are disabled — reading
     only the artist cell let "# ,drop,A Melodic Act,," through as a veto.
     """
-    out: dict = {"pins": [], "vetoes": set(), "prefer": []}
+    out: dict = {"pins": [], "vetoes": set(), "discover": [], "prefer": []}
+    labels = {c["label"] for c in CLUSTERS}
     if not config.RUNNING_OVERRIDES_CSV.exists():
         return out
 
@@ -794,6 +816,13 @@ def load_overrides() -> dict:
                           "skipped")
                     continue
                 out["prefer"].append(entry)
+            elif decision == "discover" and artist:
+                if playlist not in labels:
+                    print(f"  ! discover row for {artist!r} names no playlist "
+                          f"({playlist or 'blank'}; one of "
+                          f"{', '.join(sorted(labels))}); skipped")
+                    continue
+                out["discover"].append(entry)
             elif decision in {"keep", "drop"} and artist:
                 if decision == "keep":
                     out["pins"].append(entry)
@@ -1099,6 +1128,96 @@ def gate_discovery(tracks: list[dict], cand: dict, pinned_id: str | None,
     return choose_tracks(eligible, on_genre, k)
 
 
+def heard_keys(con: duckdb.DuckDBPyConnection) -> dict[str, set]:
+    """Everything the listener has STARTED: every URI, and every (artist, song
+    key), in plays_raw's music rows.
+
+    plays_raw, not plays. Stage 1's plays drops anything under 30 seconds, and
+    a track skipped at 20 seconds has been heard and turned down — offering it
+    as "new" would be the one discovery pick guaranteed to be skipped again.
+    The song key catches the other pressing: a single the listener never
+    played is not new if the album cut is in the history.
+    """
+    register_song_key(con)
+    uris = {r[0] for r in con.execute(
+        "SELECT DISTINCT spotify_track_uri FROM plays_raw "
+        "WHERE content_type = 'music' AND spotify_track_uri IS NOT NULL"
+    ).fetchall()}
+    songs = {(normalise(a), k) for a, k in con.execute(
+        """
+        SELECT artist_name, song_key(track_name)
+        FROM (SELECT DISTINCT artist_name, track_name FROM plays_raw
+              WHERE content_type = 'music' AND artist_name IS NOT NULL
+                AND track_name IS NOT NULL)
+        """).fetchall()}
+    return {"uris": uris, "songs": songs}
+
+
+def is_heard(track: dict, heard: dict[str, set]) -> bool:
+    """A search hit the listener has already started, under ANY of its
+    credits: plays_raw names the album artist, which for a feature or a remix
+    is not necessarily who Spotify lists first."""
+    if track.get("spotify_track_uri") in heard["uris"]:
+        return True
+    song = _title_key(track.get("track_name") or "")
+    names = [track.get("artist_name") or "",
+             *(a.get("name") or "" for a in track.get("artists") or [])]
+    return any((normalise(n), song) in heard["songs"] for n in names if n)
+
+
+def candidate_picks(sp, http, cand: dict, tags: list[str], credited_cache: dict,
+                    genre_cache: dict, drag: set[str], vetoes: set[tuple],
+                    is_fresh, heard: dict[str, set], k: int) -> list[dict]:
+    """One act's usable discovery picks, best first — the same path for every
+    supply: search, keep only the act's own Spotify id, drop what the listener
+    has already started, ask MusicBrainz which recordings are on-genre, gate.
+
+    An act with no MBID (a hand-named scene act, a hand-tagged library artist)
+    skips MusicBrainz and takes Spotify's relevance order, as gate step 5 does
+    for an artist with no tagged recordings.
+    """
+    name = cand["artist_name"]
+    pinned_id, tracks = pin_artist_id(
+        sp_artist_tracks_credited(sp, name, credited_cache), name)
+    tracks = [t for t in tracks if not is_heard(t, heard)]
+    if not tracks:
+        return []
+    on_genre = (mb_genre_recordings(http, cand["mbid"], tags, genre_cache)
+                if cand.get("mbid") else set())
+    return gate_discovery(tracks, cand, pinned_id, on_genre, drag, vetoes,
+                          is_fresh, k=k)
+
+
+def library_discovery(con, sp, http, label: str, tags: list[str],
+                      credited_cache: dict, genre_cache: dict, drag: set[str],
+                      vetoes: set[tuple], is_fresh,
+                      heard: dict[str, set]) -> list[tuple[dict, list[dict]]]:
+    """This cluster's own artists' tracks the listener has never started, as
+    (artist, picks) in seed-rank order — the first discovery supply after
+    hand-named acts.
+
+    The artists are the top RUN_LIBRARY_DISCOVERY_ARTISTS of
+    cluster_seed_artists, the same ranking that seeds ListenBrainz, but without
+    its skip for an artist ListenBrainz knows nothing about: that says nothing
+    about their own catalogue. An artist-wide veto is already out of that list,
+    and the gate refuses anything crediting a vetoed name.
+
+    Every pick passes the same track gate strangers face (candidate_picks), so
+    a drag-led single or a 6-minute cut is refused here too. The gate tests the
+    LEAD and a named remixer, never a featured vocalist, which is what keeps
+    an unplayed Subtronics record with Inéz on it.
+    """
+    out = []
+    for artist in cluster_seed_artists(con, label, vetoes, with_unresolved=True
+                                       )[:config.RUN_LIBRARY_DISCOVERY_ARTISTS]:
+        picks = candidate_picks(
+            sp, http, artist, tags, credited_cache, genre_cache, drag, vetoes,
+            is_fresh, heard, k=config.RUN_LIBRARY_DISCOVERY_TRACKS_PER_ARTIST)
+        if picks:
+            out.append((artist, picks))
+    return out
+
+
 # --------------------------------------------------------------------------
 # Duration — fill to time, not to a track count
 # --------------------------------------------------------------------------
@@ -1138,6 +1257,64 @@ def fill_to_target(rows: list[dict], target_ms: int) -> list[dict]:
         out.append(dict(r, duration_ms=dur))
         used += dur
     return out
+
+
+class DiscoveryFill:
+    """One playlist's discovery budget, filled supply by supply.
+
+    A pick is re-checked against what is placed NOW, not when it was gated:
+    library picks are gated before any stranger is placed, and a stranger's
+    record can credit a library artist. Search carries the length; /tracks is
+    only the fallback for a hit without one, and what it returns gets the same
+    cap the gate applied to everything else. An unknown length is charged
+    nothing, as it always was.
+    """
+
+    def __init__(self, budget_ms: int, placed: Placements, sp,
+                 duration_cache: dict, elsewhere: set[str]) -> None:
+        self.budget_ms = budget_ms
+        self.placed = placed
+        self.sp = sp
+        self.duration_cache = duration_cache
+        # Acts that already supplied the OTHER playlist. The two runs are
+        # compared against each other, and one act in both says less.
+        self.elsewhere = elsewhere
+        self.rows: list[dict] = []
+
+    def ms(self, supply: str | None = None) -> int:
+        return sum(r["duration_ms"] or 0 for r in self.rows
+                   if supply in (None, r["supply"]))
+
+    @property
+    def full(self) -> bool:
+        return self.ms() >= self.budget_ms
+
+    def count(self, name: str) -> int:
+        """Picks this playlist already took from the act."""
+        key = normalise(name)
+        return sum(1 for r in self.rows if normalise(r["artist_name"]) == key)
+
+    def open_to(self, name: str) -> bool:
+        return normalise(name) not in self.elsewhere
+
+    def take(self, chosen: dict, supply: str, room_ms: int | None = None) -> bool:
+        """Place one pick if it is still fresh, under the length cap, and fits
+        both the budget and `room_ms` (a supply's own ceiling)."""
+        if not self.placed.fresh(chosen):
+            return False
+        dur = (chosen.get("duration_ms")
+               or track_duration(self.sp, chosen["spotify_track_uri"],
+                                 self.duration_cache))
+        if dur and dur > config.RUN_MAX_DISCOVERY_MS:
+            return False
+        room = self.budget_ms - self.ms()
+        if room_ms is not None:
+            room = min(room, room_ms)
+        if (dur or 0) > room:
+            return False
+        self.placed.place(chosen)
+        self.rows.append(dict(chosen, duration_ms=dur, supply=supply))
+        return True
 
 
 # --------------------------------------------------------------------------
@@ -1184,8 +1361,11 @@ def register_sources(con: duckdb.DuckDBPyConnection) -> None:
     # No recommendations.parquet: Stage 10 does not read Stage 5. Discovery is
     # seeded on each cluster's own artists (cluster_candidates), and the old
     # Stage 5 top-up is gone — see build_selections.
+    # plays_raw, not just plays, because "never heard" has to include the
+    # sub-30-second skips plays drops (heard_keys).
     needed = {
         "plays": config.PLAYS_PARQUET,
+        "plays_raw": config.PLAYS_RAW_PARQUET,
         "artist_tags": config.ARTIST_TAGS_PARQUET,
         "track_credits": config.DATA_DIR / "track_credits.parquet",
     }
@@ -1221,7 +1401,8 @@ def build_selections(con, http, sp) -> list[dict]:
     # Placements says what "the same track" means; see its docstring.
     placed = Placements()
     fresh, place = placed.fresh, placed.place
-    used_discovery_artists: set[str] = set()
+    supplied_elsewhere: set[str] = set()
+    heard = heard_keys(con)
 
     out = []
     for cluster in CLUSTERS:
@@ -1267,61 +1448,110 @@ def build_selections(con, http, sp) -> list[dict]:
               f"({sum(1 for k in known if k.get('pinned'))} pinned), "
               f"{sum(k['duration_ms'] for k in known)/60000:.0f} min")
 
-        # Strangers come only from this cluster's own neighbourhood. There is
-        # deliberately no Stage 5 top-up any more: once the seed and share fixes
-        # landed, its only garage contribution was Basement Jaxx — the very
-        # miss cluster seeding was built to fix — and every dubstep act it
-        # passed was already seeded. A thin cluster is answered by known
-        # tracks below, not by a library-wide list judged on one shared tag.
+        # DISCOVERY, in supply order within one budget. SJ's call (2026-09-26):
+        # when new music runs short, fill with more of his OWN, and never keep
+        # a weak stranger just to hold the quota. Once the seed fixes cut Todd
+        # Edwards' chain, garage discovery fell to about 9 tracks, and the
+        # known top-up alone would have turned the 40% discovery share into
+        # ~10%; an unplayed Sammy Virji record was a keep where the strangers
+        # were not. So:
+        #   1. acts named by hand (`discover` rows);
+        #   2. the cluster's own artists' unplayed tracks, one each, up to
+        #      RUN_LIBRARY_DISCOVERY_FRACTION of the budget;
+        #   3. strangers from the cluster's ListenBrainz neighbourhood;
+        #   4. more of the listener's own artists, into what strangers left;
+        #   5. known tracks, below.
+        # Every pick from every supply passes the same track gate, and nothing
+        # the listener has started — not even a 20-second skip — counts as new.
+        fill = DiscoveryFill(int(target_ms - sum(k["duration_ms"] for k in known)),
+                             placed, sp, duration_cache, supplied_elsewhere)
+        picks_for = partial(candidate_picks, sp, http, tags=tags,
+                            credited_cache=credited_cache,
+                            genre_cache=genre_rec_cache, drag=drag,
+                            vetoes=vetoes, is_fresh=fresh, heard=heard)
+
+        # 1. No share test — a hand answer outranks a computed one — and no
+        #    MBID, so Spotify's relevance order; but the same gate.
+        for row in overrides["discover"]:
+            name = row["artist_name"]
+            if row["playlist"] != label:
+                continue
+            if vetoed({"artist_name": name, "track_name": ""}, vetoes):
+                print(f"  ! discover row for {name!r} is vetoed artist-wide "
+                      f"too; the veto wins")
+                continue
+            if fill.full or not fill.open_to(name) or fill.count(name):
+                continue
+            for chosen in picks_for({"artist_name": name, "mbid": None},
+                                    k=config.RUN_DISCOVERY_TRACKS_PER_ARTIST):
+                fill.take(chosen, "discover-row")
+
+        # 2. One track per library artist, capped so strangers still get a
+        #    look-in; a pick too long for what is left of the cap is passed
+        #    over for the artist's next.
+        library = library_discovery(con, sp, http, label, tags, credited_cache,
+                                    genre_rec_cache, drag, vetoes, fresh, heard)
+        lib_cap = int(fill.budget_ms * config.RUN_LIBRARY_DISCOVERY_FRACTION)
+        for artist, picks in library:
+            name = artist["artist_name"]
+            if fill.full or fill.ms("library-artist") >= lib_cap:
+                break
+            if not fill.open_to(name) or fill.count(name):
+                continue
+            for chosen in picks:
+                if fill.take(chosen, "library-artist",
+                             room_ms=lib_cap - fill.ms("library-artist")):
+                    break
+
+        # 3. Strangers come only from this cluster's own neighbourhood. There
+        #    is deliberately no Stage 5 top-up any more: once the seed and
+        #    share fixes landed, its only garage contribution was Basement
+        #    Jaxx — the very miss cluster seeding was built to fix — and every
+        #    dubstep act it passed was already seeded.
         candidates = cluster_candidates(con, http, label, tag_cache,
                                         sim_cache, vocab, vetoes)
         print(f"  {len(candidates)} candidates clear the "
               f"{config.RUN_MIN_CANDIDATE_SHARE:.2f} stranger bar")
-
-        discovery: list[dict] = []
-        budget_ms = target_ms - sum(k["duration_ms"] for k in known)
-        got_ms = 0
         for cand in candidates:
-            if got_ms >= budget_ms:
+            if fill.full:
                 break
-            if normalise(cand["artist_name"]) in used_discovery_artists:
+            if not fill.open_to(cand["artist_name"]) or fill.count(cand["artist_name"]):
                 continue
-            # Only the candidate's own Spotify id survives, so a namesake's
-            # records never reach the gate under their name.
-            pinned_id, tracks = pin_artist_id(
-                sp_artist_tracks_credited(sp, cand["artist_name"], credited_cache),
-                cand["artist_name"])
-            if not tracks:
-                continue
-            on_genre = mb_genre_recordings(http, cand["mbid"], tags, genre_rec_cache)
-            for chosen in gate_discovery(tracks, cand, pinned_id, on_genre,
-                                         drag, vetoes, fresh):
-                # Search carries the length; /tracks is only the fallback for a
-                # hit without one, and what it returns gets the same cap the
-                # gate applied to everything else.
-                dur = (chosen.get("duration_ms")
-                       or track_duration(sp, chosen["spotify_track_uri"],
-                                         duration_cache))
-                if dur and dur > config.RUN_MAX_DISCOVERY_MS:
-                    continue
-                if got_ms + (dur or 0) > budget_ms:
-                    continue
-                place(chosen)
-                used_discovery_artists.add(normalise(cand["artist_name"]))
-                discovery.append(dict(chosen, duration_ms=dur))
-                got_ms += dur or 0
+            for chosen in picks_for(cand, k=config.RUN_DISCOVERY_TRACKS_PER_ARTIST):
+                fill.take(chosen, "stranger")
 
+        # 4. What strangers left goes back to the listener's own artists, up
+        #    to RUN_LIBRARY_DISCOVERY_TRACKS_PER_ARTIST each, with no cap.
+        for artist, picks in library:
+            name = artist["artist_name"]
+            if fill.full:
+                break
+            if not fill.open_to(name):
+                continue
+            for chosen in picks:
+                if fill.count(name) >= config.RUN_LIBRARY_DISCOVERY_TRACKS_PER_ARTIST:
+                    break
+                fill.take(chosen, "library-artist")
+
+        discovery = fill.rows
+        got_ms = fill.ms()
+        supplied_elsewhere |= {normalise(d["artist_name"]) for d in discovery}
+        supply = {s: sum(1 for d in discovery if d["supply"] == s)
+                  for s in ("discover-row", "library-artist", "stranger")}
         matched = sum(1 for d in discovery if d.get("genre_matched"))
         print(f"  {len(discovery)} discovery tracks "
-              f"({matched} matched on recording-level tags), {got_ms/60000:.0f} min")
+              f"({matched} matched on recording-level tags), {got_ms/60000:.0f} min: "
+              f"{supply['discover-row']} hand-named, "
+              f"{supply['library-artist']} library-artist, "
+              f"{supply['stranger']} strangers")
 
-        # Discovery that cannot fill its third hands the time back rather than
-        # shipping a short playlist. MusicBrainz barely tags current speed
+        # 5. Discovery that cannot fill its share hands the time back rather
+        # than shipping a short playlist. MusicBrainz barely tags current speed
         # garage, so that cluster's candidate pool is thin through no fault of
         # the listener's — and a known track they already like beats a gap.
         spare_ms = target_ms - sum(k["duration_ms"] for k in known) - got_ms
+        topup = []
         if spare_ms > 0:
-            topup = []
             for r in picked:
                 if r["spotify_track_uri"] in kept:
                     continue
@@ -1336,9 +1566,11 @@ def build_selections(con, http, sp) -> list[dict]:
                 known = known + topup
 
         tracks = interleave(known, discovery)
+        total_ms = sum((t.get("duration_ms") or 0) for t in tracks)
         out.append({"label": label, "tags": tags, "tracks": tracks,
                     "n_known": len(known), "n_new": len(discovery),
-                    "prefer": prefer})
+                    "prefer": prefer, "supply": supply, "n_topup": len(topup),
+                    "short_min": max(0.0, (target_ms - total_ms) / 60_000)})
     return out
 
 
@@ -1413,7 +1645,11 @@ def publish(sp, con, selections: list[dict]) -> list[dict]:
                 "slot": t.get("slot"), "artist_name": t.get("artist_name"),
                 "track_name": t.get("track_name"),
                 "spotify_track_uri": t.get("spotify_track_uri"),
-                "source": "library" if t.get("slot") == "anchor" else "discovery",
+                # Known rows stay `library`; a discovery row says which supply
+                # it came from, so a verdict can be read per supply. Same
+                # column, same type: the archive schema does not change.
+                "source": ("library" if t.get("slot") == "anchor"
+                           else t.get("supply") or "discovery"),
             })
         print(f"  wrote {len(uris)} tracks to {name!r}")
 
@@ -1425,6 +1661,10 @@ def publish(sp, con, selections: list[dict]) -> list[dict]:
 # --------------------------------------------------------------------------
 # Report — the verification surface, as with every other stage
 # --------------------------------------------------------------------------
+
+# One mark per discovery supply, so a dry run reads per supply without a
+# second listing. Known rows print blank, pins `*`.
+SUPPLY_FLAGS = {"stranger": "+", "library-artist": "~", "discover-row": "#"}
 
 
 def report(con, selections: list[dict], dry: bool) -> None:
@@ -1482,18 +1722,26 @@ def report(con, selections: list[dict], dry: bool) -> None:
         print(f"\n--- {config.RUN_PLAYLIST_NAME_TEMPLATE.format(label=sel['label'])}")
         print(f"    {len(sel['tracks'])} tracks, {mins:.0f} min "
               f"({sel['n_known']} known + {sel['n_new']} new)")
+        if sel.get("supply") is not None:
+            s = sel["supply"]
+            print(f"    {s['discover-row']} hand-named, "
+                  f"{s['library-artist']} library-artist, "
+                  f"{s['stranger']} strangers, {sel['n_topup']} known top-up, "
+                  f"{sel['short_min']:.0f} min short")
         if sel.get("prefer"):
             p = sel["prefer"]
             print(f"    {' + '.join(p['names'])}: {p['members']} members, "
                   f"{p['boosted']} boosted")
         for t in sel["tracks"]:
             flag = "*" if t.get("pinned") else (
-                "+" if t.get("slot") == "discovery" else " ")
+                SUPPLY_FLAGS.get(t.get("supply"), "+")
+                if t.get("slot") == "discovery" else " ")
             dur = (t.get("duration_ms") or 0) / 60000
             print(f"    {t.get('position', 0):>2}{flag} {dur:4.1f}m  "
                   f"{(t.get('artist_name') or '')[:26]:<26} "
                   f"{(t.get('track_name') or '')[:40]}")
-    print("\n    * pinned by hand    + discovery (not in your library)")
+    print("\n    * pinned by hand    + stranger    ~ your artist, a track you "
+          "have never started    # hand-named act")
     if dry:
         print("\nNothing was written. Re-run with --write to build them.")
     print("=" * 74)

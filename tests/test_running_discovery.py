@@ -10,6 +10,8 @@ way. Todd Edwards is the case that made this file: one join to artist_tags per
 TAG ROW lifted him from rank 31 to garage seed #17, and his ListenBrainz tail
 supplied 13 of the 21 garage discovery tracks.
 """
+import contextlib
+import io
 import os
 import shutil
 import sys
@@ -230,7 +232,8 @@ check("a 0.77 stranger is refused", "n-rp-0" in {c["mbid"] for c in cands},
 # Basement Jaxx — the failure cluster seeding was built to fix — and every
 # dubstep passer was already seeded. It is gone, and so is the dependency: a
 # data directory with no recommendations.parquet must be enough.
-for view in ("plays", "artist_tags", "track_credits"):
+con.execute("CREATE TABLE plays_raw AS SELECT *, 'music' AS content_type FROM plays")
+for view in ("plays", "plays_raw", "artist_tags", "track_credits"):
     con.execute(f"COPY (SELECT * FROM {view}) TO "
                 f"'{config.DATA_DIR / (view + '.parquet')}' (FORMAT PARQUET)")
 check("the scratch data dir really lacks recommendations.parquet",
@@ -244,8 +247,8 @@ except SystemExit as e:
 check("register_sources needs no recommendations.parquet", raised, None)
 views = {r[0] for r in fresh_con.execute(
     "SELECT view_name FROM duckdb_views() WHERE NOT internal").fetchall()}
-check("...registers what it does need",
-      {"plays", "artist_tags", "track_credits"} <= views, True)
+check("...registers what it does need, plays_raw included (heard_keys)",
+      {"plays", "plays_raw", "artist_tags", "track_credits"} <= views, True)
 check("...and does not register recommendations", "recommendations" in views,
       False)
 check("select_candidates is no longer imported",
@@ -520,9 +523,9 @@ check("Stage 8's search cache is never written",
 lcon = duckdb.connect()
 lcon.execute("""
 CREATE TABLE artist_tags AS SELECT * FROM (VALUES
-  ('Tion Wayne', 'hip hop',   2, TRUE),
-  ('Tion Wayne', 'uk garage', 1, TRUE)
-) t(artist_name, tag, tag_count, is_genre)""")
+  ('Tion Wayne', 'm-tion', 'hip hop',   2, TRUE),
+  ('Tion Wayne', 'm-tion', 'uk garage', 1, TRUE)
+) t(artist_name, mbid, tag, tag_count, is_genre)""")
 running.build_artist_clusters(lcon)
 lcon.execute("""
 CREATE TABLE known_pool (spotify_track_uri VARCHAR, track_name VARCHAR,
@@ -531,6 +534,9 @@ CREATE TABLE known_pool (spotify_track_uri VARCHAR, track_name VARCHAR,
 lcon.execute("""
 CREATE TABLE track_credits (spotify_track_uri VARCHAR, artist_name VARCHAR,
     credit_type VARCHAR, credit_source VARCHAR)""")
+lcon.execute("""
+CREATE TABLE plays_raw (spotify_track_uri VARCHAR, track_name VARCHAR,
+    artist_name VARCHAR, content_type VARCHAR)""")
 
 
 class LoopSp:
@@ -590,7 +596,7 @@ CREATE TABLE artist_tags AS SELECT * FROM (VALUES
 running.build_artist_clusters(kcon)
 kcon.execute("""
 CREATE TABLE known_pool AS SELECT * FROM (VALUES
-  ('uri:ddlm', 'Don''t Let Me Let Go', 'Dillon Francis', 'dubstep', 200000.0, 1.0, 1.0, 9::BIGINT, 0.90::DOUBLE, ['uri:ddlm']),
+  ('uri:ddlm', 'Don''t Let Me Let Go', 'Dillon Francis', 'dubstep', 200000.0::DOUBLE, 1.0::DOUBLE, 1.0::DOUBLE, 9::BIGINT, 0.90::DOUBLE, ['uri:ddlm']),
   -- Four Act's top track also carries a garage act (a poller-seen feature),
   -- so it sits in both pools and the garage run, built first, takes it.
   ('uri:f1', 'Four Tune 1', 'Four Act', 'speed garage', 200000.0, 1.0, 1.0, 9, 0.80, ['uri:f1']),
@@ -693,6 +699,269 @@ check("a veto still removes a member",
                            )["dubstep"], False)
 check("a commented-out example row is inert",
       run_known("# ,drop,ILLENIUM,,example\n", WorkoutSp([])), base)
+
+# --- the listener's own artists are the first discovery supply (C5) -------
+# Once the seed fixes cut Todd Edwards' chain, garage discovery fell to about 9
+# tracks, and the known top-up would have quietly turned the 40% discovery share
+# into ~10%. SJ's call: when new music runs short, fill with more of his OWN —
+# unplayed tracks by artists he already plays in the cluster — and never keep a
+# weak stranger just to hold the quota.
+hcon = duckdb.connect()
+hcon.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Heard Lib',  'm-hl', 'uk garage', 3, TRUE),
+  ('Vetoed Lib', 'm-vl', 'uk garage', 3, TRUE),
+  -- Hand-tagged, never resolved: no MBID, so no MusicBrainz lookup either.
+  ('Hand Lib',   NULL,   'uk garage', 1, TRUE)
+) t(artist_name, mbid, tag, tag_count, is_genre)""")
+running.build_artist_clusters(hcon)
+hcon.execute("""
+CREATE TABLE known_pool AS SELECT * FROM (VALUES
+  ('uri:hl-old', 'speed garage', 3.0::DOUBLE, 2.0::DOUBLE),
+  ('uri:vl-old', 'speed garage', 5.0, 3.0),
+  ('uri:hd-old', 'speed garage', 1.0, 1.5)
+) t(spotify_track_uri, cluster, score, hours)""")
+hcon.execute("""
+CREATE TABLE track_credits AS SELECT * FROM (VALUES
+  ('uri:hl-old', 'Heard Lib',  'album_artist', 'export'),
+  ('uri:vl-old', 'Vetoed Lib', 'album_artist', 'export'),
+  ('uri:hd-old', 'Hand Lib',   'album_artist', 'export')
+) t(spotify_track_uri, artist_name, credit_type, credit_source)""")
+hcon.execute("""
+CREATE TABLE plays_raw AS SELECT * FROM (VALUES
+  ('uri:hl-old',   'Old Song',     'Heard Lib', 'music'),
+  -- The album cut was played; search offers the single, a different URI.
+  ('uri:hl-album', 'Other Song',   'Heard Lib', 'music'),
+  -- Skipped at 20 seconds: in plays_raw only, and still "heard".
+  ('uri:hl-skip',  'Skipped Song', 'Heard Lib', 'music'),
+  -- Not music, so not a heard song, whatever it is called.
+  (NULL,           'Fresh Song',   'Heard Lib', 'podcast'),
+  ('uri:hd-old',   'Hand Old',     'Hand Lib',  'music')
+) t(spotify_track_uri, track_name, artist_name, content_type)""")
+
+heard = running.heard_keys(hcon)
+check("heard_keys: every started URI, a sub-30-s skip included",
+      "uri:hl-skip" in heard["uris"], True)
+check("...and every (artist, song key)",
+      (N("Heard Lib"), running._title_key("Other Song")) in heard["songs"], True)
+check("...music only",
+      (N("Heard Lib"), running._title_key("Fresh Song")) in heard["songs"], False)
+check("is_heard: another pressing of a heard song is heard",
+      running.is_heard(trk("u:x", "Other Song - Radio Edit", 1, ("Heard Lib", "sp-hl")),
+                       heard), True)
+check("...by any credited name, not only the lead",
+      running.is_heard(trk("u:y", "Other Song (feat. Heard Lib)", 1,
+                           ("Somebody", "sp-sb"), ("Heard Lib", "sp-hl")), heard),
+      True)
+check("...and an unplayed song is not",
+      running.is_heard(trk("u:z", "Fresh Song", 1, ("Heard Lib", "sp-hl")), heard),
+      False)
+
+seeds_all = running.cluster_seed_artists(hcon, "speed garage", set(),
+                                         with_unresolved=True)
+check("library discovery also ranks an MBID-less library artist",
+      [(s["artist_name"], s["mbid"]) for s in seeds_all],
+      [("Vetoed Lib", "m-vl"), ("Heard Lib", "m-hl"), ("Hand Lib", None)])
+check("...which the ListenBrainz seed list still leaves out",
+      [s["artist_name"] for s in running.cluster_seed_artists(
+          hcon, "speed garage", set())], ["Vetoed Lib", "Heard Lib"])
+
+
+class SearchSp:
+    """/search answered per artist from a dict; anything else fails the test."""
+    def __init__(self, pages):
+        self.pages = pages
+        self.calls = []
+    def get(self, path, params=None):
+        self.calls.append((path, (params or {}).get("q")))
+        if path == "/search":
+            return {"tracks": {"items": self.pages.get(params["q"].split('"')[1], [])}}
+        failures.append(f"unexpected Spotify call {path}")
+        return None
+
+
+HL, HD = ("Heard Lib", "sp-hl"), ("Hand Lib", "sp-hd")
+sp_lib = SearchSp({
+    "Heard Lib": [item("uri:hl-old", "Old Song", 200_000, HL),
+                  item("uri:hl-single", "Other Song - Radio Edit", 200_000, HL),
+                  item("uri:hl-skip", "Skipped Song", 200_000, HL),
+                  item("uri:hl-new", "Fresh Song", 200_000, HL),
+                  item("uri:hl-new2", "Second Fresh", 200_000, HL),
+                  item("uri:hl-new3", "Third Fresh", 200_000, HL)],
+    "Vetoed Lib": [item("uri:vl-new", "Never Heard", 200_000, ("Vetoed Lib", "sp-vl"))],
+    "Hand Lib": [item("uri:hd-old", "Hand Old", 200_000, HD),
+                 item("uri:hd-new", "Hand New", 200_000, HD)],
+})
+garage_tags = list(config.RUN_GARAGE_TAGS)
+genre_cache = {f"m-hl::{'|'.join(sorted(set(garage_tags)))}": {
+    "titles": [running._title_key("Fresh Song"), running._title_key("Third Fresh")]}}
+lib = running.library_discovery(
+    hcon, sp_lib, NoNetwork(), "speed garage", garage_tags, {}, genre_cache,
+    set(), {(N("Vetoed Lib"), "")}, lambda r: True, heard)
+got = {a["artist_name"]: uris(picks) for a, picks in lib}
+check("a vetoed library artist contributes nothing",
+      "Vetoed Lib" in got, False)
+check("...and costs no search", any("Vetoed" in (q or "") for _, q in sp_lib.calls),
+      False)
+check("played URI, other pressing and 20-s skip all excluded; recording tags pick",
+      got.get("Heard Lib"), ["uri:hl-new", "uri:hl-new3"])
+check("an MBID-less artist takes relevance order and asks MusicBrainz nothing",
+      got.get("Hand Lib"), ["uri:hd-new"])
+check("library picks carry the gate's credit list",
+      lib[0][1][0]["credited"], ["Heard Lib"])
+
+# --- supply order, end to end ---------------------------------------------
+# One garage budget, filled in order: hand-named acts, library pass 1 (one
+# track each, up to a quarter of the budget), strangers, library pass 2 (what
+# strangers left), then the known top-up. Every track is three minutes.
+dcon = duckdb.connect()
+dcon.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Pop Star', CAST(NULL AS VARCHAR), 'pop', 10, TRUE)
+) t(artist_name, mbid, tag, tag_count, is_genre)""")
+running.build_artist_clusters(dcon)
+dcon.execute("""
+CREATE TABLE known_pool AS SELECT * FROM (VALUES
+  ('uri:known', 'Known Tune', 'Known Act', 'speed garage', 180000.0::DOUBLE,
+   1.0::DOUBLE, 1.0::DOUBLE, 5::BIGINT, 1.0::DOUBLE, ['uri:known'])
+) t(spotify_track_uri, track_name, album_artist, cluster, duration_ms, hours,
+    done_rate, n_plays, score, uris)""")
+dcon.execute("""
+CREATE TABLE track_credits (spotify_track_uri VARCHAR, artist_name VARCHAR,
+    credit_type VARCHAR, credit_source VARCHAR)""")
+dcon.execute("""
+CREATE TABLE plays (spotify_track_uri VARCHAR, track_name VARCHAR,
+    artist_name VARCHAR, played_seconds DOUBLE, reason_end VARCHAR, month DATE,
+    ms_played BIGINT, ms_played_estimated BOOLEAN)""")
+dcon.execute("CREATE TABLE plays_raw AS SELECT *, 'music' AS content_type FROM plays")
+
+M3 = 180_000
+pages = {
+    # The first hit is a drag-led original that the scene act only remixed.
+    "Scene Act": [item("u:sc-rmx", "Big Song - Scene Act Remix", M3,
+                       ("Pop Star", "sp-pop"), ("Scene Act", "sp-sc")),
+                  item("u:sc1", "Scene One", M3, ("Scene Act", "sp-sc")),
+                  item("u:sc2", "Scene Two", M3, ("Scene Act", "sp-sc"))],
+    "Vetoed Scene": [item("u:vs1", "Vetoed One", M3, ("Vetoed Scene", "sp-vs"))],
+    "Stranger One": [item("u:s1a", "S1 A", M3, ("Stranger One", "sp-s1")),
+                     item("u:s1b", "S1 B", M3, ("Stranger One", "sp-s1"))],
+    "Stranger Two": [item("u:s2a", "S2 A", M3, ("Stranger Two", "sp-s2")),
+                     item("u:s2b", "S2 B", M3, ("Stranger Two", "sp-s2"))],
+}
+for x in "ABCDE":
+    pages[f"Lib {x}"] = [item(f"u:{x}1", f"{x} One", M3, (f"Lib {x}", f"sp-{x}")),
+                         item(f"u:{x}2", f"{x} Two", M3, (f"Lib {x}", f"sp-{x}"))]
+
+
+class SupplySp(SearchSp):
+    """Search, plus just enough of the playlist API for publish()."""
+    def __init__(self, pages):
+        super().__init__(pages)
+        self.posts, self.puts = [], []
+    def get(self, path, params=None):
+        if path == "/me/playlists":
+            return {"items": [], "next": None}
+        if path.startswith("/playlists/") and "/items" in path:
+            return {"items": [], "next": None}
+        return super().get(path, params)
+    def post(self, path, json=None):
+        self.posts.append(path)
+        return {"id": f"pl-{len(self.posts)}"} if path == "/me/playlists" else {}
+    def put(self, path, json=None):
+        self.puts.append(path)
+        return {}
+
+
+mb_asked = []
+def fake_mb(http, mbid, tags, cache):
+    mb_asked.append(mbid)
+    return set()
+
+config.RUNNING_OVERRIDES_CSV.write_text(
+    "playlist,decision,artist_name,track_name,note\n"
+    "speed garage,discover,Scene Act,,untagged scene act\n"
+    "speed garage,discover,Vetoed Scene,,\n"
+    ",drop,Vetoed Scene,,the veto wins\n"
+    ",discover,Blank Playlist Act,,no playlist named\n",
+    encoding="utf-8")
+saved = (running.cluster_seed_artists, running.cluster_candidates,
+         running.load_genre_vocabulary, running.mb_genre_recordings,
+         config.RUN_TARGET_MINUTES)
+running.cluster_seed_artists = lambda con, label, vetoes, with_unresolved=False: (
+    [{"mbid": None, "artist_name": f"Lib {x}", "score": 1.0, "hours": 2.0}
+     for x in "ABCDE"] if label == "speed garage" else [])
+running.cluster_candidates = lambda con, http, label, *a: (
+    [{"artist_name": "Stranger One", "mbid": "m-s1", "score": 1.0, "share": 1.0},
+     {"artist_name": "Stranger Two", "mbid": "m-s2", "score": 0.9, "share": 1.0}]
+    if label == "speed garage" else [])
+running.load_genre_vocabulary = lambda http: set()
+running.mb_genre_recordings = fake_mb
+config.RUN_TARGET_MINUTES = 40
+supply_sp = SupplySp(pages)
+try:
+    sels = running.build_selections(dcon, NoNetwork(), supply_sp)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        running.report(dcon, sels, dry=True)
+    archive = running.publish(supply_sp, dcon, sels)
+finally:
+    (running.cluster_seed_artists, running.cluster_candidates,
+     running.load_genre_vocabulary, running.mb_genre_recordings,
+     config.RUN_TARGET_MINUTES) = saved
+    config.RUNNING_OVERRIDES_CSV.unlink()
+
+garage = next(s for s in sels if s["label"] == "speed garage")
+new = [t for t in garage["tracks"] if t["slot"] == "discovery"]
+check("supply order: hand-named, library pass 1, strangers, library pass 2",
+      [t["supply"] for t in new],
+      ["discover-row"] * 2 + ["library-artist"] * 3 + ["stranger"] * 4
+      + ["library-artist"] * 3)
+check("...track by track",
+      uris(new), ["u:sc1", "u:sc2", "u:A1", "u:B1", "u:C1",
+                  "u:s1a", "u:s1b", "u:s2a", "u:s2b", "u:A2", "u:B2", "u:C2"])
+budget = 40 * 60_000 - M3
+pass1 = new[2:5]
+check("pass 1 stops at a quarter of the discovery budget",
+      (sum(t["duration_ms"] for t in pass1) <= 0.25 * budget,
+       sum(t["duration_ms"] for t in pass1) + M3 > 0.25 * budget), (True, True))
+check("pass 2 fills what strangers left, up to the whole budget",
+      sum(t["duration_ms"] for t in new) <= budget
+      and sum(t["duration_ms"] for t in new) + M3 > budget, True)
+check("a discover row with no tags is admitted",
+      "u:sc1" in uris(new), True)
+check("...but its remix of a drag-led original is still refused",
+      "u:sc-rmx" in uris(new), False)
+check("an artist-wide veto beats a discover row, and costs no search",
+      ("u:vs1" in uris(new), any("Vetoed Scene" in (q or "")
+                                 for _, q in supply_sp.calls)), (False, False))
+check("a discover row naming no playlist is skipped",
+      any("Blank Playlist" in (q or "") for _, q in supply_sp.calls), False)
+check("MusicBrainz is asked only for acts with an MBID",
+      mb_asked, ["m-s1", "m-s2"])
+check("the dubstep run gets none of the garage discovery",
+      [t for t in next(s for s in sels if s["label"] == "dubstep")["tracks"]
+       if t["slot"] == "discovery"], [])
+check("the selection carries the supply counts",
+      (garage["supply"], garage["n_topup"]),
+      ({"discover-row": 2, "library-artist": 6, "stranger": 4}, 0))
+out = buf.getvalue()
+check("the report prints the supply line",
+      "2 hand-named, 6 library-artist, 4 strangers, 0 known top-up, 1 min short"
+      in out, True)
+
+runs = [r for r in archive if r["kind"] == "run_selection"
+        and r["gap_tag"] == "speed garage"]
+check("supply reaches the archive as `source`",
+      sorted((r["spotify_track_uri"], r["source"]) for r in runs
+             if r["slot"] == "discovery"),
+      sorted((t["spotify_track_uri"], t["supply"]) for t in new))
+check("...and known rows stay `library`",
+      [r["source"] for r in runs if r["slot"] == "anchor"], ["library"])
+check("...in the Parquet itself, schema unchanged",
+      dict(dcon.execute(
+          f"SELECT source, count(*) FROM '{config.PLAYLISTS_PARQUET}' "
+          "WHERE kind = 'run_selection' GROUP BY 1").fetchall()),
+      {"library": 1, "discover-row": 2, "library-artist": 6, "stranger": 4})
 
 shutil.rmtree(_TMP, ignore_errors=True)
 if failures:

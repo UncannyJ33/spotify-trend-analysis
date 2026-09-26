@@ -361,6 +361,20 @@ RUN_MAX_CANDIDATES_TO_TAG = 150  # MusicBrainz lookups per cluster, at 1.1s each
 # (1.43 h) by 0.001 and fail Knock2 (1.48 h), both of whom belong.
 RUN_MIN_SEED_HOURS = 1.0
 
+# The FIRST discovery supply after hand-named acts is the listener's own
+# cluster artists' tracks he has never started. Once the seed fixes cut Todd
+# Edwards' chain, garage discovery fell from 21 tracks to about 9, and the known
+# top-up would have quietly turned RUN_KNOWN_FRACTION into ~0.9; the evaluation's
+# evidence is that an unplayed Sammy Virji record ("Up & Down") was a keep where
+# the strangers were not. SJ's call (2026-09-26): when new music runs short,
+# fill with more of his own, and never keep a weak stranger just to hold the
+# quota. So library artists take up to FRACTION of the discovery budget BEFORE
+# strangers, one track each, then whatever strangers leave, up to
+# TRACKS_PER_ARTIST each. ARTISTS is how far down the seed ranking to look.
+RUN_LIBRARY_DISCOVERY_ARTISTS = 30
+RUN_LIBRARY_DISCOVERY_FRACTION = 0.25    # 0 gives SJ's literal "only when short"
+RUN_LIBRARY_DISCOVERY_TRACKS_PER_ARTIST = 2
+
 # A share alone cannot judge a STRANGER. Boys Noize and Mr. Oizo carry exactly
 # one cluster tag — `tech house` at count 1 — and no drag tags at all, so the
 # ratio is 1/1 and they scored a perfect 1.00 as speed garage. Discovery
