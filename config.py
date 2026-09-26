@@ -49,6 +49,13 @@ TAG_TRENDS_PARQUET = DATA_DIR / "tag_trends.parquet"
 MIN_MS_PLAYED = 30_000
 
 # --- Analysis parameters ----------------------------------------------------
+# The analysis horizon: the last month the EXPORT covers. Polled plays past it
+# are provisional — estimated ms_played, NULL reason_end, and a 50-item page
+# that can silently drop plays — so no trend, share or window is anchored on
+# them. ingest.merge_polled's coverage cut, applied to time. Every
+# "(SELECT max(month) FROM plays)" in a stage is this instead.
+ANALYSIS_HORIZON_SQL = "(SELECT max(month) FROM plays WHERE NOT ms_played_estimated)"
+
 # What a featured credit is worth relative to the album artist's 1.0. Stage 3
 # computes BOTH variants and stores them side by side, so the dashboard can
 # toggle without re-running anything. 0.0 reproduces the spec's original

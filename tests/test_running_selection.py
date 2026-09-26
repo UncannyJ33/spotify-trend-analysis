@@ -148,6 +148,8 @@ CREATE TABLE plays AS SELECT * FROM (VALUES
   -- Excluded artist must contribute nothing.
   ('uri:ill', 'Good Things', 'ILLENIUM', 900.0, 'trackdone', DATE '2026-06-01', 200000)
 ) t(spotify_track_uri, track_name, artist_name, played_seconds, reason_end, month, ms_played)""")
+# Stage 3's horizon excludes estimated (polled) rows; these are all export rows.
+con.execute("ALTER TABLE plays ADD COLUMN ms_played_estimated BOOLEAN DEFAULT FALSE")
 con.execute("""
 CREATE TABLE track_credits AS SELECT * FROM (VALUES
   ('uri:remix', 'Halsey',     'album_artist'),

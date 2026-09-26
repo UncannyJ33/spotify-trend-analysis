@@ -30,6 +30,8 @@ CREATE TABLE plays AS SELECT * FROM (VALUES
   ('Folkie',     'Quiet Song',   'uri:folk',  1000.0, DATE '2026-06-01'),
   ('Popper',     'Bright Song',  'uri:pop',   2000.0, DATE '2026-06-01')
 ) t(artist_name, track_name, spotify_track_uri, played_seconds, month)""")
+# Stage 3's horizon excludes estimated (polled) rows; these are all export rows.
+con.execute("ALTER TABLE plays ADD COLUMN ms_played_estimated BOOLEAN DEFAULT FALSE")
 con.execute("""
 CREATE TABLE artist_tags AS SELECT * FROM (VALUES
   ('Subtronics', 'dubstep', 5, TRUE), ('Excision', 'dubstep', 3, TRUE),
