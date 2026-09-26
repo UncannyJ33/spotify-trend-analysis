@@ -293,11 +293,12 @@ def trk(uri, name, ms, *artists):
             "artists": [{"name": a, "id": i} for a, i in artists]}
 
 
-def gate(tracks, cand, pinned, on_genre=(), vetoes=(), is_fresh=None, k=10):
+def gate(tracks, cand, pinned, on_genre=(), vetoes=(), is_fresh=None, k=10,
+         library=False):
     rows = [dict(t, artist_name=cand) for t in tracks]
     return running.gate_discovery(
         rows, {"artist_name": cand, "mbid": "m-x"}, pinned, set(on_genre),
-        drag, set(vetoes), is_fresh or (lambda r: True), k=k)
+        drag, set(vetoes), is_fresh or (lambda r: True), k=k, library=library)
 
 
 def uris(rows):
@@ -382,6 +383,28 @@ check("non-empty on_genre keeps only matched tracks",
       uris(gate([a, b, c], "Subtronics", "sp-sub", on_genre={"b"})), ["u:b"])
 check("choose_tracks still caps at k",
       uris(gate([a, b, c], "Subtronics", "sp-sub", k=2)), ["u:a", "u:b"])
+
+# A LIBRARY artist's recording tags only filter when they say something about
+# what is left. MusicBrainz tags the records people know, and for an artist the
+# listener already plays those are the ones already heard — which candidate_picks
+# removed before the gate. "Every tagged record is heard" is no evidence about
+# the rest, and filtering on it left a well-tagged library artist supplying
+# nothing at all.
+other_tune = trk("u:ot", "Other Tune", 200_000, ("Rusko", "sp-rusko"))
+check("a library artist whose tagged titles are all heard takes relevance order",
+      uris(gate([other_tune, netsky_mix], "Rusko", "sp-rusko",
+                on_genre={"wobble"}, library=True)), ["u:ot", "u:evn"])
+got = gate([other_tune, netsky_mix], "Rusko", "sp-rusko", on_genre={"everyday"},
+           library=True)
+check("...and a title step 4 refused is neither flagged nor sorted first",
+      [(r["spotify_track_uri"], r["genre_matched"]) for r in got],
+      [("u:ot", False), ("u:evn", False)])
+check("...but a stranger in the same position stays strict",
+      uris(gate([other_tune, netsky_mix], "Rusko", "sp-rusko",
+                on_genre={"wobble"})), [])
+check("...and a library artist with a matched unheard track still filters",
+      uris(gate([a, b, c], "Subtronics", "sp-sub", on_genre={"b"}, library=True)),
+      ["u:b"])
 
 # C3 on the discovery side: a veto tests every credit, features included.
 gud = trk("u:gud", "GUD VIBRATIONS", 200_000, ("NGHTMRE", "sp-ng"),
@@ -809,6 +832,18 @@ check("an MBID-less artist takes relevance order and asks MusicBrainz nothing",
       got.get("Hand Lib"), ["uri:hd-new"])
 check("library picks carry the gate's credit list",
       lib[0][1][0]["credited"], ["Heard Lib"])
+
+# The same artist when MusicBrainz only tags records the listener already
+# plays: library_discovery must hand the gate the library rule, not the
+# stranger's, or the artist it exists for supplies nothing.
+heard_only_tags = {f"m-hl::{'|'.join(sorted(set(garage_tags)))}": {
+    "titles": [running._title_key("Old Song"), running._title_key("Other Song")]}}
+lib = running.library_discovery(
+    hcon, sp_lib, NoNetwork(), "speed garage", garage_tags, {}, heard_only_tags,
+    set(), {(N("Vetoed Lib"), "")}, lambda r: True, heard)
+check("tagged titles all heard: the unheard rest, in relevance order",
+      {a["artist_name"]: uris(picks) for a, picks in lib}.get("Heard Lib"),
+      ["uri:hl-new", "uri:hl-new2"])
 
 # --- supply order, end to end ---------------------------------------------
 # One garage budget, filled in order: hand-named acts, library pass 1 (one

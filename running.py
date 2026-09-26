@@ -926,7 +926,8 @@ def apply_prefer(rows: list[dict], members: dict[str, set],
     A member is any pressing's URI in the playlist, or the same album artist
     and song. It runs before the filters, so a boosted member still has to
     clear the veto, the live test and the cap like everything else; pins never
-    pass through here.
+    pass through here. The unboosted score rides along as `base_score`, which
+    is what the top-up floor tests (see known_topup).
     """
     uris, songs = members.get("uris") or set(), members.get("songs") or set()
     if not uris and not songs:
@@ -937,7 +938,8 @@ def apply_prefer(rows: list[dict], members: dict[str, set],
                _title_key(r.get("track_name") or ""))
         if (uris & {r.get("spotify_track_uri"), *(r.get("uris") or [])}
                 or key in songs):
-            r = dict(r, score=float(r["score"]) * (1 + margin), preferred=True)
+            r = dict(r, score=float(r["score"]) * (1 + margin),
+                     base_score=float(r["score"]), preferred=True)
         out.append(r)
     return sorted(out, key=lambda r: (-r["score"], r["spotify_track_uri"]))
 
@@ -1105,7 +1107,7 @@ def remix_credit(title: str) -> str | None:
 def gate_discovery(tracks: list[dict], cand: dict, pinned_id: str | None,
                    on_genre: set[str], drag: set[str], vetoes: set[tuple],
                    is_fresh, k: int = config.RUN_DISCOVERY_TRACKS_PER_ARTIST,
-                   ) -> list[dict]:
+                   library: bool = False) -> list[dict]:
     """Every discovery pick passes as a TRACK before choose_tracks sees it, so
     each of the k picks it returns is usable rather than a slot wasted on a
     track the loop then refuses.
@@ -1133,9 +1135,19 @@ def gate_discovery(tracks: list[dict], cand: dict, pinned_id: str | None,
        Deliberately NOT added: "the lead must be the candidate or a cluster
        artist" — Spotify bills a stranger's remix to the pop original first,
        so that rule would refuse nearly every remix.
+       A `library` artist filters only when a track that survived steps 1-3 is
+       matched; otherwise relevance stands for them too. MusicBrainz tags the
+       records people know, and for an artist the listener already plays those
+       are the records already heard — removed before this gate ever runs. "All
+       their tagged work is heard" says nothing about the rest, and filtering
+       on it left exactly the well-tagged library artists supplying nothing.
+       Strangers stay strict: their tagged records are still on offer, and
+       filtering is what removes Tokyo Machine's ROCK IT and CANTINA.
     6. choose_tracks, for its stable sort and same-song dedupe. Its own flag
        agrees with step 4 by construction: after step 5, either every row is
-       matched and in `on_genre`, or `on_genre` is empty and none is.
+       matched and in `on_genre`, or it is handed an empty set and none is.
+       The library fallback hands it the empty set too, or its title-only flag
+       would sort "Everyday - Netsky Remix" first on Rusko after step 4 said no.
     """
     name = cand["artist_name"]
     want = normalise(name)
@@ -1167,8 +1179,10 @@ def gate_discovery(tracks: list[dict], cand: dict, pinned_id: str | None,
         eligible.append(row)
 
     if on_genre:
-        eligible = [r for r in eligible if r["genre_matched"]]
-    return choose_tracks(eligible, on_genre, k)
+        matched = [r for r in eligible if r["genre_matched"]]
+        if matched or not library:
+            return choose_tracks(matched, on_genre, k)
+    return choose_tracks(eligible, set(), k)
 
 
 def heard_keys(con: duckdb.DuckDBPyConnection) -> dict[str, set]:
@@ -1210,14 +1224,17 @@ def is_heard(track: dict, heard: dict[str, set]) -> bool:
 
 def candidate_picks(sp, http, cand: dict, tags: list[str], credited_cache: dict,
                     genre_cache: dict, drag: set[str], vetoes: set[tuple],
-                    is_fresh, heard: dict[str, set], k: int) -> list[dict]:
+                    is_fresh, heard: dict[str, set], k: int,
+                    library: bool = False) -> list[dict]:
     """One act's usable discovery picks, best first — the same path for every
     supply: search, keep only the act's own Spotify id, drop what the listener
     has already started, ask MusicBrainz which recordings are on-genre, gate.
 
     An act with no MBID (a hand-named scene act, a hand-tagged library artist)
     skips MusicBrainz and takes Spotify's relevance order, as gate step 5 does
-    for an artist with no tagged recordings.
+    for an artist with no tagged recordings. `library` is gate step 5's rule
+    for an artist the listener already plays: tags that name only heard
+    records do not filter what is left.
     """
     name = cand["artist_name"]
     pinned_id, tracks = pin_artist_id(
@@ -1228,7 +1245,7 @@ def candidate_picks(sp, http, cand: dict, tags: list[str], credited_cache: dict,
     on_genre = (mb_genre_recordings(http, cand["mbid"], tags, genre_cache)
                 if cand.get("mbid") else set())
     return gate_discovery(tracks, cand, pinned_id, on_genre, drag, vetoes,
-                          is_fresh, k=k)
+                          is_fresh, k=k, library=library)
 
 
 def library_discovery(con, sp, http, label: str, tags: list[str],
@@ -1248,14 +1265,17 @@ def library_discovery(con, sp, http, label: str, tags: list[str],
     Every pick passes the same track gate strangers face (candidate_picks), so
     a drag-led single or a 6-minute cut is refused here too. The gate tests the
     LEAD and a named remixer, never a featured vocalist, which is what keeps
-    an unplayed Subtronics record with Inéz on it.
+    an unplayed Subtronics record with Inéz on it. The one difference is gate
+    step 5: recording tags that name only records the listener has already
+    played do not filter the rest (see gate_discovery).
     """
     out = []
     for artist in cluster_seed_artists(con, label, vetoes, with_unresolved=True
                                        )[:config.RUN_LIBRARY_DISCOVERY_ARTISTS]:
         picks = candidate_picks(
             sp, http, artist, tags, credited_cache, genre_cache, drag, vetoes,
-            is_fresh, heard, k=config.RUN_LIBRARY_DISCOVERY_TRACKS_PER_ARTIST)
+            is_fresh, heard, k=config.RUN_LIBRARY_DISCOVERY_TRACKS_PER_ARTIST,
+            library=True)
         if picks:
             out.append((artist, picks))
     return out
@@ -1311,6 +1331,11 @@ def fill_to_target(rows: list[dict], target_ms: int) -> list[dict]:
     return out
 
 
+def below_topup_floor(row: dict) -> bool:
+    """Under RUN_TOPUP_MIN_SCORE on the track's own, unboosted score."""
+    return row.get("base_score", row["score"]) < config.RUN_TOPUP_MIN_SCORE
+
+
 def known_topup(rows: list[dict], kept: set[str], spare_ms: int,
                 place) -> list[dict]:
     """Known tracks for the time discovery could not fill, best first.
@@ -1319,15 +1344,18 @@ def known_topup(rows: list[dict], kept: set[str], spare_ms: int,
     the playlist (`kept`) are skipped, and so is anything scoring under
     RUN_TOPUP_MIN_SCORE. Without that floor the gap filled with whatever came
     next — Matt Sassari's "Give It To Me - Full Vocal Mix" at 0.186 — and the
-    playlist reached its four hours on tracks the listener lets go. The score
-    is the one the rows were ranked on, so a `prefer` member keeps its boost:
-    it is a track the listener chose for running, which is not what the floor
-    is there to keep out. A track with no known length, or too long for what
-    is left, is passed over rather than ending the fill.
+    playlist reached its four hours on tracks the listener lets go. The floor
+    tests the track's OWN score (`base_score` where the `prefer` boost set
+    one): the boost breaks near-ties between rows, and letting it lower the bar
+    would quietly move the floor to 0.16 for Workout members. Heavy Workout
+    tracks under the done-rate floor were left out rather than exempted, for
+    the same reason. Order is still the ranked order, so among rows that clear
+    it a member keeps its edge. A track with no known length, or too long for
+    what is left, is passed over rather than ending the fill.
     """
     out = []
     for r in rows:
-        if r["spotify_track_uri"] in kept or r["score"] < config.RUN_TOPUP_MIN_SCORE:
+        if r["spotify_track_uri"] in kept or below_topup_floor(r):
             continue
         dur = r.get("duration_ms") or 0
         if dur and dur <= spare_ms:
@@ -1635,7 +1663,7 @@ def build_selections(con, http, sp) -> list[dict]:
                   f"{sum(t['duration_ms'] for t in topup)/60000:.0f} min")
             known = known + topup
         floored = sum(1 for r in picked if r["spotify_track_uri"] not in kept
-                      and r["score"] < config.RUN_TOPUP_MIN_SCORE)
+                      and below_topup_floor(r))
         if spare_ms > 0 and floored:
             print(f"  ({floored} more known tracks score under the "
                   f"{config.RUN_TOPUP_MIN_SCORE:.2f} top-up floor and stay out)")

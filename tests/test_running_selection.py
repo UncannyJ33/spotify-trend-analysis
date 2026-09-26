@@ -726,6 +726,21 @@ check("...and every row taken is placed", placed_rows, got)
 check("no spare time takes nothing",
       running.known_topup(spare, set(), 0, lambda r: r), [])
 
+# The floor is on the track's OWN score. The Workout boost breaks near-ties
+# between rows; it is not a lower bar for members, or a member at 0.17 would
+# clear 0.20 as 0.2125 and pad the run with a track the listener lets go.
+boosted = running.apply_prefer(
+    [{"spotify_track_uri": "t:mem-low", "artist_name": "B", "track_name": "Low",
+      "score": 0.17, "duration_ms": M3},
+     {"spotify_track_uri": "t:mem-edge", "artist_name": "B", "track_name": "Edge",
+      "score": T, "duration_ms": M3}],
+    {"uris": {"t:mem-low", "t:mem-edge"}, "songs": set()}, config.RUN_PREFER_MARGIN)
+check("a boosted member ranks on its boosted score",
+      [round(r["score"], 4) for r in boosted], [0.25, 0.2125])
+check("...but the top-up floor tests its own: 0.17 stays out, 0.20 goes in",
+      [r["spotify_track_uri"] for r in running.known_topup(
+          boosted, set(), 12 * 60_000, lambda r: r)], ["t:mem-edge"])
+
 # --- the durations cache keeps only answers (C12) -----------------------
 # A 503 used to append {duration_ms: null}, which then read as "Spotify knows
 # no length for this track" forever. A failure is not an answer.
