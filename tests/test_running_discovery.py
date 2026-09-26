@@ -963,6 +963,38 @@ check("...in the Parquet itself, schema unchanged",
           "WHERE kind = 'run_selection' GROUP BY 1").fetchall()),
       {"library": 1, "discover-row": 2, "library-artist": 6, "stranger": 4})
 
+# --- the override file names a playlist by label OR title (D2) ------------
+# The garage run is now titled "garage & house", but its label — the state key,
+# the archive's gap_tag, what existing rows say — is still "speed garage".
+# Either spelling must reach the same playlist, or every row SJ writes after
+# the rename is silently inert.
+config.RUNNING_OVERRIDES_CSV.write_text(
+    "playlist,decision,artist_name,track_name,note\n"
+    "speed garage,keep,Label Pin,Tune,\n"
+    "garage & house,keep,Title Pin,Tune,\n"
+    "Garage & House,discover,Title Scene,,\n"
+    "garage & house,prefer,,Workout · Claude,\n"
+    "dubstep,keep,Dub Pin,Tune,\n"
+    ",keep,Both Pin,Tune,\n"
+    "speed garage run · Claude,keep,Typo Pin,Tune,\n",
+    encoding="utf-8")
+buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(buf):
+        ov = running.load_overrides()
+finally:
+    config.RUNNING_OVERRIDES_CSV.unlink()
+check("pins name their playlist by label or title; both map to the label",
+      {p["artist_name"]: p["playlist"] for p in ov["pins"]},
+      {"Label Pin": "speed garage", "Title Pin": "speed garage",
+       "Dub Pin": "dubstep", "Both Pin": ""})
+check("...and so do discover and prefer rows",
+      ([d["playlist"] for d in ov["discover"]], [p["playlist"] for p in ov["prefer"]]),
+      (["speed garage"], ["speed garage"]))
+check("a playlist value that is neither is warned about and skipped",
+      ("Typo Pin" in {p["artist_name"] for p in ov["pins"]},
+       "speed garage run · Claude" in buf.getvalue()), (False, True))
+
 # --- the known top-up stops at its floor, end to end (C12) ----------------
 # test_running_selection.py pins known_topup; this pins that build_selections
 # uses it. A 12-minute target leaves 7.2 min for known tracks (two fit), and

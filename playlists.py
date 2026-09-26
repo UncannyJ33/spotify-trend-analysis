@@ -502,7 +502,8 @@ def _alive(resp) -> bool:
     return bool(isinstance(resp, dict) and "_status" not in resp and resp.get("id"))
 
 
-def ensure_playlist(sp, tag: str, name: str, state: dict) -> str:
+def ensure_playlist(sp, tag: str, name: str, state: dict,
+                    aliases: tuple[str, ...] = ()) -> str:
     """Resolve the playlist this stage owns for `tag`, creating if needed.
 
     Identity is the stored ID — immune to the user renaming things. The name
@@ -511,21 +512,34 @@ def ensure_playlist(sp, tag: str, name: str, state: dict) -> str:
     playlist, and adopting it would mean this stage overwrites something a
     person built. Creating a duplicate is the cheap mistake; overwriting is
     the expensive one.
+
+    `aliases` are names the playlist carried before a rename (Stage 10's
+    garage run was "speed garage run · Claude"), tried in order after `name`
+    and just as exactly. The current name wins wherever it sits in the
+    listing; an alias is adopted only when nothing carries the current name,
+    so lost state after a rename finds the old playlist instead of creating
+    a second. Stage 8 passes none.
     """
     entry = state.get(tag) or {}
     if entry.get("id"):
         if _alive(sp.get(f"/playlists/{entry['id']}", params={"fields": "id,name"})):
             return entry["id"]
 
+    under_alias: dict[str, str] = {}
     page = sp.get("/me/playlists", params={"limit": 50})
     while isinstance(page, dict) and "_status" not in page:
         for item in page.get("items", []):
             if item.get("name") == name:
                 return item["id"]
+            if item.get("name") in aliases:
+                under_alias.setdefault(item["name"], item["id"])
         nxt = page.get("next")
         if not nxt:
             break
         page = sp.get(nxt.removeprefix(SP_API), params=None)
+    for alias in aliases:
+        if alias in under_alias:
+            return under_alias[alias]
 
     # POST /me/playlists, not /users/{uid}/playlists — the per-user endpoints
     # were removed in Feb 2026 and the old path now 403s.

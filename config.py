@@ -479,13 +479,22 @@ RUN_PRESSING_NOTE_RE = (
 # an original finished 6 out of 10.
 RUN_MIN_VERSION_PLAYS = 3
 
-RUN_PLAYLIST_NAME_TEMPLATE = "{label} run · Claude"
+# Named by the cluster's TITLE, not its label (running.CLUSTERS has both): the
+# label is the identity and never changes; the title is display and may.
+RUN_PLAYLIST_NAME_TEMPLATE = "{title} run · Claude"
 RUN_PLAYLIST_DESCRIPTION_TEMPLATE = (
-    "{label} — high-intensity tracks for running, {known} from your library "
+    "{title} — high-intensity tracks for running, {known} from your library "
     "and {new} you have not heard. No BPM filter: Spotify removed the tempo "
     "endpoints, and half-time drums make the number lie anyway. "
     "Built by spotify-trend-analysis · refreshed {date}"
 )
+# Names a run playlist carried before a rename, keyed on the cluster LABEL.
+# The garage run became "garage & house" on 2026-09-26, because tech house and
+# John Summit stay in it. With the stored ID lost, an exact match on the new
+# name alone would find nothing and create a second playlist; these are tried
+# after it, exactly, case and all. The rename itself happens on the next
+# --write, in place: same ID, same URL, same followers.
+RUN_PLAYLIST_LEGACY_NAMES = {"speed garage": ("speed garage run · Claude",)}
 
 # Fields that must never reach a derived artifact.
 DROPPED_FIELDS = ("ip_addr",)

@@ -118,11 +118,29 @@ DURATION_CACHE = config.CACHE_DIR / "track_durations.jsonl"
 # Stage 8's, and an append-only cache is never rebuilt.
 SP_TRACKS_CREDITED_CACHE = config.CACHE_DIR / "spotify_artist_tracks_credited.jsonl"
 
-# The two clusters. `key` names the weight column; `label` names the playlist.
+# The two clusters. `key` names the weight column.
+#
+# LABEL IS IDENTITY, TITLE IS DISPLAY. The label is artist_clusters.cluster, the
+# running_state.json key, the archive's gap_tag and the override file's playlist
+# value, and it never changes. The title is only what Spotify shows. SJ kept tech
+# house and John Summit in the garage run and renamed it "garage & house"
+# (2026-09-26); nothing keyed on the label moved. A rename changes `title` and
+# adds the old name to config.RUN_PLAYLIST_LEGACY_NAMES.
 CLUSTERS = (
-    {"key": "garage", "label": "speed garage", "tags": config.RUN_GARAGE_TAGS},
-    {"key": "bass", "label": "dubstep", "tags": config.RUN_BASS_TAGS},
+    {"key": "garage", "label": "speed garage", "title": "garage & house",
+     "tags": config.RUN_GARAGE_TAGS},
+    {"key": "bass", "label": "dubstep", "title": "dubstep",
+     "tags": config.RUN_BASS_TAGS},
 )
+
+
+TITLES = {c["label"]: c["title"] for c in CLUSTERS}
+
+
+def playlist_name(label: str) -> str:
+    """The Spotify name of a cluster's playlist — from its title, never its
+    label."""
+    return config.RUN_PLAYLIST_NAME_TEMPLATE.format(title=TITLES[label])
 
 
 # --------------------------------------------------------------------------
@@ -793,23 +811,39 @@ def load_overrides() -> dict:
     A blank `playlist` applies to both. A row whose FIRST cell starts with '#'
     is a comment, which is how the example file's rows are disabled — reading
     only the artist cell let "# ,drop,A Melodic Act,," through as a veto.
+
+    `playlist` takes a cluster's label ("speed garage") or its title ("garage
+    & house"), case aside, and every entry carries the LABEL: the garage run
+    was renamed, and the rows written before and after must reach the same
+    playlist. A value that is neither is warned about and skipped — a pin
+    naming the playlist by its Spotify name would otherwise match nothing,
+    silently. A drop applies everywhere whatever the column says.
     """
     out: dict = {"pins": [], "vetoes": set(), "discover": [], "prefer": []}
     labels = {c["label"] for c in CLUSTERS}
+    to_label = {k.casefold(): c["label"]
+                for c in CLUSTERS for k in (c["label"], c["title"])}
     if not config.RUNNING_OVERRIDES_CSV.exists():
         return out
 
     with config.RUNNING_OVERRIDES_CSV.open(encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
-            playlist = (row.get("playlist") or "").strip()
+            raw_playlist = (row.get("playlist") or "").strip()
             decision = (row.get("decision") or "").strip().lower()
             artist = (row.get("artist_name") or "").strip()
             track = (row.get("track_name") or "").strip()
-            if playlist.startswith("#") or artist.startswith("#"):
+            if raw_playlist.startswith("#") or artist.startswith("#"):
                 continue
+            playlist = to_label.get(raw_playlist.casefold(), raw_playlist)
             entry = {"playlist": playlist, "artist_name": artist,
                      "track_name": track,
                      "note": (row.get("note") or "").strip()}
+            if (decision in {"keep", "prefer"} and playlist
+                    and playlist not in labels):
+                print(f"  ! {decision} row {artist or track!r} names playlist "
+                      f"{raw_playlist!r}, which is neither a label nor a title "
+                      f"({', '.join(sorted(to_label))}); skipped")
+                continue
             if decision == "prefer":
                 if not track:
                     print("  ! a prefer row names no playlist in track_name; "
@@ -819,8 +853,8 @@ def load_overrides() -> dict:
             elif decision == "discover" and artist:
                 if playlist not in labels:
                     print(f"  ! discover row for {artist!r} names no playlist "
-                          f"({playlist or 'blank'}; one of "
-                          f"{', '.join(sorted(labels))}); skipped")
+                          f"({raw_playlist or 'blank'}; one of "
+                          f"{', '.join(sorted(to_label))}); skipped")
                     continue
                 out["discover"].append(entry)
             elif decision in {"keep", "drop"} and artist:
@@ -1450,7 +1484,7 @@ def build_selections(con, http, sp) -> list[dict]:
     out = []
     for cluster in CLUSTERS:
         label, tags = cluster["label"], list(cluster["tags"])
-        print(f"\n{pretty(label)} run")
+        print(f"\n{pretty(cluster['title'])} run")
         placed.new_playlist()
 
         # Pins are placed first and are exempt from folding: the suffix IS the
@@ -1639,6 +1673,11 @@ def publish(sp, con, selections: list[dict]) -> list[dict]:
 
     Contents are snapshotted into data/playlists.parquet BEFORE any replace, so
     nothing this overwrites goes unrecorded — hand-added tracks included.
+
+    A RENAME HAPPENS IN PLACE. The playlist is found by its stored ID, then by
+    its current name, then by a legacy name — all exact — and the metadata PUT
+    below carries the current name, so the old playlist keeps its ID, URL and
+    followers. State, archive and overrides stay keyed on the label.
     """
     state = load_state()
     run_date = date.today().isoformat()
@@ -1646,8 +1685,9 @@ def publish(sp, con, selections: list[dict]) -> list[dict]:
 
     for sel in selections:
         label = sel["label"]
-        name = config.RUN_PLAYLIST_NAME_TEMPLATE.format(label=label)
-        pid = ensure_playlist(sp, label, name, state)
+        name = playlist_name(label)
+        pid = ensure_playlist(sp, label, name, state,
+                              aliases=config.RUN_PLAYLIST_LEGACY_NAMES.get(label, ()))
         state[label] = {"id": pid, "name": name}
 
         for row in playlist_items(sp, pid):
@@ -1672,10 +1712,12 @@ def publish(sp, con, selections: list[dict]) -> list[dict]:
         # `public: false` is accepted on create and then reported as true, and a
         # later PUT does not change it either. These stay off the public profile
         # page but ARE readable by direct link; the description must not claim
-        # otherwise.
+        # otherwise. `name` rides along so a renamed cluster's playlist takes
+        # its new title here, as Stage 8 already does.
         sp.put(f"/playlists/{pid}", json={
+            "name": name,
             "description": config.RUN_PLAYLIST_DESCRIPTION_TEMPLATE.format(
-                label=label, known=sel["n_known"], new=sel["n_new"],
+                title=TITLES[label], known=sel["n_known"], new=sel["n_new"],
                 date=run_date),
         })
 
@@ -1761,7 +1803,7 @@ def report(con, selections: list[dict], dry: bool) -> None:
 
     for sel in selections:
         mins = sum((t.get("duration_ms") or 0) for t in sel["tracks"]) / 60000
-        print(f"\n--- {config.RUN_PLAYLIST_NAME_TEMPLATE.format(label=sel['label'])}")
+        print(f"\n--- {playlist_name(sel['label'])}")
         print(f"    {len(sel['tracks'])} tracks, {mins:.0f} min "
               f"({sel['n_known']} known + {sel['n_new']} new)")
         if sel.get("supply") is not None:
