@@ -9,7 +9,9 @@ artist_name,mbid,note,tags
 # COLUMNS
 #   artist_name   the name as it appears in your export. Matched loosely on
 #                 accents/case/stylisation - "A$AP Rocky" here matches "ASAP Rocky".
-#   mbid          a MusicBrainz artist UUID (8-4-4-4-12 hex) or the literal IGNORE.
+#   mbid          a MusicBrainz artist UUID (8-4-4-4-12 hex), the literal IGNORE,
+#                 the literal NONE, or blank. IGNORE and NONE are case-insensitive.
+#                 See the sections below for what each one means.
 #   note          free text for your own benefit. Never read by the code.
 #   tags          OPTIONAL. Pipe-separated MusicBrainz genres, supplied by hand
 #                 for an artist MusicBrainz has never tagged. REPLACES whatever
@@ -52,10 +54,24 @@ artist_name,mbid,note,tags
 #     Leave the mbid blank. Resolution still runs and still fails; only the
 #     genres are supplied. This is common — the acts MusicBrainz serves worst
 #     are the same ones it cannot resolve.
+#     A blank mbid does NOT undo a match already made. If the name once
+#     resolved to someone else, that artist's MBID stays, and your genres get
+#     attached to it. Use NONE (below) for that case.
 # Some Tiny Act,,no MB entry exists,drill|uk drill
 #
 # --- both at once: the wrong artist was matched AND the right one is untagged ---
 # Henrik,00000000-0000-0000-0000-000000000000,was matching a different Henrik,folk pop|pop
+#
+# --- no entry: the wrong artist was matched and NO right one exists ---
+#     NONE says "this is a real artist with no MusicBrainz entry". Whatever the
+#     search matched is thrown away: no MBID, nothing resolved, and the tags
+#     column (optional) supplies the genres. The wrong MBID matters more than
+#     it looks — it is what seeds ListenBrainz, so discovery would run on a
+#     stranger's neighbours while the genres look right. Costs no request, is
+#     re-applied every run, and leaves the review list like IGNORE does. Delete
+#     the row and the old match comes back.
+# Some Act,NONE,was matching a different artist; no correct entry exists,uk garage|house
+# Another Act,NONE,real artist; MusicBrainz has nothing and I have no genres
 #
 # --- suppressions: not an artist, stop listing it ---
 # Various Artists,IGNORE,compilation placeholder

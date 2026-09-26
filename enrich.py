@@ -55,8 +55,9 @@ USER_AGENT = (
 )
 MB_MIN_INTERVAL = 1.1  # seconds between MusicBrainz requests, with headroom
 
-# An override row must carry a real MBID or the literal IGNORE. Anything else is
-# a typo, and a typo'd MBID would otherwise be pinned as gospel.
+# An override row must carry a real MBID, the literal IGNORE, the literal NONE,
+# or nothing. Anything else is a typo, and a typo'd MBID would otherwise be
+# pinned as gospel.
 MBID_RE = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 
 CACHE_FILE = config.CACHE_DIR / "artist_resolution.jsonl"
@@ -165,14 +166,17 @@ def load_overrides() -> dict[str, dict]:
     write-only: Stage 2 ranked what it could not resolve by listening time and
     offered no way to hand an answer back. This is that way.
 
-    Two kinds of row:
+    Three kinds of row, plus the tags-only row described below:
 
         Wale,ab2528dd-...,the US rapper not the percussionist
         Various Artists,IGNORE,compilation placeholder
+        PLAT.,NONE,was matching a different artist; no correct entry exists
 
     An MBID pins the artist and skips the search entirely. IGNORE marks a name
     that is not an artist at all, so it stops surfacing in the review list on
-    every future run.
+    every future run. NONE marks a real artist MusicBrainz has no entry for:
+    whatever the search matched is thrown away, nothing is resolved, and the
+    `tags` column (if any) supplies the genres.
 
     Keyed on the *normalised* name, so an entry written `A$AP Rocky` matches
     however the export happens to spell it — the same folding resolution uses.
@@ -198,10 +202,19 @@ def load_overrides() -> dict[str, dict]:
             # only the genres are supplied.
             if not raw and not has_tags:
                 continue
-            ignore = raw.casefold() == "ignore" if raw else False
-            if raw and not ignore and not MBID_RE.fullmatch(raw):
+            ignore = raw.casefold() == "ignore"
+            # NONE exists because a blank mbid cannot UN-resolve a name. A
+            # tags-only row leaves resolution alone, and a cached name is never
+            # searched again, so a wrong auto-match made before the row was
+            # written keeps its MBID and the hand tags get hung on it. PLAT.
+            # stayed on the vaporwave ＰＬＡＴ, Unconscious Mind on a Canadian
+            # black-metal band — and the MBID is what seeds ListenBrainz, so
+            # discovery ran on a stranger's neighbours while the genres looked
+            # right. Blank keeps its old meaning; NONE is the explicit statement.
+            none = raw.casefold() == "none"
+            if raw and not (ignore or none) and not MBID_RE.fullmatch(raw):
                 print(f"  ⚠ {path.name} line {lineno}: "
-                      f"'{raw}' is neither a UUID nor IGNORE — skipped")
+                      f"'{raw}' is neither a UUID, IGNORE nor NONE — skipped")
                 continue
             # Hand-supplied genres, pipe-separated. MusicBrainz coverage falls
             # off hard for smaller artists — in this library 100% of 50h+
@@ -211,10 +224,11 @@ def load_overrides() -> dict[str, dict]:
             # genre ever enters this project by hand rather than by lookup.
             tags = [t.strip() for t in (row.get("tags") or "").split("|") if t.strip()]
             out[normalise(name)] = {
-                # None for both IGNORE and a tags-only row: neither pins an
-                # artist, so neither may reach resolve_via_override.
-                "mbid": raw.casefold() if (raw and not ignore) else None,
+                # None for IGNORE, NONE and a tags-only row: none of them pins
+                # an artist, so none may reach resolve_via_override.
+                "mbid": raw.casefold() if (raw and not (ignore or none)) else None,
                 "ignore": ignore,
+                "none": none,
                 "note": (row.get("note") or "").strip(),
                 "tags": tags,
             }
@@ -307,13 +321,14 @@ def apply_overrides(http: Throttled | None, artists: list[str],
                     cache: dict[str, dict], overrides: dict[str, dict]) -> dict:
     """Fold manual answers over the cache. An override always wins.
 
-    IGNORE entries are applied in memory and never cached: they cost no request,
-    so recomputing them every run keeps the file authoritative for free. MBID
-    entries do cost a request, so those are cached and re-fetched only when the
-    file changes.
+    IGNORE and NONE entries are applied in memory and never cached: they cost no
+    request, so recomputing them every run keeps the file authoritative for
+    free — and deleting the row lets the cached record show again. MBID entries
+    do cost a request, so those are cached and re-fetched only when the file
+    changes.
     """
     stats = {"ignored": 0, "pinned": 0, "fetched": 0, "failed": 0, "unused": 0,
-             "tags_only": 0}
+             "tags_only": 0, "no_entry": 0}
     seen: set[str] = set()
 
     for name in artists:
@@ -330,6 +345,20 @@ def apply_overrides(http: Throttled | None, artists: list[str],
                 "n_candidates": 0, "tags": [], "note": ov["note"],
             }
             stats["ignored"] += 1
+            continue
+
+        if ov.get("none"):
+            # A real artist with no MusicBrainz entry. Written OVER whatever
+            # the cache holds, so a wrong auto-match loses its MBID here, before
+            # the backfill can fetch the wrong artist's release-group tags and
+            # before any stage can seed ListenBrainz on it. The genres, if the
+            # row has any, arrive later via apply_override_tags.
+            cache[name] = {
+                "artist_name": name, "source": "override", "status": "no_entry",
+                "mbid": None, "score": None, "matched_name": None,
+                "n_candidates": 0, "tags": [], "note": ov["note"],
+            }
+            stats["no_entry"] += 1
             continue
 
         if ov["mbid"] is None:
@@ -565,6 +594,14 @@ def backfill_untagged(http: Throttled, cache: dict[str, dict]) -> int:
 # Persist + report
 # --------------------------------------------------------------------------
 
+# Who is still waiting for an answer: unresolved, or resolved but untagged.
+# 'ignored' (not an artist) and 'no_entry' (a real artist MusicBrainz lacks) ARE
+# answers — the override file gave them — and re-listing them is exactly what
+# that file exists to stop. Both review sites use this one definition, because
+# a status missing from either brings the answered names straight back.
+REVIEW_PREDICATE = """r.status NOT IN ('ignored', 'no_entry')
+              AND (r.status <> 'resolved' OR r.n_tags = 0)"""
+
 
 def write_outputs(con: duckdb.DuckDBPyConnection, cache: dict[str, dict],
                   vocab: set[str]) -> None:
@@ -610,10 +647,7 @@ def write_outputs(con: duckdb.DuckDBPyConnection, cache: dict[str, dict],
                    w.listening_hours
             FROM artist_resolution r
             LEFT JOIN artist_weight w USING (artist_name)
-            -- 'ignored' names were reviewed once and declared not-an-artist.
-            -- Re-listing them is exactly what the override file exists to stop.
-            WHERE r.status <> 'ignored'
-              AND (r.status <> 'resolved' OR r.n_tags = 0)
+            WHERE {REVIEW_PREDICATE}
             -- Names are unique in artist_resolution, so this is a total order.
             -- Hours alone tie, and DuckDB's parallel sort breaks ties arbitrarily.
             ORDER BY w.listening_hours DESC NULLS LAST, r.artist_name
@@ -684,12 +718,11 @@ def report(con: duckdb.DuckDBPyConnection) -> None:
 
     print("\n--- REVIEW LIST: unresolved/untagged artists, by listening time ---")
     rows = con.execute(
-        """
+        f"""
         SELECT r.artist_name, r.status, r.matched_name, w.listening_hours
         FROM artist_resolution r LEFT JOIN artist_weight w USING (artist_name)
-        WHERE r.status <> 'ignored'
-          AND (r.status <> 'resolved' OR r.n_tags = 0)
-        ORDER BY w.listening_hours DESC NULLS LAST LIMIT 20
+        WHERE {REVIEW_PREDICATE}
+        ORDER BY w.listening_hours DESC NULLS LAST, r.artist_name LIMIT 20
         """
     ).fetchall()
     if not rows:
@@ -699,15 +732,19 @@ def report(con: duckdb.DuckDBPyConnection) -> None:
         print(f"   {(h or 0):>6.1f} h  {a[:32]:<32} {st}{near}")
     print(f"\n   full review list -> {REVIEW_PARQUET}")
 
-    n_ignored = q("SELECT count(*) FROM artist_resolution "
-                  "WHERE status = 'ignored'")[0]
+    n_ignored, n_no_entry = q(
+        "SELECT count(*) FILTER (WHERE status = 'ignored'), "
+        "count(*) FILTER (WHERE status = 'no_entry') FROM artist_resolution")
     print(f"\n   To answer any of these by hand, add a row to "
           f"{config.ARTIST_OVERRIDES_CSV.name}:")
     print("       artist_name,mbid,note")
     print("       Wale,ab2528dd-...,the US rapper not the percussionist")
     print("       Various Artists,IGNORE,not an artist")
+    print("       Some Act,NONE,no MusicBrainz entry; was matching someone else")
     if n_ignored:
         print(f"   ({n_ignored:,} name(s) currently suppressed by IGNORE)")
+    if n_no_entry:
+        print(f"   ({n_no_entry:,} name(s) marked NONE: no MusicBrainz entry)")
     print("=" * 74)
 
 
@@ -764,6 +801,8 @@ def main() -> None:
             f"— {ov_stats['pinned']:,} pinned "
             f"({ov_stats['fetched']:,} newly fetched), "
             f"{ov_stats['ignored']:,} ignored"
+            + (f", {ov_stats['no_entry']:,} no entry (NONE)"
+               if ov_stats["no_entry"] else "")
             + (f", {ov_stats['failed']:,} failed" if ov_stats["failed"] else "")
             + (f", {dropped:,} stale dropped" if dropped else "")
             + (f", {ov_stats['unused']:,} match no artist"
