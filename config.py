@@ -248,14 +248,20 @@ RUNNING_OVERRIDES_CSV = _path_from_env(
 # artists, seeding on Justice and Tiësto returned Mr. Oizo, Boys Noize and
 # Basement Jaxx as "speed garage". A tag that is merely adjacent poisons the
 # discovery pool far beyond the tracks it admits directly.
+#
+# `breakbeat` and `breakbeat hardcore` are absent for the same reason: broken
+# beats are not run music. They carried The Prodigy into dubstep, and the cost of
+# removing them lands on library artists, not strangers — jigitz (5.9 h, tagged
+# breakbeat|future garage|house by hand) now classifies to neither run and comes
+# back only as pins; K Theory (0.7 h), MALUGI (0.4 h) and the Chemical Brothers
+# leave too. That list is the check before the change, not after it.
 RUN_GARAGE_TAGS = (
     "speed garage", "uk garage", "bassline", "stutter house", "bass house",
-    "tech house", "jackin house", "donk", "2-step",
-    "hard house", "breakbeat hardcore",
+    "tech house", "jackin house", "donk", "2-step", "hard house",
 )
 RUN_BASS_TAGS = (
     "dubstep", "brostep", "tearout", "hybrid trap", "trap edm", "drum and bass",
-    "jungle", "neurofunk", "drumstep", "breakbeat", "glitch hop", "complextro",
+    "jungle", "neurofunk", "drumstep", "glitch hop", "complextro",
     "hardstyle", "colour bass", "happy hardcore", "gabber",
 )
 
@@ -263,6 +269,13 @@ RUN_BASS_TAGS = (
 # not enough: ILLENIUM carries dubstep(3) and trap edm(3), so any include-list
 # admits him, while melodic dubstep(3) and future bass(2) are why the playlist
 # sags. Membership is therefore a weighted share, not a set test.
+#
+# The last four are the soft or off-shape side of a cluster's own neighbours,
+# each named for the act that proved it: `liquid funk` is drum and bass with the
+# intensity taken out (Netsky), `big beat` is The Prodigy's home genre (21 votes,
+# more than his breakbeat), `future garage` is garage's ambient offshoot, and
+# `psytrance` let Infected Mushroom through as dubstep. All four are in the
+# MusicBrainz genre vocabulary, so they can match and be supplied by hand.
 RUN_DRAG_TAGS = (
     "melodic dubstep", "future bass", "chillstep", "deep house",
     "progressive house", "melodic house", "melodic techno", "ambient",
@@ -271,6 +284,7 @@ RUN_DRAG_TAGS = (
     "contemporary r&b", "alternative r&b", "r&b", "soul", "rock",
     "alternative rock", "indie rock", "heavy metal", "latin", "reggaeton",
     "folk", "singer-songwriter",
+    "liquid funk", "big beat", "future garage", "psytrance",
 )
 # Bare `trap` appears on 60 of this playlist's tracks and is ambiguous: it names
 # both rap-trap and EDM-trap. It is deliberately in NEITHER list, so it can
@@ -351,9 +365,18 @@ RUN_MIN_CANDIDATE_CLUSTER_WEIGHT = 2
 # nothing else, which is tag-identical to Boys Noize, so no rule can admit one
 # and refuse the other. He is lost until MusicBrainz knows more about him.
 RUN_BROAD_TAGS = frozenset({
-    "tech house", "hard house", "breakbeat hardcore",
-    "drum and bass", "breakbeat", "glitch hop", "complextro",
+    "tech house", "hard house", "drum and bass", "glitch hop", "complextro",
 })
+
+# ...and a stranger's SHARE must clear a higher line than a library artist's.
+# 0.60 is right for the library, where listening has already vouched for the
+# artist; for a stranger it admitted Netsky (drum and bass 10 against liquid
+# funk 3: 0.77), Rusko, Modestep and Basement Jaxx, four acts whose tracks the
+# evaluation cut. 0.85 refuses all four and keeps every discovery keep —
+# Pendulum 0.97, Bassnectar 0.92, NERO 0.89 — and also refuses Slushii and
+# Pixel Terror (0.67), which the normalised seed ranking would otherwise lift.
+# Library classification (build_artist_clusters) stays on RUN_MIN_INTENSITY_SHARE.
+RUN_MIN_CANDIDATE_SHARE = 0.85
 
 # Live recordings are refused outright. Crowd noise, a rambling intro and a
 # tempo the drummer chose on the night all break a run in a way the genre

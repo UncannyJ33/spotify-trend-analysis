@@ -44,7 +44,13 @@ CREATE TABLE artist_tags AS SELECT * FROM (VALUES
   -- A non-genre tag must not classify anyone.
   ('Some Show',   'dubstep',         9, FALSE),
   -- Drag only.
-  ('Pop Act',     'pop',             6, TRUE)
+  ('Pop Act',     'pop',             6, TRUE),
+  -- jigitz's confirmed hand tags. Before `breakbeat` left the bass list this
+  -- was 1/1 dubstep; now no cluster tag survives and `house` is on neither
+  -- list, so he classifies nowhere and his tracks come back only as pins.
+  ('jigitz',      'breakbeat',       1, TRUE),
+  ('jigitz',      'future garage',   1, TRUE),
+  ('jigitz',      'house',           1, TRUE)
 ) t(artist_name, tag, tag_count, is_genre)""")
 
 running.build_artist_clusters(con)
@@ -125,6 +131,44 @@ check("classify_tags agrees with the SQL on a zero-count vector",
       running.classify_tags([{"tag": "dubstep", "count": 0},
                              {"tag": "heavy metal", "count": 0}], 0)[0],
       cluster_of("REAPER"))
+
+# --- breakbeat is not run music, and four more genres are drag ----------
+# The cost of taking `breakbeat` out lands on library artists, and this is the
+# biggest of it: jigitz, 5.9 h, classifies to neither run.
+check("jigitz's confirmed tags carry no cluster tag any more",
+      cluster_of("jigitz"), None)
+
+# The Prodigy's real vector. With `big beat` as drag he would score 0.42 bass
+# and 0.25 garage even with breakbeat still listed; with it gone, nothing.
+prodigy = [{"tag": "big beat", "count": 21}, {"tag": "breakbeat", "count": 15},
+           {"tag": "breakbeat hardcore", "count": 7},
+           {"tag": "hardcore breaks", "count": 3}, {"tag": "rave", "count": 4}]
+check("The Prodigy classifies nowhere, even at the library bar",
+      running.classify_tags(prodigy, 0)[0], None)
+check("...and his best share is zero", running.classify_tags(prodigy, 0)[1], 0.0)
+
+# --- strangers clear 0.85, library artists still 0.60 -------------------
+# Netsky: a clean drum-and-bass share for a library artist, and a liquid act a
+# run playlist should never be offered by a stranger's say-so.
+CAND = config.RUN_MIN_CANDIDATE_SHARE
+netsky = [{"tag": "drum and bass", "count": 10}, {"tag": "liquid funk", "count": 3},
+          {"tag": "electronic", "count": 2}]
+check("Netsky fails the stranger bar",
+      running.classify_tags(netsky, MIN_W, min_share=CAND)[0], None)
+check("...at 0.77",
+      round(running.classify_tags(netsky, MIN_W, min_share=CAND)[1], 2), 0.77)
+check("the same vector at the library bar is still dubstep",
+      running.classify_tags(netsky, 0)[0], "dubstep")
+nero = [{"tag": "drum and bass", "count": 3}, {"tag": "dubstep", "count": 5},
+        {"tag": "liquid funk", "count": 1}]
+check("NERO clears the stranger bar at 0.89",
+      running.classify_tags(nero, MIN_W, min_share=CAND),
+      ("dubstep", 8 / 9))
+check("ILLENIUM is refused at the stranger bar too",
+      running.classify_tags([
+          {"tag": "dubstep", "count": 3}, {"tag": "trap edm", "count": 3},
+          {"tag": "melodic dubstep", "count": 3},
+          {"tag": "future bass", "count": 2}], MIN_W, min_share=CAND)[0], None)
 
 # --- known pool: credits, completion, and the per-artist cap ------------
 con.execute("""

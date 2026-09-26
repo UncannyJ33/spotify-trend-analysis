@@ -173,15 +173,22 @@ def build_artist_clusters(con: duckdb.DuckDBPyConnection) -> None:
     )
 
 
-def classify_tags(tags: list[dict], min_weight: int = 0) -> tuple[str | None, float]:
+def classify_tags(tags: list[dict], min_weight: int = 0,
+                  min_share: float = config.RUN_MIN_INTENSITY_SHARE,
+                  ) -> tuple[str | None, float]:
     """The same weighted-share test as build_artist_clusters, for tag vectors
-    that are not in artist_tags — i.e. Stage 5 candidates, whose genres live in
-    the candidate_tags cache.
+    that are not in artist_tags — i.e. discovery candidates, whose genres live
+    in the candidate_tags cache.
 
-    A discovery artist must clear exactly the bar a library artist clears.
-    Without this, `select_candidates` admits anything sharing ONE tag with the
-    cluster, and a dry run duly offered Röyksopp, Basement Jaxx and 90 seconds
-    of Aphex Twin ambient as running music.
+    A discovery artist must clear at least the bar a library artist clears.
+    Without this, a candidate sharing ONE tag with the cluster is admitted, and
+    a dry run duly offered Röyksopp, Basement Jaxx and 90 seconds of Aphex Twin
+    ambient as running music.
+
+    `min_share` defaults to the library line so the SQL and this agree; callers
+    judging a stranger pass config.RUN_MIN_CANDIDATE_SHARE. At 0.60 Netsky
+    passed on drum and bass 10 against liquid funk 3 (0.77) — fine for an
+    artist the listener already plays, not for one nobody has vouched for.
     """
     broad = {b.casefold() for b in config.RUN_BROAD_TAGS}
     garage = bass = drag = 0
@@ -210,7 +217,7 @@ def classify_tags(tags: list[dict], min_weight: int = 0) -> tuple[str | None, fl
         garage, g_share = 0, 0.0
     if bass < min_weight and not narrow_bass:
         bass, b_share = 0, 0.0
-    thr = config.RUN_MIN_INTENSITY_SHARE
+    thr = min_share
     if g_share >= thr and b_share >= thr:
         return ("speed garage", g_share) if garage >= bass else ("dubstep", b_share)
     if g_share >= thr:
@@ -373,7 +380,8 @@ def cluster_candidates(con, http, label: str, tag_cache: dict,
     for cand in ranked[:config.RUN_MAX_CANDIDATES_TO_TAG]:
         tags = fetch_candidate_tags(http, cand["mbid"], vocab, tag_cache)
         cl, share = classify_tags(
-            tags, min_weight=config.RUN_MIN_CANDIDATE_CLUSTER_WEIGHT)
+            tags, min_weight=config.RUN_MIN_CANDIDATE_CLUSTER_WEIGHT,
+            min_share=config.RUN_MIN_CANDIDATE_SHARE)
         if cl == label:
             out.append(dict(cand, share=share))
     return out
@@ -647,11 +655,12 @@ def build_selections(con, http, sp) -> list[dict]:
                 continue
             cl, share = classify_tags(
                 (tag_cache.get(c["mbid"]) or {}).get("tags", []),
-                min_weight=config.RUN_MIN_CANDIDATE_CLUSTER_WEIGHT)
+                min_weight=config.RUN_MIN_CANDIDATE_CLUSTER_WEIGHT,
+                min_share=config.RUN_MIN_CANDIDATE_SHARE)
             if cl == label:
                 candidates.append(dict(c, share=share))
         print(f"  {len(candidates)} candidates clear the "
-              f"{config.RUN_MIN_INTENSITY_SHARE:.2f} intensity bar "
+              f"{config.RUN_MIN_CANDIDATE_SHARE:.2f} stranger bar "
               f"({seeded} from your own artists' neighbours)")
 
         discovery: list[dict] = []
