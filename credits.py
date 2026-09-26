@@ -30,6 +30,9 @@ Caveats on the regex path, by construction:
   - Only catches features named in the *title*. Features that live solely in
     Spotify's track metadata stay invisible. This is a floor, not a fix.
   - `(with <producer>)` credits a producer as a performer. Accepted.
+  - A name carrying a separator ("Tyler, The Creator", "Chase & Status") is
+    kept whole only if the library already knows it, as an album artist or
+    from the poller. One it has never seen is still split.
   - Parsing is fuzzy; run with --review to eyeball what was extracted.
   - A remix suffix that names no person ("- BLM REMIX") yields a name that
     MusicBrainz cannot resolve, so it lands on Stage 2's review list and is
@@ -50,8 +53,26 @@ import config
 # Anchored on the keyword so "(Remastered)" and "(Live)" are ignored.
 CREDIT_RE = r'[\(\[](?:feat\.?|featuring|ft\.?|with)\s+([^\)\]]+)[\)\]]'
 
-# Separators inside a credit list: "A, B & C", "A and B", "A x B".
-SPLIT_RE = r',\s*|\s+&\s+|\s+and\s+|\s+x\s+|\s+X\s+|\s*\+\s*'
+# Separators inside a credit list: "A, B & C", "A and B", "A x B", and a feature
+# marker INSIDE the list. "(with 21 Savage ft. Project Pat)" is one blob, and
+# LEADING_NOISE_RE strips a marker only at the start of a fragment, so without
+# this "21 Savage ft. Project Pat" was a single performer holding 5 hours — 11
+# such names and 11 hours here. Case-insensitive inline, since the split call
+# passes no flags.
+#
+# A capital X is NOT a separator. It cut "Ty Dolla $ign feat. X Ambassadors" at
+# " X ", and "Ambassadors" resolved to an unrelated act; inside a credit blob in
+# this library ` X ` had that one use and no true ones. Lowercase ` x ` stays,
+# and the names that carry one ("A1 x J1", "Calle x Vida") are protected below.
+SPLIT_RE = (r',\s*|\s+&\s+|\s+and\s+|\s+x\s+|\s*\+\s*'
+            r'|(?i:\s+(?:feat\.?|ft\.?|featuring)\s+)')
+
+# Characters RE2 reads as syntax outside a character class.
+RE2_SPECIAL = frozenset(r'\.^$|?*+()[]{}')
+
+# A pattern that matches nothing: the protected-name alternation when the
+# library holds no name the splitter would cut.
+RE2_NEVER = r'[^\s\S]'
 
 # Trailing noise that rides along inside the parenthetical.
 TRAILING_NOISE_RE = r'\s*(?:remix|cover|version|edit|mix|remaster(?:ed)?)\s*$'
@@ -93,8 +114,69 @@ REMIX_FORMAT_STOPLIST = frozenset({
 REMIX_NON_NAME_RE = r'^[0-9\s\-\.,:]+$'
 
 
+def _re2_escape(name: str) -> str:
+    """Escape a literal name for RE2: its own syntax characters, not
+    re.escape's list, which is Python's and has changed between versions."""
+    return "".join("\\" + c if c in RE2_SPECIAL else c for c in name)
+
+
+def build_protected_names(con: duckdb.DuckDBPyConnection) -> str:
+    """Names the splitter would cut, and the RE2 pattern that finds them.
+
+    A separator is also a character real names carry. SPLIT_RE turned
+    "(feat. Tyler, The Creator & Billie Essco)" into "Tyler" and "The Creator",
+    and the all-caps "GRAVITY (FEAT. TYLER, THE CREATOR)" into two more — four
+    performers who do not exist, 1.5 h between them. The library already knows
+    the real spellings: every album artist, and every name the poller has seen.
+    Those that SPLIT_RE would cut are taken out of a blob whole before it is
+    split ("Chase & Status", "Earth, Wind & Fire", "Florence + The Machine").
+
+    Creates table `protected_names` (`key` = lower(name), `name` = the
+    canonical spelling) and returns
+    `(?i)(^|[^[:alnum:]])(<names>)($|[^[:alnum:]])`. RE2 has no lookbehind, so
+    the boundary characters are captured as groups 1 and 3 and put back.
+    """
+    con.execute(
+        f"""
+        CREATE OR REPLACE TEMP TABLE protected_names AS
+        WITH names AS (
+            SELECT trim(artist_name) AS name FROM plays
+            WHERE artist_name IS NOT NULL
+            UNION ALL
+            SELECT trim(unnest(string_split(track_artists, chr(31)))) FROM plays
+            WHERE track_artists IS NOT NULL AND track_artists <> ''
+        ),
+        cut AS (
+            -- Padded: a name is cut where it sits INSIDE a blob, and there a
+            -- separator word at its edge has the whitespace it needs.
+            SELECT name, count(*) AS n FROM names
+            WHERE regexp_matches(' ' || name || ' ', '{SPLIT_RE}')
+            GROUP BY name
+        )
+        -- One spelling per name however a title capitalises it: the one most
+        -- plays carry, ties broken by the name itself so re-runs agree.
+        SELECT lower(name) AS key, first(name ORDER BY n DESC, name) AS name
+        FROM cut
+        GROUP BY 1
+        """
+    )
+    names = [r[0] for r in con.execute("SELECT name FROM protected_names").fetchall()]
+    # Longest first: RE2 takes the first alternative that matches at a
+    # position, so "A & B & C" has to be tried before "A & B". The name breaks
+    # length ties so the pattern text is identical run to run.
+    names.sort(key=lambda s: (-len(s), s))
+    alts = "|".join(_re2_escape(n) for n in names) or RE2_NEVER
+    return rf"(?i)(^|[^[:alnum:]])({alts})($|[^[:alnum:]])"
+
+
 def build_track_credits(con: duckdb.DuckDBPyConnection) -> None:
     stoplist = ", ".join(f"'{w}'" for w in sorted(REMIX_FORMAT_STOPLIST))
+    # Spliced into single-quoted SQL literals, so a name's own quote is doubled
+    # (an "O'Brien & Sons" would otherwise end the string).
+    protected = build_protected_names(con).replace("'", "''")
+    # Swap each protected name for the 0x1f mask, keeping its boundaries. The
+    # mask is only ever a split point and never reaches output.
+    mask = r"'\1' || chr(31) || '\3'"
     con.execute(
         f"""
         CREATE OR REPLACE TABLE track_credits AS
@@ -155,7 +237,47 @@ def build_track_credits(con: duckdb.DuckDBPyConnection) -> None:
                 regexp_extract(track_name, '{CREDIT_RE}', 1, 'i') AS credit_blob
             FROM unseen
         ),
+        -- Protected names come out of the blob whole, and only the rest is
+        -- split. Two passes, because a match consumes its trailing boundary:
+        -- in "Chase & Status,Tyler, The Creator" the comma ends the first
+        -- match, and the second name has no leading boundary left until the
+        -- first has been masked and the comma put back.
+        masked AS (
+            SELECT
+                *,
+                regexp_replace(credit_blob, '{protected}', {mask}, 'g') AS pass1
+            FROM parsed
+            WHERE credit_blob IS NOT NULL AND credit_blob <> ''
+        ),
+        blobs AS (
+            SELECT
+                spotify_track_uri, track_name, album_artist,
+                played_seconds, n_plays,
+                list_concat(
+                    regexp_extract_all(credit_blob, '{protected}', 2),
+                    regexp_extract_all(pass1, '{protected}', 2)
+                ) AS protected_hits,
+                regexp_replace(pass1, '{protected}', {mask}, 'g') AS remainder
+            FROM masked
+        ),
         featured AS (
+            -- A hit carries the title's casing; the library's spelling wins, so
+            -- "TYLER, THE CREATOR" is credited as "Tyler, The Creator". LEFT,
+            -- so a hit survives where RE2's case folding and lower() disagree.
+            SELECT
+                h.spotify_track_uri, h.track_name, h.album_artist,
+                h.played_seconds, h.n_plays,
+                coalesce(p.name, h.hit) AS artist_name
+            FROM (
+                SELECT
+                    spotify_track_uri, track_name, album_artist,
+                    played_seconds, n_plays,
+                    unnest(protected_hits) AS hit
+                FROM blobs
+            ) h
+            LEFT JOIN protected_names p ON p.key = lower(h.hit)
+            UNION ALL
+            -- The mask is a split point too, written as RE2's hex escape.
             SELECT
                 spotify_track_uri, track_name, album_artist,
                 played_seconds, n_plays,
@@ -163,7 +285,8 @@ def build_track_credits(con: duckdb.DuckDBPyConnection) -> None:
                     regexp_replace(
                         regexp_replace(
                             regexp_replace(
-                                unnest(regexp_split_to_array(credit_blob, '{SPLIT_RE}')),
+                                unnest(regexp_split_to_array(
+                                    remainder, '{SPLIT_RE}|\\x1f')),
                                 '{LEADING_NOISE_RE}', '', 'i'
                             ),
                             '{TRAILING_NOISE_RE}', '', 'i'
@@ -171,8 +294,7 @@ def build_track_credits(con: duckdb.DuckDBPyConnection) -> None:
                         '{STRAY_BRACKET_RE}', '', 'g'
                     )
                 ) AS artist_name
-            FROM parsed
-            WHERE credit_blob IS NOT NULL AND credit_blob <> ''
+            FROM blobs
         ),
         -- The title-suffix remixer. Same floor-not-fix caveat as `featured`:
         -- it only sees credits Spotify spelled into the title.
@@ -233,9 +355,20 @@ def build_track_credits(con: duckdb.DuckDBPyConnection) -> None:
         deduped AS (
             SELECT * FROM unioned
             WHERE artist_name IS NOT NULL
-              AND length(artist_name) BETWEEN 2 AND 60
-              -- Drop fragments that are punctuation or stray words, not names.
-              AND regexp_matches(artist_name, '[A-Za-z0-9]')
+              AND artist_name <> ''
+              AND (
+                  -- The junk filter is for regex fragments. The album artist is
+                  -- the export's own field and a poller name is Spotify's, so
+                  -- neither faces it: it dropped the album artist `¥$` for
+                  -- carrying no ASCII letter, and "CARNIVAL - HOOLIGANS
+                  -- VERSION" (220 plays, 11 h) was credited only to its
+                  -- remixer, and to nobody at all under album_artist_only.
+                  credit_type = 'album_artist'
+                  OR credit_source = 'poller'
+                  OR (length(artist_name) BETWEEN 2 AND 60
+                      -- Drop fragments that are punctuation or stray words.
+                      AND regexp_matches(artist_name, '[A-Za-z0-9]'))
+              )
             -- One performer, one row per track, whatever the title calls them.
             -- Stage 3 partitions credit weight by the play's identity, so a
             -- performer appearing twice would hand that track's listening time
@@ -318,6 +451,8 @@ def report(con: duckdb.DuckDBPyConnection, review: bool) -> None:
         f"\nlistening time on tracks with a parsed feature: "
         f"{feat_secs/3600:,.1f} h ({100*feat_secs/total_secs:.1f}% of total)"
     )
+    n_protected = q("SELECT count(*) FROM protected_names")[0]
+    print(f"separator-bearing names kept whole: {n_protected:,}")
     print(f"\nartists Stage 2 must resolve: {n_artists:,}")
 
     # ---- What the poller repaired -----------------------------------------
@@ -401,6 +536,10 @@ def main() -> None:
         raise SystemExit(f"{config.PLAYS_PARQUET} not found — run ingest.py first.")
 
     con = duckdb.connect()
+    # played_seconds is a float sum, and a parallel aggregate adds floats in
+    # whatever order the threads finish. ORDER BY ALL fixes the rows, not their
+    # values; one thread fixes both, so re-runs stay byte-identical.
+    con.execute("SET threads = 1")
     con.execute(f"CREATE VIEW plays AS SELECT * FROM '{config.PLAYS_PARQUET}'")
     # A plays.parquet written before the poller existed has no track_artists
     # column. Synthesise it so the repair path is simply empty rather than a
