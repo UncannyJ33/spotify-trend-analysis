@@ -167,7 +167,9 @@ skrillex_list.append({"mbid": "", "name": "Nobody", "score": 3000.0,
 reaper_list = [{"mbid": f"n-rp-{i}", "name": f"Niche Friend {i}",
                 "score": float(181 - i * 20), "comment": ""} for i in range(5)]
 sim_cache = {
-    "m-subtronics": {"seed_mbid": "m-subtronics", "similar": []},
+    # An empty ANSWER (status 200) is final; a status-less empty entry is a
+    # legacy record Stage 5 re-asks once (recommend.cached_answer).
+    "m-subtronics": {"seed_mbid": "m-subtronics", "similar": [], "status": 200},
     "m-skrillex":   {"seed_mbid": "m-skrillex", "similar": skrillex_list},
     "m-reaper":     {"seed_mbid": "m-reaper", "similar": reaper_list},
     "m-slander":    {"seed_mbid": "m-slander", "similar": [
