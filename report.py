@@ -243,11 +243,19 @@ def build(con: duckdb.DuckDBPyConnection) -> str:
     v = config.DEFAULT_VARIANT
     q1 = lambda s: con.execute(s).fetchone()  # noqa: E731
 
+    # The headline describes what the trends describe: export rows only.
+    # Polled plays past the export are provisional and Stage 3 leaves them out
+    # (analyze.EXPORT_ONLY), so counting them here would stamp a range the
+    # charts below do not cover. They are named, not hidden.
+    export = "FROM plays WHERE NOT ms_played_estimated"
     plays, hours, artists, tracks = q1(
         "SELECT count(*), sum(played_seconds)/3600.0, "
-        "count(DISTINCT artist_name), count(DISTINCT spotify_track_uri) FROM plays")
-    lo, hi = q1("SELECT min(ts), max(ts) FROM plays")
-    months = q1("SELECT count(DISTINCT month) FROM plays")[0]
+        f"count(DISTINCT artist_name), count(DISTINCT spotify_track_uri) {export}")
+    lo, hi = q1(f"SELECT min(ts), max(ts) {export}")
+    months = q1(f"SELECT count(DISTINCT month) {export}")[0]
+    n_polled = q1("SELECT count(*) FROM plays WHERE ms_played_estimated")[0]
+    polled_note = (f" (+{n_polled:,} polled plays after the export, "
+                   f"not in the trends)" if n_polled else "")
     covered = q1(
         """
         SELECT 100.0 * sum(w.listening_hours) FILTER (WHERE r.status='resolved')
@@ -297,7 +305,8 @@ def build(con: duckdb.DuckDBPyConnection) -> str:
       f'{100*hh_peak:.0f}% of listening time and now sits at '
       f'{100*top_faller["smoothed_share"]:.1f}%. {sw(top_riser["tag"])} moved '
       f'the other way. Genre names carry their chart colour throughout.</p>')
-    A(f'<p class="stamp">{lo:%d %b %Y} — {hi:%d %b %Y} · {months} months · '
+    A(f'<p class="stamp">{lo:%d %b %Y} — {hi:%d %b %Y}{esc(polled_note)} · '
+      f'{months} months · '
       f'generated {datetime.now(timezone.utc):%d %b %Y}</p>')
     A('<dl class="stats">')
     for label, value in (

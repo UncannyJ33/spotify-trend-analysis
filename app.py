@@ -59,16 +59,23 @@ def load_secondary(name: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_headline(variant: str) -> dict:
+    # Export rows only, the same rule as report.py's headline: Stage 3 leaves
+    # polled plays out of the trends, so the headline must not count them as
+    # if the charts covered them. They are counted separately and named.
     con = duckdb.connect()
     plays = con.execute(
         f"""
-        SELECT count(*), sum(played_seconds)/3600.0,
-               count(DISTINCT artist_name), min(month), max(month)
+        SELECT count(*) FILTER (WHERE NOT ms_played_estimated),
+               sum(played_seconds) FILTER (WHERE NOT ms_played_estimated) / 3600.0,
+               count(DISTINCT artist_name) FILTER (WHERE NOT ms_played_estimated),
+               min(month) FILTER (WHERE NOT ms_played_estimated),
+               max(month) FILTER (WHERE NOT ms_played_estimated),
+               count(*) FILTER (WHERE ms_played_estimated)
         FROM '{config.PLAYS_PARQUET}'
         """
     ).fetchone()
     return {"plays": plays[0], "hours": plays[1], "artists": plays[2],
-            "first": plays[3], "last": plays[4]}
+            "first": plays[3], "last": plays[4], "polled": plays[5]}
 
 
 def missing_data_notice() -> bool:
@@ -154,6 +161,9 @@ def page_trends(ctrl: dict) -> None:
     c2.metric("Plays", f"{head['plays']:,}")
     c3.metric("Artists", f"{head['artists']:,}")
     c4.metric("Genres shown", f"{len(ranked):,}")
+    st.caption(f"{head['first']:%b %Y} – {head['last']:%b %Y}"
+               + (f" (+{head['polled']:,} polled plays after the export, "
+                  f"not in the trends)" if head["polled"] else ""))
 
     st.plotly_chart(
         figures.stacked_area_top_tags(d, ranked_all, smoothed=ctrl["smoothed"],

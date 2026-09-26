@@ -30,16 +30,32 @@ import config
 SECONDARY_DIR = config.DATA_DIR / "secondary"
 
 
+# Stage 3 reads EXPORT rows only. Polled plays past the export are provisional:
+# ms_played is the track's length rather than the time played, skipped and
+# reason_end are NULL, and a 50-item page can drop plays without saying so. The
+# 2026-09-25 re-run showed what one day of them does — 50 polled plays made a
+# one-day September that became the highest-leverage point in every 12-month
+# slope and flipped 10 of 11 trend classes. This is ingest.merge_polled's
+# coverage cut applied to time: the export decides what the trends cover.
+# Polled rows still repair credits (Stage 1b) and still count as Stage 10 hours;
+# they never enter a trend, a secondary metric or a window anchor. The skip rate
+# needs it as much as the trends do: a NULL `skipped` makes is_skip NULL, which
+# counts in weighted_plays and never in weighted_skips, so every polled row was
+# being scored as a play that was not skipped.
+EXPORT_ONLY = "WHERE NOT ms_played_estimated"
+
+
 def register_sources(con: duckdb.DuckDBPyConnection) -> None:
-    for name, path in (
-        ("plays", config.PLAYS_PARQUET),
-        ("plays_raw", config.PLAYS_RAW_PARQUET),
-        ("track_credits", config.DATA_DIR / "track_credits.parquet"),
-        ("artist_tags", config.ARTIST_TAGS_PARQUET),
+    for name, path, where in (
+        ("plays", config.PLAYS_PARQUET, EXPORT_ONLY),
+        ("plays_raw", config.PLAYS_RAW_PARQUET, EXPORT_ONLY),
+        ("track_credits", config.DATA_DIR / "track_credits.parquet", ""),
+        ("artist_tags", config.ARTIST_TAGS_PARQUET, ""),
     ):
         if not path.exists():
             raise SystemExit(f"{path} not found — run the earlier stages first.")
-        con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM '{path}'")
+        con.execute(
+            f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM '{path}' {where}")
 
 
 def build_tag_weights(con: duckdb.DuckDBPyConnection) -> None:
@@ -137,10 +153,23 @@ def build_tag_trends(con: duckdb.DuckDBPyConnection) -> None:
         ),
         -- A dense month x tag grid. Without it the rolling mean would average
         -- over whatever rows happen to exist and silently skip gap months.
+        -- The months come from the CALENDAR, not from DISTINCT month: a month
+        -- nobody listened in must still be a row, or the months either side
+        -- of it become neighbours. That is how a one-day September after an
+        -- empty August was averaged with June and July and treated as the
+        -- month after July. Such a month gets a NULL share (0/0 through the
+        -- nullif below), which avg and regr_slope skip rather than read as a
+        -- month of zero listening in every genre. The export has no gap
+        -- months today, so this is a guard, not a change.
         grid AS (
             SELECT v.variant, m.month, t.tag
             FROM (SELECT DISTINCT variant FROM tag_month) v
-            CROSS JOIN (SELECT DISTINCT month FROM plays) m
+            CROSS JOIN (
+                SELECT unnest(generate_series(
+                           min(month), max(month), INTERVAL 1 MONTH))::DATE
+                       AS month
+                FROM plays
+            ) m
             CROSS JOIN (SELECT DISTINCT tag FROM tag_month) t
         ),
         dense AS (
@@ -157,7 +186,11 @@ def build_tag_trends(con: duckdb.DuckDBPyConnection) -> None:
                 tag_seconds / nullif(
                     sum(tag_seconds) OVER (PARTITION BY variant, month), 0
                 ) AS share,
-                dense_rank() OVER (ORDER BY month) AS month_idx
+                -- Calendar months since the first, so the slope's x-axis is
+                -- time. dense_rank counted distinct months present and would
+                -- put a two-month gap one step apart if the grid ever lost it.
+                date_diff('month', (SELECT min(month) FROM dense), month)
+                    AS month_idx
             FROM dense
         ),
         smoothed AS (
@@ -349,6 +382,12 @@ def report(con: duckdb.DuckDBPyConnection) -> None:
     print(f"\nvariant reported : {v}   (both variants stored)")
     print(f"tags             : {n_tags:,}")
     print(f"months           : {n_months:,}")
+    # The views are export-only, so the excluded rows are counted at source.
+    horizon = q("SELECT max(month) FROM plays")[0]
+    n_polled = q(f"SELECT count(*) FROM '{config.PLAYS_PARQUET}' "
+                 f"WHERE ms_played_estimated")[0]
+    print(f"horizon          : {horizon}   (export's last month; "
+          f"{n_polled:,} polled plays after it excluded)")
 
     # How much listening time never reaches a tag at all — the honest ceiling
     # on everything downstream.
@@ -367,7 +406,8 @@ def report(con: duckdb.DuckDBPyConnection) -> None:
     )[0]
     print(f"listening time reaching at least one tag: {covered:.1f}%")
 
-    print(f"\n--- Top 12 genres, trailing year ({v}) ---")
+    print(f"\n--- Top 12 genres, latest month "
+          f"({config.ROLLING_WINDOW_MONTHS}-month smoothed, {v}) ---")
     for tag, sh, cls, pp in con.execute(
         f"""
         SELECT tag, smoothed_share, trend_class, slope_pp_per_year
