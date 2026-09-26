@@ -12,7 +12,9 @@ nor destroyed:
      artist is worth 1.0 and a featured performer `CREDIT_VARIANTS[variant]`.
      Both variants are computed and stored side by side, so `album_artist_only`
      (weight 0.0) reproduces the spec's original behaviour and the dashboard
-     toggles between them without recomputing.
+     toggles between them without recomputing. It is normalised per play ROW,
+     and assert_time_conserved refuses to write if the split did not keep
+     every credited second.
   2. Tag weight — an artist's share is split across their genres in proportion
      to MusicBrainz vote count, capped at TOP_N_TAGS_PER_ARTIST.
 
@@ -98,8 +100,12 @@ def build_tag_weights(con: duckdb.DuckDBPyConnection) -> None:
     )
 
 
-def build_tag_trends(con: duckdb.DuckDBPyConnection) -> None:
-    """Monthly tag share, smoothed, with a trailing-window slope per tag."""
+def build_credit_weights(con: duckdb.DuckDBPyConnection) -> None:
+    """A play's time split across its performers, per variant.
+
+    Materialised, rather than a CTE inside build_tag_trends, so that
+    assert_time_conserved can check it before anything is written.
+    """
     variant_sql = " UNION ALL ".join(
         f"SELECT '{name}' AS variant, {w} AS feature_weight"
         for name, w in config.CREDIT_VARIANTS.items()
@@ -107,47 +113,67 @@ def build_tag_trends(con: duckdb.DuckDBPyConnection) -> None:
 
     con.execute(
         f"""
-        CREATE OR REPLACE TABLE tag_trends AS
+        CREATE OR REPLACE TABLE credit_weights AS
 
         WITH variants AS ({variant_sql}),
 
-        -- A play's time split across its performers, per variant.
+        -- The play's identity is its ROW, not (ts, track). 97 plays here
+        -- share (ts, spotify_track_uri) with a different play — ingest
+        -- dedupes on every content column and these differ in ms_played —
+        -- and partitioning on (ts, track) gave each of a pair half weight,
+        -- losing half the pair's time (4.26 h). The id only has to be unique
+        -- per row; its value never matters, since every output aggregates
+        -- over it.
+        numbered AS (
+            SELECT row_number() OVER () AS play_id, * FROM plays
+        ),
         play_credits AS (
             SELECT
                 v.variant,
-                p.ts,                      -- carried solely to identify the play
-                p.spotify_track_uri,
+                p.play_id,
                 p.month,
                 c.artist_name,
                 p.ms_played / 1000.0 AS played_seconds,
                 CASE c.credit_type WHEN 'album_artist' THEN 1.0
                                    ELSE v.feature_weight END AS raw_w
-            FROM plays p
+            FROM numbered p
             JOIN track_credits c USING (spotify_track_uri)
             CROSS JOIN variants v
-        ),
-        normalised AS (
-            SELECT
-                variant, month, artist_name, played_seconds,
-                -- Normalise across the performers of ONE play. The partition
-                -- must be the play's identity (ts + track); partitioning by
-                -- artist instead would hand every performer a full 1.0 and
-                -- multiply the listening time by the size of the credit list.
-                raw_w / nullif(sum(raw_w) OVER (
-                    PARTITION BY variant, ts, spotify_track_uri
-                ), 0) AS credit_w
-            FROM play_credits
-        ),
+        )
+        SELECT
+            variant, play_id, month, artist_name, played_seconds,
+            -- Normalise across the performers of ONE play; partitioning by
+            -- artist instead would hand every performer a full 1.0 and
+            -- multiply the listening time by the size of the credit list.
+            -- The fallback is for a play with no album-artist credit under
+            -- album_artist_only, where every weight is 0.0 and 0/0 is NULL:
+            -- "CARNIVAL - HOOLIGANS VERSION" lost its album artist `¥$` in
+            -- Stage 1b and vanished from that variant outright. An even split
+            -- keeps its time; restoring the missing credit is Stage 1b's job.
+            coalesce(raw_w / nullif(sum(raw_w) OVER w, 0),
+                     1.0 / count(*) OVER w) AS credit_w
+        FROM play_credits
+        WINDOW w AS (PARTITION BY variant, play_id)
+        """
+    )
+
+
+def build_tag_trends(con: duckdb.DuckDBPyConnection) -> None:
+    """Monthly tag share, smoothed, with a trailing-window slope per tag."""
+    con.execute(
+        f"""
+        CREATE OR REPLACE TABLE tag_trends AS
+
         -- Time attributed to each tag. Two normalised weights multiplied, so
         -- the total across tags equals the total tagged listening time.
-        tag_month AS (
+        WITH tag_month AS (
             SELECT
                 n.variant,
                 n.month,
                 w.tag,
                 sum(n.played_seconds * n.credit_w * w.tag_weight) AS tag_seconds,
                 count(DISTINCT n.artist_name)                     AS n_artists
-            FROM normalised n
+            FROM credit_weights n
             JOIN artist_tag_weights w USING (artist_name)
             GROUP BY 1, 2, 3
         ),
@@ -352,6 +378,67 @@ def assert_no_nan(con: duckdb.DuckDBPyConnection) -> None:
                          + "\n  ".join(problems))
 
 
+def time_balance(con: duckdb.DuckDBPyConnection) -> list[tuple[str, float, float]]:
+    """(variant, credited seconds in, seconds attributed out), per variant.
+
+    "In" is measured from `plays` directly, never from credit_weights, so a
+    fault in the weighting cannot also hide itself in the thing it is checked
+    against. Every configured variant gets a row, even one absent from
+    credit_weights, so a variant that lost everything still reports.
+    """
+    return con.execute(
+        """
+        WITH credited AS (
+            SELECT coalesce(sum(ms_played / 1000.0), 0) AS secs
+            FROM plays
+            WHERE spotify_track_uri IN (SELECT spotify_track_uri FROM track_credits)
+        ),
+        attributed AS (
+            SELECT variant, sum(played_seconds * credit_w) AS secs
+            FROM credit_weights GROUP BY 1
+        )
+        SELECT v.variant, c.secs, coalesce(a.secs, 0)
+        FROM (SELECT unnest(?::VARCHAR[]) AS variant) v
+        CROSS JOIN credited c
+        LEFT JOIN attributed a USING (variant)
+        ORDER BY 1
+        """,
+        [list(config.CREDIT_VARIANTS)],
+    ).fetchall()
+
+
+def assert_time_conserved(con: duckdb.DuckDBPyConnection) -> None:
+    """Refuse to write trends whose credit weighting created or lost time.
+
+    Shares are ratios, so time lost evenly moves no share at all and nothing
+    on the report surface shows it. The 2026-09-25 re-run attributed 3,938.7
+    of 3,941.0 credited hours — a (ts, track) partition halving 97 paired
+    plays, and one track with no album artist vanishing under
+    album_artist_only — and every chart looked fine.
+    """
+    problems = []
+    for variant, secs_in, secs_out in time_balance(con):
+        if abs(secs_out - secs_in) > 1e-6 * secs_in:
+            problems.append(f"{variant}: {secs_in / 3600:,.4f} h credited, "
+                            f"{secs_out / 3600:,.4f} h attributed")
+    if problems:
+        raise SystemExit("Refusing to write: credit weighting did not conserve "
+                         "listening time:\n  " + "\n  ".join(problems))
+
+
+def keep_previous_trends(con: duckdb.DuckDBPyConnection) -> None:
+    """Hold the last run's shares in memory before write_outputs replaces them.
+
+    Only so the report can say how far this run moved them: a fix meant to
+    change nothing but rounding should show a rounding-sized number, and a
+    byte-identical re-run should show zero.
+    """
+    if config.TAG_TRENDS_PARQUET.exists():
+        con.execute(
+            f"CREATE OR REPLACE TABLE previous_trends AS "
+            f"SELECT variant, tag, month, share FROM '{config.TAG_TRENDS_PARQUET}'")
+
+
 def write_outputs(con: duckdb.DuckDBPyConnection) -> None:
     SECONDARY_DIR.mkdir(parents=True, exist_ok=True)
     con.execute(
@@ -405,6 +492,40 @@ def report(con: duckdb.DuckDBPyConnection) -> None:
         """
     )[0]
     print(f"listening time reaching at least one tag: {covered:.1f}%")
+
+    # Checked before the write by assert_time_conserved; printed so the
+    # balance is on the verification surface and not only implied by silence.
+    for variant, secs_in, secs_out in time_balance(con):
+        print(f"credited listening conserved ({variant}): "
+              f"{secs_in / 3600:,.1f} h in, {secs_out / 3600:,.1f} h attributed")
+
+    # How far this run moved the shares the last run wrote, on the rows both
+    # carry. Months or tags present on only one side are counted, not diffed.
+    if q("SELECT count(*) FROM duckdb_tables() "
+         "WHERE table_name = 'previous_trends'")[0]:
+        d_max, d_var, d_tag, d_month, n_shared = q(
+            """
+            SELECT max(d), arg_max(variant, d), arg_max(tag, d),
+                   arg_max(month, d), count(*)
+            FROM (SELECT n.variant, n.tag, n.month, abs(n.share - o.share) AS d
+                  FROM tag_trends n
+                  JOIN previous_trends o USING (variant, tag, month)
+                  WHERE n.share IS NOT NULL AND o.share IS NOT NULL)
+            """)
+        n_added, n_removed = q(
+            """
+            SELECT count(*) FILTER (WHERE o.variant IS NULL),
+                   count(*) FILTER (WHERE n.variant IS NULL)
+            FROM tag_trends n
+            FULL JOIN previous_trends o
+              ON n.variant = o.variant AND n.tag = o.tag AND n.month = o.month
+            """)
+        where = f"  ({d_var}, {d_tag}, {d_month})" if d_max else ""
+        print(f"max |Δshare| vs previous run: {100 * (d_max or 0):.6f} pp over "
+              f"{n_shared:,} shared rows{where}; "
+              f"{n_added:,} rows new, {n_removed:,} gone")
+    else:
+        print("max |Δshare| vs previous run: (no previous tag_trends.parquet)")
 
     print(f"\n--- Top 12 genres, latest month "
           f"({config.ROLLING_WINDOW_MONTHS}-month smoothed, {v}) ---")
@@ -489,11 +610,15 @@ def main() -> None:
     register_sources(con)
     print("Building artist tag weights ...")
     build_tag_weights(con)
+    print("Building credit weights ...")
+    build_credit_weights(con)
     print("Building tag trends ...")
     build_tag_trends(con)
     print("Building secondary metrics ...")
     build_secondary_metrics(con)
     assert_no_nan(con)
+    assert_time_conserved(con)
+    keep_previous_trends(con)
     write_outputs(con)
     report(con)
 

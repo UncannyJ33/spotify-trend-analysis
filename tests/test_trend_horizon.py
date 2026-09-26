@@ -77,9 +77,11 @@ def run(rows):
     con = duckdb.connect()
     analyze.register_sources(con)
     analyze.build_tag_weights(con)
+    analyze.build_credit_weights(con)
     analyze.build_tag_trends(con)
     analyze.build_secondary_metrics(con)
     analyze.assert_no_nan(con)
+    analyze.assert_time_conserved(con)
     return con
 
 
