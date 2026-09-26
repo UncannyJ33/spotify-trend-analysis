@@ -196,16 +196,16 @@ CREATE TABLE plays AS SELECT * FROM (VALUES
 con.execute("ALTER TABLE plays ADD COLUMN ms_played_estimated BOOLEAN DEFAULT FALSE")
 con.execute("""
 CREATE TABLE track_credits AS SELECT * FROM (VALUES
-  ('uri:remix', 'Halsey',     'album_artist'),
-  ('uri:remix', 'Blair Muir', 'remixer'),
-  ('uri:s1', 'Subtronics', 'album_artist'),
-  ('uri:s2', 'Subtronics', 'album_artist'),
-  ('uri:s3', 'Subtronics', 'album_artist'),
-  ('uri:skip', 'Subtronics', 'album_artist'),
-  ('uri:once', 'Blair Muir', 'album_artist'),
-  ('uri:old', 'Subtronics', 'album_artist'),
-  ('uri:ill', 'ILLENIUM', 'album_artist')
-) t(spotify_track_uri, artist_name, credit_type)""")
+  ('uri:remix', 'Halsey',     'album_artist', 'export'),
+  ('uri:remix', 'Blair Muir', 'remixer',      'export'),
+  ('uri:s1', 'Subtronics', 'album_artist', 'export'),
+  ('uri:s2', 'Subtronics', 'album_artist', 'export'),
+  ('uri:s3', 'Subtronics', 'album_artist', 'export'),
+  ('uri:skip', 'Subtronics', 'album_artist', 'export'),
+  ('uri:once', 'Blair Muir', 'album_artist', 'export'),
+  ('uri:old', 'Subtronics', 'album_artist', 'export'),
+  ('uri:ill', 'ILLENIUM', 'album_artist', 'export')
+) t(spotify_track_uri, artist_name, credit_type, credit_source)""")
 
 running.build_known_pool(con)
 bass = running.select_known(con, "dubstep", limit=50)
@@ -223,6 +223,137 @@ check("a single skipped play is not enough evidence to drop",
       "uri:once" in garage_uris, True)
 check("play outside the window excluded", "uri:old" in bass_uris, False)
 check("excluded artist contributes nothing", "uri:ill" in bass_uris, False)
+
+# --- known pool: polled plays, the export horizon, admitting credits ----
+# The poller's rows are provisional: estimated ms_played, NULL reason_end. Read
+# as completion evidence they turned every polled play into a skip (Rain fell
+# from 0.846), and read as "now" they slid the 36-month window forward and lost
+# 82.6 h off its old end. They still count as HOURS: the listening happened.
+kp = duckdb.connect()
+kp.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Subtronics',   'dubstep',         4, TRUE),
+  ('NGHTMRE',      'dubstep',         3, TRUE),
+  ('Habstrakt',    'bass house',      2, TRUE),
+  ('John Summit',  'tech house',      3, TRUE),
+  ('Todd Edwards', 'uk garage',       2, TRUE),
+  -- On neither list: Daft Punk places nothing on his own.
+  ('Daft Punk',    'house',           5, TRUE),
+  -- Inéz's hand tags: `house` is on neither list and melodic dubstep is drag,
+  -- so she has no cluster — and on the known side that must change nothing.
+  ('Inéz',         'house',           1, TRUE),
+  ('Inéz',         'melodic dubstep', 1, TRUE)
+) t(artist_name, tag, tag_count, is_genre)""")
+running.build_artist_clusters(kp)
+kp.execute("""
+CREATE TABLE plays AS SELECT * FROM (VALUES
+  -- 3 finished export plays, then 2 polled ones. Completion is the export's
+  -- 3/3; the polled plays count as hours only. The export ends in 2026-07 and
+  -- the poller runs on to 2026-09.
+  ('uri:mix', 'Mixed Evidence', 'Subtronics', 200.0, 'trackdone', DATE '2026-07-01', 200000, FALSE),
+  ('uri:mix', 'Mixed Evidence', 'Subtronics', 200.0, 'trackdone', DATE '2026-07-01', 200000, FALSE),
+  ('uri:mix', 'Mixed Evidence', 'Subtronics', 200.0, 'trackdone', DATE '2026-07-01', 200000, FALSE),
+  ('uri:mix', 'Mixed Evidence', 'Subtronics', 200.0, NULL,        DATE '2026-09-01', 200000, TRUE),
+  ('uri:mix', 'Mixed Evidence', 'Subtronics', 200.0, NULL,        DATE '2026-09-01', 200000, TRUE),
+  -- Heard only by the poller: no completion evidence at all, and a polled
+  -- ms_played is the whole track, so it is the duration.
+  ('uri:polled', 'Only Polled', 'Subtronics', 222.0, NULL, DATE '2026-09-01', 222000, TRUE),
+  -- 2 export skips + 2 polled plays. Four "plays" at 0% done used to floor it;
+  -- two export skips are not enough evidence to.
+  ('uri:skip2', 'Two Skips', 'Subtronics', 40.0, 'fwdbtn', DATE '2026-06-01', 40000, FALSE),
+  ('uri:skip2', 'Two Skips', 'Subtronics', 40.0, 'fwdbtn', DATE '2026-06-01', 40000, FALSE),
+  ('uri:skip2', 'Two Skips', 'Subtronics', 200.0, NULL,    DATE '2026-09-01', 200000, TRUE),
+  ('uri:skip2', 'Two Skips', 'Subtronics', 200.0, NULL,    DATE '2026-09-01', 200000, TRUE),
+  -- 36 months back from the EXPORT's last month is 2023-07: in, and a month
+  -- earlier out. Anchored on the polled 2026-09 it would start at 2023-09.
+  ('uri:edge', 'Three Years Back', 'Subtronics', 300.0, 'trackdone', DATE '2023-07-01', 200000, FALSE),
+  ('uri:past', 'One Month Older',  'Subtronics', 300.0, 'trackdone', DATE '2023-06-01', 200000, FALSE),
+  -- C10: which credits may place a track.
+  ('uri:frag',  'Fragments of Time', 'Daft Punk', 300.0, 'trackdone', DATE '2026-06-01', 280000, FALSE),
+  ('uri:one',   'The One - NGHTMRE Remix', 'Habstrakt', 300.0, 'trackdone', DATE '2026-06-01', 200000, FALSE),
+  ('uri:eyes',  'Eyes Cut Deeper (feat. Inéz)', 'Subtronics', 300.0, 'trackdone', DATE '2026-06-01', 200000, FALSE),
+  ('uri:cryst', 'crystallized (feat. Inéz) - Subtronics Remix', 'John Summit', 300.0, 'trackdone', DATE '2026-06-01', 200000, FALSE),
+  ('uri:light', 'light years (feat. Inéz)', 'John Summit', 300.0, 'trackdone', DATE '2026-06-01', 200000, FALSE)
+) t(spotify_track_uri, track_name, artist_name, played_seconds, reason_end, month, ms_played,
+    ms_played_estimated)""")
+kp.execute("""
+CREATE TABLE track_credits AS SELECT * FROM (VALUES
+  ('uri:mix',    'Subtronics',   'album_artist', 'export'),
+  ('uri:polled', 'Subtronics',   'album_artist', 'export'),
+  ('uri:skip2',  'Subtronics',   'album_artist', 'export'),
+  ('uri:edge',   'Subtronics',   'album_artist', 'export'),
+  ('uri:past',   'Subtronics',   'album_artist', 'export'),
+  ('uri:frag',   'Daft Punk',    'album_artist', 'export'),
+  ('uri:frag',   'Todd Edwards', 'featured',     'export'),
+  ('uri:one',    'Habstrakt',    'album_artist', 'export'),
+  ('uri:one',    'NGHTMRE',      'remixer',      'export'),
+  ('uri:eyes',   'Subtronics',   'album_artist', 'poller'),
+  ('uri:eyes',   'Inéz',         'featured',     'poller'),
+  ('uri:cryst',  'John Summit',  'album_artist', 'export'),
+  ('uri:cryst',  'Inéz',         'featured',     'export'),
+  ('uri:cryst',  'Subtronics',   'remixer',      'export'),
+  ('uri:light',  'John Summit',  'album_artist', 'export'),
+  ('uri:light',  'Inéz',         'featured',     'export')
+) t(spotify_track_uri, artist_name, credit_type, credit_source)""")
+
+def pool_clusters(uri):
+    running.build_known_pool(kp)
+    return sorted(r[0] for r in kp.execute(
+        "SELECT cluster FROM known_pool WHERE spotify_track_uri = ?", [uri]
+    ).fetchall())
+
+def pool_row(uri):
+    cols = ["n_plays", "hours", "done_rate", "done_smoothed", "duration_ms"]
+    r = kp.execute(f"SELECT {', '.join(cols)} FROM known_pool "
+                   "WHERE spotify_track_uri = ?", [uri]).fetchone()
+    return dict(zip(cols, r)) if r else None
+
+running.build_known_pool(kp)
+mix = pool_row("uri:mix")
+check("C9: completion is measured on export plays only",
+      mix and mix["done_rate"], 1.0)
+check("...and n_plays counts only those", mix and mix["n_plays"], 3)
+check("...while the polled plays still count as hours",
+      mix and round(mix["hours"], 4), round(1000 / 3600, 4))
+polled = pool_row("uri:polled")
+check("a polled-only track is in the pool, not NULLed out", polled is not None, True)
+check("...at the 0.5 prior", polled and polled["done_smoothed"], 0.5)
+check("...with the polled ms_played as its duration",
+      polled and polled["duration_ms"], 222000)
+check("2 export skips + 2 polled plays is not floored",
+      pool_row("uri:skip2") is not None, True)
+check("the window runs 36 months back from the EXPORT horizon",
+      pool_row("uri:edge") is not None, True)
+check("...and not a month further", pool_row("uri:past"), None)
+
+# Todd Edwards is on Daft Punk's record only by the title regex. An export
+# feature is a guess, and guessing is how his 0.54 h became a garage seed.
+check("C10: an export feature does not admit (Fragments of Time)",
+      pool_clusters("uri:frag"), [])
+kp.execute("UPDATE track_credits SET credit_source = 'poller' "
+           "WHERE spotify_track_uri = 'uri:frag'")
+check("...a poller feature does", pool_clusters("uri:frag"), ["speed garage"])
+
+# A remix belongs to its remixer's run. Habstrakt's bass house would also put
+# "The One - NGHTMRE Remix" in garage; the record is NGHTMRE's.
+check("C10 routing: a remix goes to the remixer's cluster only",
+      pool_clusters("uri:one"), ["dubstep"])
+# credits.py types every non-first poller artist as `featured`, remixers
+# included, which is why routing reads the title rather than credit_type.
+kp.execute("UPDATE track_credits SET credit_type = 'featured', "
+           "credit_source = 'poller' WHERE spotify_track_uri = 'uri:one'")
+check("...still when the poller types the remixer as featured",
+      pool_clusters("uri:one"), ["dubstep"])
+
+check("a featured credit with no cluster neither admits nor refuses",
+      pool_clusters("uri:eyes"), ["dubstep"])
+kp.execute("DELETE FROM track_credits WHERE spotify_track_uri = 'uri:eyes' "
+           "AND artist_name = 'Inéz'")
+check("...exactly as with no Inéz row at all", pool_clusters("uri:eyes"), ["dubstep"])
+check("John Summit's Subtronics remix is dubstep only",
+      pool_clusters("uri:cryst"), ["dubstep"])
+check("...and his own light years stays garage",
+      pool_clusters("uri:light"), ["speed garage"])
 
 # --- overrides ----------------------------------------------------------
 # A veto naming only an artist removes all of their tracks.

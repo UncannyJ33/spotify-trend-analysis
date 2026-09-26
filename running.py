@@ -248,14 +248,43 @@ def build_known_pool(con: duckdb.DuckDBPyConnection) -> None:
     """Tracks from the listener's own recent history, per cluster.
 
     The join is on track_credits, NOT on plays.artist_name, so a track counts
-    for every artist actually on it — album artist, feature and remixer alike.
-    That is the whole reason Stage 1b learned to parse `- X Remix`: without it
-    a Halsey track remixed by Ian Asher is judged on Halsey's tags.
+    for the artists actually on it. That is the whole reason Stage 1b learned
+    to parse `- X Remix`: without it a Halsey track remixed by Ian Asher is
+    judged on Halsey's tags.
 
-    Duration comes from the longest COMPLETED play. A play that ended in
-    'trackdone' ran the track to its end, so its ms_played is the duration —
-    exact, free, and it saves a request per track against an endpoint whose
-    batch form answers 403.
+    POLLED PLAYS COUNT AS TIME, NOT AS EVIDENCE. A polled row carries an
+    estimated ms_played and a NULL reason_end, so read as completion every one
+    is a skip — the 09-25 re-run pulled Rain off its 0.846 and cut "Tough -
+    Gravagerz Remix" outright. Completion, the play count behind the Laplace
+    term and the skip floor come from export rows only; hours count all, since
+    the listening did happen. A track only the poller has heard sits at the
+    0.5 prior rather than vanishing.
+
+    THE WINDOW ENDS AT THE EXPORT HORIZON (config.ANALYSIS_HORIZON_SQL), not at
+    the latest play. Anchored on the poller, 36 months slid forward past the
+    export's coverage and lost 1,801 plays (82.6 h) off the far end. There is no
+    upper bound, so polled plays past the horizon are still counted.
+
+    Duration is the MEDIAN completed export play; failing that, a polled
+    ms_played, which the poller records as the whole track's length.
+
+    WHICH CREDITS MAY PLACE A TRACK. The album artist, a remixer, or a feature
+    the poller saw. A feature from the export is Stage 1b's title regex — a
+    guess — and never admits on its own: Todd Edwards' 0.54 h in this window is
+    two Daft Punk edits he is guessed onto, and that guess is how he reached
+    the garage seeds at all. A blanket ban on features would be wrong the other way, eroding every
+    remixer keep as polling grows, because credits.py types every non-first
+    poller artist as `featured`, remixers included.
+
+    A remix belongs to its REMIXER's run. Habstrakt's bass house put "The One -
+    NGHTMRE Remix" in garage; the record is NGHTMRE's. So when the title's
+    remix credit names a credited cluster artist, the track goes to that
+    artist's cluster only. It is read from the title, not from credit_type, for
+    the poller reason above.
+
+    A featured credit with no cluster (Inéz, hand-tagged house and melodic
+    dubstep) neither admits nor refuses. There is no drag test on the known
+    side: a hand tag on a singer must never move a track the listener plays.
 
     The per-artist cap is keyed on the ALBUM artist. A remixer who also has
     their own releases is capped on those separately, which is why Blair Muir
@@ -269,49 +298,83 @@ def build_known_pool(con: duckdb.DuckDBPyConnection) -> None:
                 p.spotify_track_uri,
                 any_value(p.track_name)  AS track_name,
                 any_value(p.artist_name) AS album_artist,
-                count(*)                 AS n_plays,
+                -- Completion evidence: export plays only.
+                count(*) FILTER (WHERE NOT p.ms_played_estimated) AS n_plays,
+                count(*)                                          AS n_plays_all,
+                -- Polled estimates count as time.
                 sum(p.played_seconds) / 3600.0 AS hours,
-                avg(CASE WHEN p.reason_end = 'trackdone' THEN 1.0 ELSE 0 END)
-                    AS done_rate,
+                coalesce(
+                    avg(CASE WHEN p.reason_end = 'trackdone' THEN 1.0 ELSE 0 END)
+                        FILTER (WHERE NOT p.ms_played_estimated),
+                    0) AS done_rate,
                 -- MEDIAN, not max. A completed play's ms_played is the track's
                 -- duration, but the odd play reports far more than the track
                 -- runs (a paused stream that kept counting). max() took
                 -- SLANDER's "Wish I Could Forget" to 9.6 minutes and let one
                 -- track eat a tenth of the playlist.
-                median(CASE WHEN p.reason_end = 'trackdone' THEN p.ms_played END)
-                    AS duration_ms
+                coalesce(
+                    median(CASE WHEN p.reason_end = 'trackdone'
+                                THEN p.ms_played END)
+                        FILTER (WHERE NOT p.ms_played_estimated),
+                    median(p.ms_played) FILTER (WHERE p.ms_played_estimated)
+                ) AS duration_ms
             FROM plays p
             WHERE p.spotify_track_uri IS NOT NULL
               AND p.track_name IS NOT NULL
-              AND p.month >= (SELECT max(month) FROM plays)
+              AND p.month >= {config.ANALYSIS_HORIZON_SQL}
                              - INTERVAL {config.RUN_WINDOW_MONTHS} MONTH
             GROUP BY 1
         ),
-        credited AS (
-            SELECT r.*, ac.cluster,
-                   -- One row per (track, cluster): a track crediting three
-                   -- qualifying artists is one track, not three.
-                   row_number() OVER (
-                       PARTITION BY r.spotify_track_uri, ac.cluster
-                       ORDER BY ac.garage_w + ac.bass_w DESC, c.artist_name
-                   ) AS rn
+        admitting AS (
+            -- The credits allowed to place a track in a cluster.
+            SELECT r.spotify_track_uri, c.artist_name, ac.cluster,
+                   ac.garage_w + ac.bass_w AS w
             FROM recent r
             JOIN track_credits c USING (spotify_track_uri)
             JOIN artist_clusters ac ON ac.artist_name = c.artist_name
             WHERE ac.cluster IS NOT NULL
+              AND (c.credit_type IN ('album_artist', 'remixer')
+                   OR (c.credit_type = 'featured' AND c.credit_source = 'poller'))
+        ),
+        routed AS (
+            -- The remixer the TITLE names, when they are an admitting cluster
+            -- artist on the record. regexp_extract gives '' on no match, and
+            -- no credited name is that short.
+            SELECT a.spotify_track_uri,
+                   first(a.cluster ORDER BY a.w DESC, a.cluster) AS remix_cluster
+            FROM admitting a
+            JOIN recent r USING (spotify_track_uri)
+            WHERE lower(trim(a.artist_name)) = lower(trim(
+                      regexp_extract(r.track_name, '{REMIX_CREDIT_RE}', 1, 'i')))
+            GROUP BY 1
+        ),
+        credited AS (
+            SELECT r.*, a.cluster,
+                   -- One row per (track, cluster): a track crediting three
+                   -- qualifying artists is one track, not three.
+                   row_number() OVER (
+                       PARTITION BY r.spotify_track_uri, a.cluster
+                       ORDER BY a.w DESC, a.artist_name
+                   ) AS rn
+            FROM recent r
+            JOIN admitting a USING (spotify_track_uri)
+            LEFT JOIN routed x USING (spotify_track_uri)
+            WHERE x.remix_cluster IS NULL OR a.cluster = x.remix_cluster
         )
         SELECT
             spotify_track_uri, track_name, album_artist, cluster,
-            n_plays, hours, done_rate, duration_ms,
+            n_plays, n_plays_all, hours, done_rate, duration_ms,
             -- Laplace-smoothed completion. A track played once and finished is
             -- not evidence of the same strength as one finished forty times,
             -- and (done+1)/(n+2) says so without discarding the single play.
+            -- n is the EXPORT count, so a polled-only track sits at 0.5.
             (done_rate * n_plays + 1) / (n_plays + 2) AS done_smoothed,
             hours * ((done_rate * n_plays + 1) / (n_plays + 2)) AS score
         FROM credited
         WHERE rn = 1
           -- A track skipped repeatedly is not a track that carries a run.
-          -- Applied only where there is enough evidence to mean anything.
+          -- Applied only where there is enough evidence to mean anything,
+          -- and polled plays are not evidence.
           AND NOT (n_plays >= 3 AND done_rate < {config.RUN_MIN_TRACKDONE_RATE})
         ORDER BY ALL
         """
@@ -1118,7 +1181,7 @@ def report(con, selections: list[dict], dry: bool) -> None:
         FROM plays p
         LEFT JOIN artist_tags t ON t.artist_name = p.artist_name
         WHERE t.artist_name IS NULL AND p.artist_name IS NOT NULL
-          AND p.month >= (SELECT max(month) FROM plays)
+          AND p.month >= {config.ANALYSIS_HORIZON_SQL}
                          - INTERVAL {config.RUN_WINDOW_MONTHS} MONTH
         GROUP BY 1 ORDER BY h DESC LIMIT 12
         """

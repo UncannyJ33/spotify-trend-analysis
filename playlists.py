@@ -141,7 +141,9 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection,
                    sum(p.played_seconds) / 3600.0 AS hours
             FROM plays p
             WHERE p.spotify_track_uri IS NOT NULL
-              AND p.month >= (SELECT max(month) FROM plays)
+              -- The export horizon, not the latest play: a polled row past the
+              -- export's coverage would slide the window forward.
+              AND p.month >= {config.ANALYSIS_HORIZON_SQL}
                              - INTERVAL {config.ANCHOR_WINDOW_MONTHS} MONTH
               AND EXISTS (
                   SELECT 1 FROM artist_tags t
