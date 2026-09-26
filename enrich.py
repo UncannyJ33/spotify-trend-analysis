@@ -506,6 +506,61 @@ def tags_from_release_groups(http: Throttled, mbid: str) -> list[dict]:
             sorted(totals.items(), key=lambda kv: -kv[1])]
 
 
+def recovered_by_backfill(rec: dict) -> bool:
+    """Did this record's tags come from its release groups? Either marker says so."""
+    return bool(rec.get("tags")) and (
+        rec.get("source") == "musicbrainz-release-group"
+        or rec.get("tags_from") == "release-group")
+
+
+def backfill_untagged(http: Throttled, cache: dict[str, dict]) -> int:
+    """Second pass: artists that resolved to a real MBID but carry no tags.
+
+    `backfilled` marks a record as already attempted so a re-run does not spend
+    requests re-checking artists whose releases are also untagged. Returns how
+    many artists this pass recovered tags for.
+
+    An override-pinned record keeps `source = 'override'` and records where its
+    tags came from in `tags_from` instead. Rewriting `source` used to break
+    `override_satisfied`, so every run re-fetched the pin, found it untagged
+    again and backfilled it again: REAPER, Reaper, NOTION, Ylti, CJ, ALLEYCVT
+    and Levity cost ~14 requests on every run. It also hid the record from
+    `purge_stale_overrides`, so deleting the override row freed nothing.
+    """
+    gaps = [
+        n for n, r in cache.items()
+        if r.get("status") == "resolved" and r.get("mbid")
+        and not r.get("tags") and not r.get("backfilled")
+    ]
+    if not gaps:
+        return 0
+    print(f"\nBackfilling {len(gaps):,} untagged artists from release "
+          f"groups (~{len(gaps) * MB_MIN_INTERVAL / 60:.0f} min).\n")
+    recovered = 0
+    try:
+        for i, name in enumerate(gaps, 1):
+            rec = dict(cache[name])
+            tags = tags_from_release_groups(http, rec["mbid"])
+            rec["tags"] = tags
+            rec["backfilled"] = True
+            if tags:
+                if rec.get("source") == "override":
+                    rec["tags_from"] = "release-group"
+                else:
+                    rec["source"] = "musicbrainz-release-group"
+                recovered += 1
+            append_cache(rec)
+            cache[name] = rec
+            if i % 25 == 0 or i == len(gaps):
+                filled = sum(1 for r in cache.values() if recovered_by_backfill(r))
+                print(f"  [{i:>5,}/{len(gaps):,}] "
+                      f"{100*i/len(gaps):5.1f}%  recovered: {filled:,}",
+                      flush=True)
+    except KeyboardInterrupt:
+        print("\nInterrupted — progress is cached, re-run to resume.\n")
+    return recovered
+
+
 # --------------------------------------------------------------------------
 # Persist + report
 # --------------------------------------------------------------------------
@@ -559,7 +614,9 @@ def write_outputs(con: duckdb.DuckDBPyConnection, cache: dict[str, dict],
             -- Re-listing them is exactly what the override file exists to stop.
             WHERE r.status <> 'ignored'
               AND (r.status <> 'resolved' OR r.n_tags = 0)
-            ORDER BY w.listening_hours DESC NULLS LAST
+            -- Names are unique in artist_resolution, so this is a total order.
+            -- Hours alone tie, and DuckDB's parallel sort breaks ties arbitrarily.
+            ORDER BY w.listening_hours DESC NULLS LAST, r.artist_name
         ) TO '{REVIEW_PARQUET}' (FORMAT PARQUET, COMPRESSION ZSTD)"""
     )
 
@@ -742,39 +799,9 @@ def main() -> None:
             except KeyboardInterrupt:
                 print("\nInterrupted — progress is cached, re-run to resume.\n")
 
-        # Second pass: artists that resolved to a real MBID but carry no tags.
-        # `backfilled` marks a record as already attempted so a re-run does not
-        # spend requests re-checking artists whose releases are also untagged.
+        # Second pass: resolved to a real MBID, but no tags on the artist page.
         if not args.no_backfill:
-            gaps = [
-                n for n, r in cache.items()
-                if r.get("status") == "resolved" and r.get("mbid")
-                and not r.get("tags") and not r.get("backfilled")
-            ]
-            if gaps:
-                print(f"\nBackfilling {len(gaps):,} untagged artists from release "
-                      f"groups (~{len(gaps) * MB_MIN_INTERVAL / 60:.0f} min).\n")
-                try:
-                    for i, name in enumerate(gaps, 1):
-                        rec = dict(cache[name])
-                        tags = tags_from_release_groups(http, rec["mbid"])
-                        rec["tags"] = tags
-                        rec["backfilled"] = True
-                        if tags:
-                            rec["source"] = "musicbrainz-release-group"
-                        append_cache(rec)
-                        cache[name] = rec
-                        if i % 25 == 0 or i == len(gaps):
-                            filled = sum(
-                                1 for r in cache.values()
-                                if r.get("source") == "musicbrainz-release-group"
-                                and r.get("tags")
-                            )
-                            print(f"  [{i:>5,}/{len(gaps):,}] "
-                                  f"{100*i/len(gaps):5.1f}%  recovered: {filled:,}",
-                                  flush=True)
-                except KeyboardInterrupt:
-                    print("\nInterrupted — progress is cached, re-run to resume.\n")
+            backfill_untagged(http, cache)
 
     # Applied last, so a hand answer beats both the lookup and the
     # release-group backfill. Not cached — see apply_override_tags.
