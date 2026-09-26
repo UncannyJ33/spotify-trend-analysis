@@ -607,6 +607,13 @@ def report(con: duckdb.DuckDBPyConnection) -> None:
 def main() -> None:
     config.ensure_dirs()
     con = duckdb.connect()
+    # One thread, so every float sum adds in the same order. ORDER BY ALL fixes
+    # which row lands where, not what is in it: parallel aggregates combine
+    # partial sums in whatever order the threads finish, and two identical runs
+    # differed in 70,638 of 89,080 rows by up to 4.4e-16. Byte-identical
+    # re-runs need both a total order and a deterministic summation order. The
+    # data is tens of thousands of rows per variant, so this costs seconds.
+    con.execute("SET threads = 1")
     register_sources(con)
     print("Building artist tag weights ...")
     build_tag_weights(con)

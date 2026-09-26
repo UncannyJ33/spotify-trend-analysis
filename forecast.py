@@ -195,6 +195,11 @@ def main() -> None:
 
     config.ensure_dirs()
     con = duckdb.connect()
+    # One thread for the same reason as analyze.main: parallel aggregates sum
+    # floats in whatever order the threads finish, so the tag weights, the
+    # projected shares and the gap hours drift in the last bit between re-runs
+    # and stop being byte-identical even though ORDER BY ALL fixes row order.
+    con.execute("SET threads = 1")
     for name, path in (
         ("tag_trends", config.TAG_TRENDS_PARQUET),
         ("track_credits", config.DATA_DIR / "track_credits.parquet"),
