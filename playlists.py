@@ -453,21 +453,27 @@ def sp_artist_tracks(sp, artist: str, cache: dict) -> list[dict]:
     per-artist cap downstream stays keyed on one spelling.
 
     An empty answer caches like any other: an artist Spotify does not carry is
-    asked once, not once per run.
+    asked once, not once per run. A FAILED request is not an answer — a 429,
+    an error envelope or no response at all used to be written as "no tracks",
+    and an append-only cache never asked again. Records now carry the status;
+    an empty one from before that may have been a failure, so it is asked once
+    more and the new record wins.
     """
     key = normalise(artist)
-    if key in cache:
-        return [dict(t, artist_name=artist) for t in cache[key]["tracks"]]
+    hit = cache.get(key)
+    if hit and ("status" in hit or hit["tracks"]):
+        return [dict(t, artist_name=artist) for t in hit["tracks"]]
     resp = sp.get("/search", params={
         "q": f'artist:"{artist.replace(chr(34), "")}"',
         "type": "track", "limit": SP_SEARCH_LIMIT,
     })
-    items = (resp.get("tracks", {}).get("items", [])
-             if isinstance(resp, dict) and "_status" not in resp else [])
+    if not isinstance(resp, dict) or "_status" in resp:
+        return []
+    items = (resp.get("tracks") or {}).get("items", [])
     tracks = [{"track_name": it.get("name"), "spotify_track_uri": it.get("uri")}
               for it in items
               if it.get("uri") and _artist_match(it, artist)]
-    rec = {"key": key, "artist": artist, "tracks": tracks}
+    rec = {"key": key, "artist": artist, "status": 200, "tracks": tracks}
     append_jsonl(ARTIST_TRACKS_CACHE, rec)
     cache[key] = rec
     return [dict(t, artist_name=artist) for t in tracks]

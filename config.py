@@ -342,6 +342,13 @@ RUN_WINDOW_MONTHS = 36
 # than his Blair Muir remix and less than half the completion.
 RUN_MIN_TRACKDONE_RATE = 0.45
 
+# When discovery cannot fill its share, known tracks take the time back — but
+# only ones scoring at least this. Matt Sassari's "Give It To Me - Full Vocal
+# Mix" (0.186) went in as filler. A playlist may therefore come in under
+# RUN_TARGET_MINUTES, and the report prints by how much: a few minutes short
+# beats minutes of what the listener skips.
+RUN_TOPUP_MIN_SCORE = 0.20
+
 # Discovery is seeded on the CLUSTER's own top artists, not on Stage 5's
 # library-wide candidate list. Stage 5 seeds across all taste, so its
 # electronic candidates skew canonical — a first dry run offered Basement Jaxx,

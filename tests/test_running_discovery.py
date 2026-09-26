@@ -963,6 +963,55 @@ check("...in the Parquet itself, schema unchanged",
           "WHERE kind = 'run_selection' GROUP BY 1").fetchall()),
       {"library": 1, "discover-row": 2, "library-artist": 6, "stranger": 4})
 
+# --- the known top-up stops at its floor, end to end (C12) ----------------
+# test_running_selection.py pins known_topup; this pins that build_selections
+# uses it. A 12-minute target leaves 7.2 min for known tracks (two fit), and
+# with no discovery at all the other 6 min go to the top-up: the 0.25 row
+# goes in, and the 0.186 row stays out although it would fit.
+tcon = duckdb.connect()
+tcon.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Act A', CAST(NULL AS VARCHAR), 'dubstep', 3, TRUE)
+) t(artist_name, mbid, tag, tag_count, is_genre)""")
+running.build_artist_clusters(tcon)
+tcon.execute("""
+CREATE TABLE known_pool AS SELECT * FROM (VALUES
+  ('uri:t1', 'Top',    'Act A', 'dubstep', 180000.0::DOUBLE, 0.5::DOUBLE, 1.0::DOUBLE, 9::BIGINT, 1.0::DOUBLE,   ['uri:t1']),
+  ('uri:t2', 'Second', 'Act B', 'dubstep', 180000.0, 0.5, 1.0, 9, 0.5,   ['uri:t2']),
+  ('uri:t3', 'Third',  'Act C', 'dubstep', 180000.0, 0.5, 1.0, 9, 0.25,  ['uri:t3']),
+  ('uri:t4', 'Filler', 'Act D', 'dubstep', 180000.0, 0.5, 1.0, 9, 0.186, ['uri:t4'])
+) t(spotify_track_uri, track_name, album_artist, cluster, duration_ms, hours,
+    done_rate, n_plays, score, uris)""")
+tcon.execute("""
+CREATE TABLE track_credits AS
+SELECT spotify_track_uri, album_artist AS artist_name, 'album_artist' AS credit_type,
+       'export' AS credit_source FROM known_pool""")
+tcon.execute("""
+CREATE TABLE plays (spotify_track_uri VARCHAR, track_name VARCHAR,
+    artist_name VARCHAR, played_seconds DOUBLE, reason_end VARCHAR, month DATE,
+    ms_played BIGINT, ms_played_estimated BOOLEAN)""")
+tcon.execute("CREATE TABLE plays_raw AS SELECT *, 'music' AS content_type FROM plays")
+saved = (running.cluster_candidates, running.load_genre_vocabulary,
+         config.RUN_TARGET_MINUTES)
+running.cluster_candidates = lambda *a: []
+running.load_genre_vocabulary = lambda http: set()
+config.RUN_TARGET_MINUTES = 12
+try:
+    sels = running.build_selections(tcon, NoNetwork(), SearchSp({}))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        running.report(tcon, sels, dry=True)
+finally:
+    (running.cluster_candidates, running.load_genre_vocabulary,
+     config.RUN_TARGET_MINUTES) = saved
+dub = next(s for s in sels if s["label"] == "dubstep")
+check("build_selections tops up only above the floor",
+      sorted(t["spotify_track_uri"] for t in dub["tracks"]),
+      ["uri:t1", "uri:t2", "uri:t3"])
+check("...and reports the shortfall rather than padding it",
+      (dub["n_topup"], round(dub["short_min"]),
+       "3 min short of the 12-min target" in buf.getvalue()), (1, 3, True))
+
 shutil.rmtree(_TMP, ignore_errors=True)
 if failures:
     print(f"{len(failures)} FAILURE(S)")

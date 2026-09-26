@@ -678,6 +678,125 @@ missing = running.prefer_members(psp, ["Workout · claude"])
 check("a name that is not an exact match is a warning, not an exit",
       missing, {"uris": set(), "songs": set()})
 
+# --- pins are charged their MEDIAN completed play (C12) -----------------
+# max() is the bug the known pool already fixed: the odd play reports far more
+# than the track runs, and a pin charged 900k for a 3-minute record overcharged
+# the garage run by 4.8 minutes. A skip's ms_played is not a length at all, and
+# a polled play's is the whole track, so it is the fallback.
+pc = duckdb.connect()
+pc.execute("""
+CREATE TABLE plays AS SELECT * FROM (VALUES
+  ('uri:pin', 'Pinned Tune', 'Pin Act', 180.0, 'trackdone', 180000, FALSE),
+  ('uri:pin', 'Pinned Tune', 'Pin Act', 190.0, 'trackdone', 190000, FALSE),
+  ('uri:pin', 'Pinned Tune', 'Pin Act', 900.0, 'trackdone', 900000, FALSE),
+  ('uri:pin', 'Pinned Tune', 'Pin Act',  40.0, 'fwdbtn',     40000, FALSE),
+  -- A polled play beside export evidence changes nothing.
+  ('uri:pin', 'Pinned Tune', 'Pin Act', 999.0, NULL,        999000, TRUE),
+  ('uri:pp',  'Polled Pin',  'Pin Act', 222.0, NULL,        222000, TRUE)
+) t(spotify_track_uri, track_name, artist_name, played_seconds, reason_end,
+    ms_played, ms_played_estimated)""")
+pins = running.resolve_pins(pc, [
+    {"playlist": "", "artist_name": "Pin Act", "track_name": "Pinned Tune"},
+    {"playlist": "", "artist_name": "pin act", "track_name": "POLLED PIN"}], "dubstep")
+check("pin durations of 180k, 190k and 900k give the median, 190k",
+      pins[0]["duration_ms"], 190000)
+check("a pin heard only by the poller takes the polled ms_played",
+      pins[1]["duration_ms"], 222000)
+
+# --- the known top-up has a floor (C12) ---------------------------------
+# When discovery leaves time over, known tracks fill it — but not at any score.
+# Matt Sassari's "Give It To Me - Full Vocal Mix" (0.186) went in as filler; a
+# playlist a few minutes short beats one padded with what the listener skips.
+T = config.RUN_TOPUP_MIN_SCORE
+check("RUN_TOPUP_MIN_SCORE is 0.20", T, 0.20)
+M3 = 180_000
+spare = [{"spotify_track_uri": u, "score": s, "duration_ms": d} for u, s, d in [
+    ("t:kept", 0.9, M3), ("t:ok", 0.5, M3), ("t:long", 0.4, 900_000),
+    ("t:filler", 0.186, M3), ("t:edge", T, M3)]]
+placed_rows = []
+got = running.known_topup(spare, {"t:kept"}, 12 * 60_000,
+                          lambda r: placed_rows.append(r) or r)
+check("a 0.186-score row is not topped up; one at the floor is",
+      [r["spotify_track_uri"] for r in got], ["t:ok", "t:edge"])
+check("...a row too long for the gap is passed over, not fatal",
+      "t:long" in [r["spotify_track_uri"] for r in got], False)
+check("...an already-kept row is not taken twice",
+      "t:kept" in [r["spotify_track_uri"] for r in got], False)
+check("...and every row taken is placed", placed_rows, got)
+check("no spare time takes nothing",
+      running.known_topup(spare, set(), 0, lambda r: r), [])
+
+# --- the durations cache keeps only answers (C12) -----------------------
+# A 503 used to append {duration_ms: null}, which then read as "Spotify knows
+# no length for this track" forever. A failure is not an answer.
+appended = []
+saved_append = running.append_jsonl
+running.append_jsonl = lambda path, rec: appended.append((path.name, rec))
+
+
+class TracksSp:
+    def __init__(self, resp):
+        self.resp, self.calls = resp, []
+    def get(self, path, params=None):
+        self.calls.append(path)
+        return self.resp
+
+
+try:
+    dc = {}
+    sp503 = TracksSp({"_status": 503, "_body": "unavailable"})
+    check("a 503 from /tracks gives no duration",
+          running.track_duration(sp503, "spotify:track:abc", dc), None)
+    check("...and appends nothing", (appended, dc), ([], {}))
+    running.track_duration(sp503, "spotify:track:abc", dc)
+    check("...so the next call asks again", len(sp503.calls), 2)
+    check("no response at all appends nothing either",
+          (running.track_duration(TracksSp(None), "spotify:track:abc", dc),
+           appended), (None, []))
+    sp200 = TracksSp({"id": "abc", "duration_ms": 201_000})
+    check("a 200 gives its duration",
+          running.track_duration(sp200, "spotify:track:abc", dc), 201_000)
+    check("...and is cached with its status",
+          appended, [("track_durations.jsonl",
+                      {"key": "abc", "status": 200, "duration_ms": 201_000})])
+    running.track_duration(sp200, "spotify:track:abc", dc)
+    check("...so it is asked once", len(sp200.calls), 1)
+    # Records written before the status existed: an empty one may have been a
+    # failure, so it is asked ONCE more; one carrying a length never is.
+    appended.clear()
+    legacy = {"old": {"key": "old", "duration_ms": None},
+              "good": {"key": "good", "duration_ms": 150_000}}
+    sp_leg = TracksSp({"id": "old", "duration_ms": 199_000})
+    check("a legacy empty entry is re-asked",
+          running.track_duration(sp_leg, "spotify:track:old", legacy), 199_000)
+    running.track_duration(sp_leg, "spotify:track:old", legacy)
+    check("...once: the new record then wins", len(sp_leg.calls), 1)
+    check("a legacy entry with a length is never re-asked",
+          (running.track_duration(sp_leg, "spotify:track:good", legacy),
+           len(sp_leg.calls)), (150_000, 1))
+finally:
+    running.append_jsonl = saved_append
+
+# --- the borderline listing is in a total order --------------------------
+# ORDER BY best alone left ties to DuckDB's parallel sort, so two runs of the
+# same data could list different artists under the LIMIT.
+bc = duckdb.connect()
+bc.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Zz Tie', 'dubstep', 2, TRUE), ('Zz Tie', 'pop', 1, TRUE),
+  ('Mm Tie', 'dubstep', 2, TRUE), ('Mm Tie', 'pop', 1, TRUE),
+  ('Aa Tie', 'dubstep', 2, TRUE), ('Aa Tie', 'pop', 1, TRUE)
+) t(artist_name, tag, tag_count, is_genre)""")
+running.build_artist_clusters(bc)
+bc.execute("""CREATE TABLE plays (artist_name VARCHAR, played_seconds DOUBLE,
+    month DATE, ms_played_estimated BOOLEAN)""")
+import contextlib, io
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    running.report(bc, [], dry=True)
+lines = [ln.split()[0] for ln in buf.getvalue().splitlines() if " Tie " in ln]
+check("tied borderline artists are listed by name", lines, ["Aa", "Mm", "Zz"])
+
 # --- fill to a duration target -----------------------------------------
 rows = [{"spotify_track_uri": f"u{i}", "duration_ms": 200_000} for i in range(20)]
 filled = running.fill_to_target(rows, 1_000_000)      # exactly 5 fit

@@ -915,6 +915,11 @@ def resolve_pins(con: duckdb.DuckDBPyConnection, pins: list[dict],
     Matched on the full title against plays, so the pin means the pressing the
     listener actually played rather than whichever one Spotify search happens
     to rank first.
+
+    Duration is measured as build_known_pool measures it: the MEDIAN completed
+    export play, failing that a polled ms_played (the whole track). It used to
+    be max(), which the odd over-long play inflated — the garage pins were
+    overcharged 4.8 minutes, and the run came in that much short.
     """
     out = []
     for pin in pins:
@@ -923,14 +928,18 @@ def resolve_pins(con: duckdb.DuckDBPyConnection, pins: list[dict],
         rows = con.execute(
             """
             SELECT spotify_track_uri, any_value(track_name), any_value(artist_name),
-                   max(CASE WHEN reason_end = 'trackdone' THEN ms_played END),
+                   coalesce(
+                       median(CASE WHEN reason_end = 'trackdone'
+                                   THEN ms_played END)
+                           FILTER (WHERE NOT ms_played_estimated),
+                       median(ms_played) FILTER (WHERE ms_played_estimated)),
                    sum(played_seconds) / 3600.0 AS hours
             FROM plays
             WHERE lower(artist_name) = lower(?)
               AND lower(track_name)  = lower(?)
               AND spotify_track_uri IS NOT NULL
             GROUP BY spotify_track_uri
-            ORDER BY hours DESC
+            ORDER BY hours DESC, spotify_track_uri
             LIMIT 1
             """,
             [pin["artist_name"], pin["track_name"]],
@@ -1226,18 +1235,27 @@ def library_discovery(con, sp, http, label: str, tags: list[str],
 def track_duration(sp, uri: str, cache: dict) -> int | None:
     """Duration for a discovery track whose search hit carried none — search
     usually does, so this is the fallback. One request each: the batch /tracks
-    form answers 403 like every other batch endpoint."""
+    form answers 403 like every other batch endpoint.
+
+    Only an ANSWER is cached, with its status. A 503 used to be written as
+    {duration_ms: null}, which then read as "no length known" for good — and
+    an unknown length is charged nothing against the budget. A record from
+    before the status existed that holds no length may be one of those, so it
+    is asked once more; the new record then wins.
+    """
     tid = (uri or "").rsplit(":", 1)[-1]
     if not tid:
         return None
-    if tid in cache:
-        return cache[tid]["duration_ms"]
+    hit = cache.get(tid)
+    if hit and ("status" in hit or hit.get("duration_ms") is not None):
+        return hit["duration_ms"]
     resp = sp.get(f"/tracks/{tid}", params={})
-    dur = resp.get("duration_ms") if isinstance(resp, dict) and "_status" not in resp else None
-    rec = {"key": tid, "duration_ms": dur}
+    if not isinstance(resp, dict) or "_status" in resp:
+        return None
+    rec = {"key": tid, "status": 200, "duration_ms": resp.get("duration_ms")}
     append_jsonl(DURATION_CACHE, rec)
     cache[tid] = rec
-    return dur
+    return rec["duration_ms"]
 
 
 def fill_to_target(rows: list[dict], target_ms: int) -> list[dict]:
@@ -1256,6 +1274,31 @@ def fill_to_target(rows: list[dict], target_ms: int) -> list[dict]:
             continue
         out.append(dict(r, duration_ms=dur))
         used += dur
+    return out
+
+
+def known_topup(rows: list[dict], kept: set[str], spare_ms: int,
+                place) -> list[dict]:
+    """Known tracks for the time discovery could not fill, best first.
+
+    `rows` are the known side's eligible rows in rank order; those already in
+    the playlist (`kept`) are skipped, and so is anything scoring under
+    RUN_TOPUP_MIN_SCORE. Without that floor the gap filled with whatever came
+    next — Matt Sassari's "Give It To Me - Full Vocal Mix" at 0.186 — and the
+    playlist reached its four hours on tracks the listener lets go. The score
+    is the one the rows were ranked on, so a `prefer` member keeps its boost:
+    it is a track the listener chose for running, which is not what the floor
+    is there to keep out. A track with no known length, or too long for what
+    is left, is passed over rather than ending the fill.
+    """
+    out = []
+    for r in rows:
+        if r["spotify_track_uri"] in kept or r["score"] < config.RUN_TOPUP_MIN_SCORE:
+            continue
+        dur = r.get("duration_ms") or 0
+        if dur and dur <= spare_ms:
+            out.append(place(dict(r, duration_ms=dur)))
+            spare_ms -= dur
     return out
 
 
@@ -1549,21 +1592,19 @@ def build_selections(con, http, sp) -> list[dict]:
         # than shipping a short playlist. MusicBrainz barely tags current speed
         # garage, so that cluster's candidate pool is thin through no fault of
         # the listener's — and a known track they already like beats a gap.
+        # But not at any score: known_topup has the floor and why.
         spare_ms = target_ms - sum(k["duration_ms"] for k in known) - got_ms
-        topup = []
-        if spare_ms > 0:
-            for r in picked:
-                if r["spotify_track_uri"] in kept:
-                    continue
-                dur = r.get("duration_ms") or 0
-                if dur and dur <= spare_ms:
-                    topup.append(place(dict(r, duration_ms=dur)))
-                    spare_ms -= dur
-            if topup:
-                print(f"  + {len(topup)} more known tracks to fill the gap "
-                      f"discovery left, "
-                      f"{sum(t['duration_ms'] for t in topup)/60000:.0f} min")
-                known = known + topup
+        topup = known_topup(picked, kept, spare_ms, place) if spare_ms > 0 else []
+        if topup:
+            print(f"  + {len(topup)} more known tracks to fill the gap "
+                  f"discovery left, "
+                  f"{sum(t['duration_ms'] for t in topup)/60000:.0f} min")
+            known = known + topup
+        floored = sum(1 for r in picked if r["spotify_track_uri"] not in kept
+                      and r["score"] < config.RUN_TOPUP_MIN_SCORE)
+        if spare_ms > 0 and floored:
+            print(f"  ({floored} more known tracks score under the "
+                  f"{config.RUN_TOPUP_MIN_SCORE:.2f} top-up floor and stay out)")
 
         tracks = interleave(known, discovery)
         total_ms = sum((t.get("duration_ms") or 0) for t in tracks)
@@ -1691,7 +1732,8 @@ def report(con, selections: list[dict], dry: bool) -> None:
         FROM artist_clusters
         WHERE greatest(coalesce(garage_share, 0), coalesce(bass_share, 0))
               BETWEEN {lo} AND {hi}
-        ORDER BY best DESC LIMIT 15
+        -- The name breaks ties, or the LIMIT picks among them at random.
+        ORDER BY best DESC, artist_name LIMIT 15
         """
     ).fetchall()
     if border:
@@ -1728,6 +1770,10 @@ def report(con, selections: list[dict], dry: bool) -> None:
                   f"{s['library-artist']} library-artist, "
                   f"{s['stranger']} strangers, {sel['n_topup']} known top-up, "
                   f"{sel['short_min']:.0f} min short")
+        if round(sel.get("short_min") or 0) >= 1:
+            print(f"    ! {sel['short_min']:.0f} min short of the "
+                  f"{config.RUN_TARGET_MINUTES}-min target: nothing else fits "
+                  f"that clears the {config.RUN_TOPUP_MIN_SCORE:.2f} top-up floor")
         if sel.get("prefer"):
             p = sel["prefer"]
             print(f"    {' + '.join(p['names'])}: {p['members']} members, "
