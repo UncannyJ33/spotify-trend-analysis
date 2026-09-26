@@ -80,7 +80,8 @@ python3.12 -m venv .venv
 ```
 
 Six dependencies: DuckDB, requests, Plotly, Streamlit, pandas, python-dotenv.
-No API keys are required for anything except the optional Stage 6 poller.
+No API keys are required for the analysis. The Spotify stages — the Stage 6 poller and the
+playlist writers in Stages 8, 9 and 10 — need one free developer app (`SPOTIFY_CLIENT_ID`, no secret).
 
 ## 3. Run it
 
@@ -142,7 +143,7 @@ operation.
 | 9. Consolidate | `python consolidate.py --keep-whole N --filter N` (`--write`) | one new Spotify playlist + `data/consolidate_review.csv` |
 | 10. Running | `python running.py` (`--write`) | 2 Spotify playlists + `data/running_state.json` |
 
-All prefixed with `.venv/bin/`. Stages 2, 5, 6 and 10 use the network; the rest are local.
+All prefixed with `.venv/bin/`. Stages 2, 5, 6, 8, 9 and 10 use the network; the rest are local.
 
 **Bind the dashboard to localhost.** Streamlit listens on every interface by
 default and prints an external URL on your public IP. This page renders your

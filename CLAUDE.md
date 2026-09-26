@@ -38,7 +38,7 @@ Run 1 → 1b → 2 → 3 in order; 4–8 consume Stage 3's output (Stage 8 also 
 Stage 5's and Stage 7's). Stage 9 is independent of the gap analysis — it reads
 playlists a person built and needs only Stage 2's tags. Stage 10 needs 1b and 2 (plus `plays_raw`,
 so a 20-second skip counts as heard) and is likewise independent of the gap analysis — it no longer
-reads Stage 5 at all. Stages 2, 5, 6, 10 touch the network; the rest are local and cheap to re-run.
+reads Stage 5 at all. Stages 2, 5, 6, 8, 9, 10 touch the network; the rest are local and cheap to re-run.
 
 Verification is split. Stages 1–7 are verified mainly by their `report()`, which prints counts,
 coverage and sanity checks to stdout; read it before claiming a stage worked. Tests exist where a
