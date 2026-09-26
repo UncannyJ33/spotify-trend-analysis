@@ -71,7 +71,6 @@ from playlists import (
     ensure_playlist,
     mb_genre_recordings,
     playlist_items,
-    select_candidates,
     sp_artist_tracks,
     write_archive,
 )
@@ -637,11 +636,13 @@ def interleave(known: list[dict], discovery: list[dict]) -> list[dict]:
 
 
 def register_sources(con: duckdb.DuckDBPyConnection) -> None:
+    # No recommendations.parquet: Stage 10 does not read Stage 5. Discovery is
+    # seeded on each cluster's own artists (cluster_candidates), and the old
+    # Stage 5 top-up is gone — see build_selections.
     needed = {
         "plays": config.PLAYS_PARQUET,
         "artist_tags": config.ARTIST_TAGS_PARQUET,
         "track_credits": config.DATA_DIR / "track_credits.parquet",
-        "recommendations": config.RECOMMENDATIONS_PARQUET,
     }
     for name, path in needed.items():
         if not path.exists():
@@ -717,25 +718,16 @@ def build_selections(con, http, sp) -> list[dict]:
               f"({sum(1 for k in known if k.get('pinned'))} pinned), "
               f"{sum(k['duration_ms'] for k in known)/60000:.0f} min")
 
-        # Cluster-seeded candidates first; Stage 5's library-wide list is the
-        # top-up when ListenBrainz is thin. Both must clear the same intensity
-        # bar a library artist clears.
+        # Strangers come only from this cluster's own neighbourhood. There is
+        # deliberately no Stage 5 top-up any more: once the seed and share fixes
+        # landed, its only garage contribution was Basement Jaxx — the very
+        # miss cluster seeding was built to fix — and every dubstep act it
+        # passed was already seeded. A thin cluster is answered by known
+        # tracks below, not by a library-wide list judged on one shared tag.
         candidates = cluster_candidates(con, http, label, tag_cache,
                                         sim_cache, vocab, vetoes)
-        seeded = len(candidates)
-        have = {c["mbid"] for c in candidates}
-        for c in select_candidates(con, tags, tag_cache):
-            if c["mbid"] in have:
-                continue
-            cl, share = classify_tags(
-                (tag_cache.get(c["mbid"]) or {}).get("tags", []),
-                min_weight=config.RUN_MIN_CANDIDATE_CLUSTER_WEIGHT,
-                min_share=config.RUN_MIN_CANDIDATE_SHARE)
-            if cl == label:
-                candidates.append(dict(c, share=share))
         print(f"  {len(candidates)} candidates clear the "
-              f"{config.RUN_MIN_CANDIDATE_SHARE:.2f} stranger bar "
-              f"({seeded} from your own artists' neighbours)")
+              f"{config.RUN_MIN_CANDIDATE_SHARE:.2f} stranger bar")
 
         discovery: list[dict] = []
         budget_ms = target_ms - sum(k["duration_ms"] for k in known)

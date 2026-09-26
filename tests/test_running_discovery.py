@@ -225,6 +225,32 @@ cands = running.cluster_candidates(con, http, "dubstep", tag_cache, sim_cache,
 check("a 0.77 stranger is refused", "n-rp-0" in {c["mbid"] for c in cands},
       False)
 
+# --- Stage 10 no longer reads Stage 5 -----------------------------------
+# The Stage 5 top-up's only garage contribution after the fixes above was
+# Basement Jaxx — the failure cluster seeding was built to fix — and every
+# dubstep passer was already seeded. It is gone, and so is the dependency: a
+# data directory with no recommendations.parquet must be enough.
+for view in ("plays", "artist_tags", "track_credits"):
+    con.execute(f"COPY (SELECT * FROM {view}) TO "
+                f"'{config.DATA_DIR / (view + '.parquet')}' (FORMAT PARQUET)")
+check("the scratch data dir really lacks recommendations.parquet",
+      config.RECOMMENDATIONS_PARQUET.exists(), False)
+fresh_con = duckdb.connect()
+try:
+    running.register_sources(fresh_con)
+    raised = None
+except SystemExit as e:
+    raised = str(e)
+check("register_sources needs no recommendations.parquet", raised, None)
+views = {r[0] for r in fresh_con.execute(
+    "SELECT view_name FROM duckdb_views() WHERE NOT internal").fetchall()}
+check("...registers what it does need",
+      {"plays", "artist_tags", "track_credits"} <= views, True)
+check("...and does not register recommendations", "recommendations" in views,
+      False)
+check("select_candidates is no longer imported",
+      hasattr(running, "select_candidates"), False)
+
 shutil.rmtree(_TMP, ignore_errors=True)
 if failures:
     print(f"{len(failures)} FAILURE(S)")
