@@ -219,14 +219,22 @@ def build_tag_trends(con: duckdb.DuckDBPyConnection) -> None:
                     AS month_idx
             FROM dense
         ),
+        -- An empty month's smoothed share is NULL too. avg() over the window
+        -- would otherwise carry the previous months' shares into it: plays in
+        -- Jan–Apr then Jul–Aug (tests/test_trend_horizon.py) gave house a
+        -- smoothed 0.625 in May and 0.5 in June, months with no listening at
+        -- all. Both points entered the slope and the mean_recent_share gate
+        -- below, and the dashboard drew a smoothed line through the hole. The
+        -- window still reads the raw shares, so the month after a gap averages
+        -- only the months that had plays.
         smoothed AS (
             SELECT
                 *,
-                avg(share) OVER (
+                CASE WHEN share IS NULL THEN NULL ELSE avg(share) OVER (
                     PARTITION BY variant, tag ORDER BY month
                     ROWS BETWEEN {config.ROLLING_WINDOW_MONTHS - 1} PRECEDING
                              AND CURRENT ROW
-                ) AS smoothed_share
+                ) END AS smoothed_share
             FROM shared
         ),
         -- Trailing-window slope, one value per tag, measured on the smoothed

@@ -146,10 +146,61 @@ check("January's share", house["2026-01-01"][0], 0.75)
 check("March's share", house["2026-03-01"][0], 0.5)
 check("March's smoothed share averages January and March only",
       close(house["2026-03-01"][1], (0.75 + 0.5) / 2), True)
-# Points (0, .75), (1, .75), (2, .625): slope = (sM - sJ) / 4. Treating March
-# as the month after January — the dense_rank bug — gives (sM - sJ) / 2.
+# Points (0, .75), (2, .625) — February has no smoothed share either (case 3):
+# slope = (sM - sJ) / 4. Treating March as the month after January — the
+# dense_rank bug — gives (sM - sJ) / 2.
 check("the slope measures a two-month gap, not one",
       close(house["2026-03-01"][2], (0.5 - 0.75) / 4), True)
+
+# --------------------------------------------------------------------------
+# 3. Export plays Jan–Apr and Jul–Aug: a two-month hole. The rolling mean must
+#    not carry April into May and June — a smoothed value for a month with no
+#    listening is a made-up point, and it would enter the slope and the
+#    mean_recent_share gate and draw listening on the dashboard where there
+#    was none. Case 2 cannot see this: with one empty month between two
+#    points the slope is (sM - sJ) / 4 either way.
+# --------------------------------------------------------------------------
+# (house plays, dubstep plays) per month; house share = a / (a + b).
+MIX = {"2026-01": (1, 3), "2026-02": (2, 2), "2026-03": (3, 1),
+       "2026-04": (1, 1), "2026-07": (3, 1), "2026-08": (1, 3)}
+rows = []
+for month, (a, b) in MIX.items():
+    rows += [play(f"{month}-{d:02d} 12:00", "uri:a", "Alpha") for d in range(1, a + 1)]
+    rows += [play(f"{month}-{d:02d} 13:00", "uri:b", "Beta") for d in range(1, b + 1)]
+con = run(rows)
+house = {r[0].isoformat()[:7]: r[1:] for r in con.execute(
+    "SELECT month, share, smoothed_share, slope, mean_recent_share "
+    "FROM tag_trends WHERE variant = ? AND tag = 'house' ORDER BY month",
+    [V]).fetchall()}
+
+check("May and June exist as rows", "2026-05" in house and "2026-06" in house, True)
+check("May's smoothed share is NULL", house["2026-05"][1], None)
+check("June's smoothed share is NULL", house["2026-06"][1], None)
+
+# Expected series, built independently: calendar index, a trailing mean over
+# the months that had listening, and no point at all for the months that did not.
+order = ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06",
+         "2026-07", "2026-08"]
+share = [MIX[m][0] / sum(MIX[m]) if m in MIX else None for m in order]
+W = config.ROLLING_WINDOW_MONTHS
+pts = []
+for i, s in enumerate(share):
+    if s is None:
+        continue
+    win = [x for x in share[max(0, i - W + 1): i + 1] if x is not None]
+    pts.append((i, sum(win) / len(win)))
+pts = [(x, y) for x, y in pts if x > len(order) - 1 - config.SLOPE_WINDOW_MONTHS]
+mx = sum(x for x, _ in pts) / len(pts)
+my = sum(y for _, y in pts) / len(pts)
+want_slope = (sum((x - mx) * (y - my) for x, y in pts)
+              / sum((x - mx) ** 2 for x, _ in pts))
+
+check("July's smoothed share averages July alone (May, June empty)",
+      close(house["2026-07"][1], 0.75), True)
+check("the slope skips the empty months",
+      close(house["2026-08"][2], want_slope, tol=1e-9), True)
+check("mean_recent_share skips the empty months",
+      close(house["2026-08"][3], my, tol=1e-9), True)
 
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)
