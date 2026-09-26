@@ -100,10 +100,10 @@ re-run picks up exactly where it stopped, and later re-runs only spend requests
 on artists they've never seen. You can also cap a session with `--limit 200`.
 
 Every stage prints a report when it finishes — row counts, coverage, what got
-dropped and why. Read it. That output is how you know a stage worked; for these
-pipeline stages there's no test suite standing between you and a silently wrong
-number. The stages that write to Spotify do have one — see
-[the tests](#the-tests).
+dropped and why. Read it. That output is how you know a stage worked; for most of
+these pipeline stages nothing else stands between you and a silently wrong
+number. The stages that write to Spotify, and a few pipeline invariants no report
+can see, do have tests — see [the tests](#the-tests).
 
 Then the optional extras:
 
@@ -252,6 +252,13 @@ The regex only catches features named in the *title*; features living solely in
 Spotify's track metadata stay invisible to it. Run `credits.py --review` to
 eyeball what it extracted.
 
+Splitting a credit list on `,` `&` `and` is how "Tyler, The Creator" became two
+performers who do not exist. Any name the library already knows — as an album
+artist or from the poller — that a separator would cut is lifted out whole
+before the split. A capital ` X ` is not a separator (it turned "X Ambassadors"
+into an unrelated act called "Ambassadors"), and an inner `ft.` is: "(with 21
+Savage ft. Project Pat)" is two people.
+
 That guesswork is superseded wherever real data exists. If you run the
 [Stage 6 poller](#stage-6--history-poller), every track it sees contributes its
 true performer list, which replaces the parsed credits for all plays of that
@@ -303,12 +310,17 @@ hand an answer back. Copy `artist_overrides.example.csv` to
 ```csv
 artist_name,mbid,note
 Dave,<mbid>,UK rapper not Dave Matthews Band
-21 Savage ft. Project Pat,IGNORE,unsplit feature string
+Various Artists,IGNORE,compilation placeholder
+Some Act,NONE,was matching a different artist; no correct entry exists
 ```
 
 An MBID pins that name to that artist and skips the search entirely. `IGNORE`
 marks a name that is not an artist at all — regex artifacts and compilation
-placeholders — so it stops surfacing on every future run. Run `enrich.py
+placeholders — so it stops surfacing on every future run. `NONE` marks a real
+artist MusicBrainz has no entry for: whatever the search matched is thrown away,
+which matters because a wrong match's MBID is what seeds ListenBrainz. A blank
+`mbid` with genres in the `tags` column cannot do that; it leaves resolution
+alone. Run `enrich.py
 --report` first: it ranks the review list by listening time, and only the top
 few are worth a lookup. Overrides always win over the cache, take effect on the
 next run, and deleting a row un-pins the artist and sends it back through normal
@@ -333,6 +345,20 @@ artist's share splits across their genres by MusicBrainz vote count, capped at 8
 
 The cap matters. Ye carries 58 tags; splitting evenly would give each 1/58 while a
 two-tag artist gives each a half, systematically burying well-tagged artists.
+
+Neither split may create or lose time, and because shares are ratios, time lost
+evenly would move no chart at all. So the stage measures credited seconds going
+in and attributed seconds coming out, per variant, and refuses to write if they
+differ. It caught a real loss: plays sharing a timestamp and track were each
+being given half their time.
+
+**The trends stop at the export's last month.** Polled plays past it (Stage 6)
+are provisional, and 50 of them made a one-day September that became the
+highest-leverage point in every 12-month slope and flipped 10 of 11 trend
+classes. The month axis is the calendar, so a month with no listening has no
+share rather than a zero one, and never makes the months either side neighbours.
+The stage runs single-threaded so re-runs are byte-identical: parallel float sums
+add in whatever order the threads finish.
 
 Trend classification gates on absolute size before computing relative change.
 Without that floor a genre sitting at a fraction of a percent posts "+540% a year"
@@ -398,7 +424,10 @@ than hidden:
   comes back full — the signal that older plays fell off before it arrived.
 
 When a real export later covers the same period, it supersedes every polled row
-in that window, replacing the estimates with true durations.
+in that window, replacing the estimates with true durations. Until then polled
+plays stay out of the trends: Stage 3 stops at the export's last month, because a
+month the poller has covered for a day is not a month of listening. They still
+repair credits (below) and still count as listening time in Stage 10.
 
 Auth is Authorization Code with PKCE, so no client secret is used. **This is the
 one thing that needs a Spotify developer app**: create one at
@@ -590,10 +619,13 @@ python running.py            # dry run: prints both playlists, writes nothing
 python running.py --write    # build/refresh them
 ```
 
-Two playlists for running, filled to `RUN_TARGET_MINUTES` (240) by *duration*
-rather than by a track count — Spotify returns `duration_ms` on every item, so
-there is no reason to approximate. Roughly 60% from your own history, 40%
-discovery.
+Two playlists for running — **garage & house run · Claude** (steady 4x4 for
+distance) and **dubstep run · Claude** (drop-driven bass for intervals) — filled
+to `RUN_TARGET_MINUTES` (240) by *duration* rather than by a track count. About
+60% of the time goes to your own history (`RUN_KNOWN_FRACTION`) and the rest to
+music you have never started, or more of your own when that runs short. It
+needs Stages 1b and 2 and nothing from Stage 5: discovery is seeded on each
+cluster's own artists.
 
 **Length is set against repetition, not against the run.** A playlist sized to
 the run is a playlist heard end to end every time; at 30–45 minutes a session,
@@ -610,6 +642,8 @@ end. Invisible at 33 tracks; at four hours on a 40-minute run it means the
 discovery half is never reached, which is precisely the problem the length is
 meant to solve. `interleave()` takes from whichever pool has consumed less of
 itself instead, so 45 known against 30 discovery stays roughly 3:2 throughout.
+The author plays these on shuffle, so order is otherwise not tuned — no fixed
+openers, no rotation — but the proportional property is cheap and a test pins it.
 
 **There is no BPM, and BPM would be the wrong signal anyway.** Spotify's
 `/audio-features` and `/audio-analysis` both answer 403 since the February 2026
@@ -631,9 +665,36 @@ asymmetry is deliberate. A stranger with one `tech house` vote and no drag tags
 scores a perfect 1.00 on the ratio alone — that is how Boys Noize and Mr. Oizo
 were first offered as speed garage. Candidates must clear an absolute weight
 too, waived for *narrow* tags where a single vote means something (`bass house`
-does, `tech house` does not). An artist you have played for 36 hours has earned
-the benefit of a thin tag vector; a stranger has not, and a wrong discovery
-track is the expensive mistake because it lands mid-run.
+does, `tech house` does not). The share bar is higher too: 0.85 for a stranger
+(`RUN_MIN_CANDIDATE_SHARE`) against 0.60 for your own artists. At 0.60 Netsky got
+in on drum and bass 10 against liquid funk 3; at 0.85 Pendulum, Bassnectar and
+NERO still clear it. An artist you have played for 36 hours has earned the
+benefit of a thin tag vector; a stranger has not, and a wrong discovery track is
+the expensive mistake because it lands mid-run.
+
+**Then every discovery pick is judged as a track.** Clearing the bar says the
+artist belongs, not that a given record of theirs does — Spotify's relevance page
+for MJ Cole led with Tion Wayne's rap single. Each pick is read against Spotify's
+own credit list and refused if it is live, runs over 4.5 minutes
+(`RUN_MAX_DISCOVERY_MS`; your own tracks are exempt), credits a vetoed artist, is
+something you have already started (a 20-second skip counts), or is led or
+remixed by a pop, rap or melodic act. Featured vocalists are not drag-tested: a
+singer's hand tag must not refuse a record you would keep.
+
+**New music comes from your own artists first.** One discovery budget, filled in
+this order:
+
+1. acts you name by hand (`discover` rows);
+2. tracks you have never started by your own cluster artists, one each, up to a
+   quarter of the budget (`RUN_LIBRARY_DISCOVERY_FRACTION`);
+3. strangers from the cluster's ListenBrainz neighbourhood;
+4. more of your own artists' unstarted tracks, into whatever strangers left;
+5. more of your known tracks — only those scoring at least `RUN_TOPUP_MIN_SCORE`.
+
+When new music runs short the playlist fills with more of what you already play,
+and a weak stranger is never kept just to hold the quota. Because of that floor a
+playlist can come in under four hours; the report prints by how much, since a few
+minutes short beats minutes of what you skip.
 
 Tags are per *artist*, which this stage cannot fix — per-track MBID resolution
 is the explosion the project has twice declined. What ranks individual tracks is
@@ -648,39 +709,69 @@ is visible to a genre tag. `RUN_LIVE_TITLE_RE` matches structurally rather than
 as a substring — a bare `live` would take Zeds Dead's and Dustycloud's `Alive`,
 both of which are in these playlists and both of which belong.
 
-`running_overrides.csv` takes pins and vetoes. Pins match the **full** title,
-unfolded: this library holds both Insania's `iloveitiloveitiloveit - Garage`
-(23 plays) and Bella Kay's `iloveitiloveitiloveit` (4 plays), and dedupe folds
-them together.
+`running_overrides.csv` takes four kinds of row (the tracked
+`running_overrides.example.csv` documents each):
+
+- **`keep`** pins a track in. Pins match the **full** title, unfolded: this
+  library holds both Insania's `iloveitiloveitiloveit - Garage` (23 plays) and
+  Bella Kay's `iloveitiloveitiloveit` (4 plays), and dedupe folds them together.
+- **`drop`** vetoes a track, or every track by an artist when `track_name` is
+  blank. A veto matches **every credit** on the record, features and remixers
+  included. For new music the credits are Spotify's own; for your own tracks they
+  are what the export, Stage 1b's title parsing and the poller know, so a
+  collaborator absent from all three stays invisible to a veto until the poller
+  has seen the track.
+- **`discover`** names an act MusicBrainz never tagged, for one named playlist.
+  Its tracks are offered ahead of every other discovery source and still face the
+  track gate.
+- **`prefer`** names a playlist you built by hand for running. Its members'
+  scores are multiplied by 1.25 (`RUN_PREFER_MARGIN`) — a near-tie breaker, not a
+  pin: a vetoed member is still vetoed.
 
 **Vetoing one track promotes the next one by the same artist** — the per-artist
-count is a cap, so a freed slot gets refilled from the same catalogue. Dropping
-SLANDER's `Superhuman` produced *three* SLANDER tracks where there had been two.
-If the artist is the problem rather than the track, veto the artist (blank
-`track_name`), and pin any single track you want to survive it: pins resolve
-before the veto filter, so the more specific statement wins.
+count is a cap, applied after the veto, live and duplicate filters, so a freed
+slot gets refilled from the same catalogue. Dropping SLANDER's `Superhuman`
+produced *three* SLANDER tracks where there had been two. If the artist is the
+problem rather than the track, veto the artist (blank `track_name`), and pin any
+single track you want to survive it: pins resolve before the veto filter, so the
+more specific statement wins.
+
+**A cluster's label is its identity; its title is only display.** The garage run
+was renamed "garage & house" on 2026-09-26, because tech house and John Summit
+stay in it. State, the archive and override rows are keyed on the label
+(`speed garage`), so nothing moved, and the override file's `playlist` column
+accepts either spelling. The next `--write` renames the existing playlist in
+place — same ID, same URL, same followers.
 
 Every Stage 8 safety rule is inherited — never deletes, never unfollows, writes
-only to IDs in `data/running_state.json` or an exact name match, and snapshots
-whatever it overwrites into `data/playlists.parquet` first.
+only to IDs in `data/running_state.json` or an exact name match (the current
+name, or failing that an exact former one from `RUN_PLAYLIST_LEGACY_NAMES`), and
+snapshots whatever it overwrites into `data/playlists.parquet` first.
 
 ### The tests
 
-The analysis pipeline, Stages 1–7, has none — every stage prints its report,
-and that output is the verification surface. The stages that write to your
-Spotify account are held to a higher bar, because their reports genuinely
-cannot catch the failures that matter: a filter that drops the right *number*
-of tracks while dropping the wrong ones looks identical in a count.
+The analysis pipeline, Stages 1–7, is verified mainly by its reports — every
+stage prints one, and that output is the verification surface. The stages that
+write to your Spotify account are held to a higher bar, because their reports
+genuinely cannot catch the failures that matter: a filter that drops the right
+*number* of tracks while dropping the wrong ones looks identical in a count. So
+are the few pipeline invariants a report cannot see, such as time lost evenly,
+which moves no share.
 
-`tests/` pins that logic instead — Stage 8's selection and within-artist track
-choice, Stage 9's scoring (above all Daft Punk and Kendrick Lamar, the two real
-artists that break the naive genre rules), Stage 10's intensity classification
-(ILLENIUM, who an include-list admits and a share test refuses) and its remixer
-parsing (`Radio Edit` must never become an artist called "Radio"), the
-never-delete guarantee, each of the override files, and the scope arithmetic on
-the shared Spotify token. They
-are plain scripts, no pytest, and touch no network — Spotify is a fake and the
-tag tables are synthetic. Run them from the repo root:
+`tests/` pins that logic instead, in 17 files — Stage 8's selection and
+within-artist track choice, Stage 9's scoring (above all Daft Punk and Kendrick
+Lamar, the two real artists that break the naive genre rules), Stage 10's
+intensity classification (ILLENIUM, who an include-list admits and a share test
+refuses), its remixer parsing (`Radio Edit` must never become an artist called
+"Radio"), its discovery seeds, track gate and supply order, the never-delete
+guarantee and the rename alias, each of the override files, and the scope
+arithmetic on the shared Spotify token. On the pipeline side:
+`test_credit_names.py` (names Stage 1b must not cut), `test_override_cache.py`
+(a pinned override costs requests once), `test_trend_horizon.py` (Stage 3 stops
+at the export), `test_time_conservation.py`, `test_seed_weights.py` (Stage 5
+seeds on recent time) and `test_recommend_cache.py` (caches hold answers, never
+failures). They are plain scripts, no pytest, and touch no network — Spotify is a
+fake and the tag tables are synthetic. Run them from the repo root:
 
 ```bash
 for t in tests/test_*.py; do .venv/bin/python "$t" || break; done
@@ -706,9 +797,17 @@ what it is. The ones worth touching:
 | `PLAYLIST_SIZE` | 25 | Tracks per playlist, anchors included |
 | `ANCHOR_TRACKS` | 5 | How many of those are your own familiar tracks |
 | `TRACKS_PER_ARTIST` | 2 | Stops one act owning a playlist |
+| `RUN_TARGET_MINUTES` | 240 | Length of each running playlist |
+| `RUN_KNOWN_FRACTION` | 0.6 | Share of that time from your own history |
+| `RUN_MIN_CANDIDATE_SHARE` | 0.85 | How purely on-genre a stranger must be |
+| `RUN_MAX_DISCOVERY_MS` | 270,000 | Longest new track allowed (4.5 min) |
+| `RUN_LIBRARY_DISCOVERY_FRACTION` | 0.25 | Discovery budget your own artists take before strangers |
+| `RUN_TOPUP_MIN_SCORE` | 0.20 | Floor for known tracks filling a discovery shortfall |
+| `RUN_PREFER_MARGIN` | 0.25 | Boost for members of a `prefer` playlist |
 
-Change one, re-run `analyze.py`, re-run `report.py`. Stage 2's cache is untouched
-by any of this, so you never pay the enrichment cost twice.
+Change one and re-run the stage it belongs to (`analyze.py` then `report.py` for
+the trends, `running.py` for the `RUN_*` ones). Stage 2's cache is untouched by
+any of this, so you never pay the enrichment cost twice.
 
 ## Troubleshooting
 
@@ -750,8 +849,8 @@ credited alongside them on an album you actually played. Pin the right MBID in
 **Streamlit prints an external URL on your public IP.** You dropped
 `--server.address 127.0.0.1`.
 
-**The poller says `SPOTIFY_CLIENT_ID missing`.** See Stage 6 above — that stage
-and Stage 8 are the only two that need a developer app, and they share one.
+**The poller says `SPOTIFY_CLIENT_ID missing`.** See Stage 6 above — Stages 6,
+8, 9 and 10 are the only ones that need a developer app, and they share one.
 
 **Stage 8 says Spotify refused a playlist call with 403.** Check the endpoint
 path before the permissions. Spotify's pre-February-2026 playlist paths
@@ -776,6 +875,10 @@ working afterwards.
   `plays`, but in practice all are short snippets the 30-second floor removes.
 - Genre tags are crowd-sourced from MusicBrainz. They're inconsistent at the
   edges, and an artist nobody bothered to tag contributes nothing.
+- Polled months are provisional until the next export covers them: estimated
+  durations, no skip data, and a 50-item page that can drop plays. The trends
+  stop at the export's last month, and the headline counts polled plays
+  separately.
 
 ## License
 

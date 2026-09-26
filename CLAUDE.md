@@ -36,15 +36,17 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 Run 1 → 1b → 2 → 3 in order; 4–8 consume Stage 3's output (Stage 8 also needs
 Stage 5's and Stage 7's). Stage 9 is independent of the gap analysis — it reads
-playlists a person built and needs only Stage 2's tags. Stage 10 needs 1b, 2 and
-5, and is likewise independent of the gap analysis. Stages 2, 5, 6, 10 touch the network; the rest
-are local and cheap to re-run.
+playlists a person built and needs only Stage 2's tags. Stage 10 needs 1b and 2 (plus `plays_raw`,
+so a 20-second skip counts as heard) and is likewise independent of the gap analysis — it no longer
+reads Stage 5 at all. Stages 2, 5, 6, 10 touch the network; the rest are local and cheap to re-run.
 
-Verification is split. Stages 1–7 have no tests — each ends in a `report()` that prints counts,
-coverage and sanity checks to stdout, and that output is the verification surface; read it before
-claiming a stage worked. The Spotify-writing stages and the override/auth plumbing *do* have tests:
-standalone scripts in `tests/`, no pytest, all offline (fakes and synthetic DuckDB tables, never the
-network). Run them from the repo root — they `sys.path.insert(0, ".")` and fail from anywhere else:
+Verification is split. Stages 1–7 are verified mainly by their `report()`, which prints counts,
+coverage and sanity checks to stdout; read it before claiming a stage worked. Tests exist where a
+report cannot see the failure: the Spotify-writing stages, the override/auth plumbing, and targeted
+Stage 1b/2/3/5 cases (credit names, override cache, the export horizon, time conservation, seed
+weights, answer-only caches). They are standalone scripts in `tests/`, no pytest, all offline (fakes
+and synthetic DuckDB tables, never the network). Run them from the repo root — they
+`sys.path.insert(0, ".")` and fail from anywhere else:
 
 ```bash
 for t in tests/test_*.py; do .venv/bin/python "$t" || break; done   # each exits 1 on failure
@@ -58,8 +60,12 @@ fail silently — no listening time created or lost, no double-counted performer
 ## Architecture
 
 **Scripts, not a library.** Each stage is a standalone module with `main()`, argparse flags, and a
-`report()`. Nothing imports another stage except `recommend.py`, which reuses `enrich.py`'s
-`Throttled`, `normalise` and `load_genre_vocabulary` rather than growing a second copy.
+`report()`. Stages import each other only to reuse, never to copy: `recommend` ← `enrich`;
+`forecast` ← `analyze`; `playlists` ← `enrich`, `recommend`, `report`, `poll`; `consolidate` ←
+`enrich`, `playlists`, `poll`; `running` ← `consolidate`, `credits` (the remix regex and its guards),
+`enrich`, `playlists`, `recommend`, `report`; `app` ← `recommend` (the λ dial). A second copy is how
+two definitions of one idea drift apart — `running.register_song_key` registers
+`playlists._title_key` itself as a DuckDB function rather than re-spelling it in SQL.
 
 **`config.py` is the only place paths and tuning constants are defined.** Every stage imports it.
 Paths are overridable via same-named environment variables (`SPOTIFY_EXPORT_DIR`, `SPOTIFY_DATA_DIR`,
@@ -85,12 +91,15 @@ figure and taking `mode="light"|"dark"`. `app.py` and `report.py` both import it
 code in either renderer.
 
 **Five places accept a human answer, and all are files rather than code.** `artist_overrides.csv`
-answers Stage 2's review list (name → MBID, or `IGNORE` for things that were never artists);
-`playlist_overrides.csv` answers Stage 8's "which genres deserve a playlist";
-`consolidate_overrides.csv` answers Stage 9's review list (`data/consolidate_review.csv` is machine
-output, regenerated every run — copy a row across, fill in `keep` or `drop`, and it stops coming
-back); `running_overrides.csv` carries Stage 10's pins and vetoes;
-`.env` carries `SPOTIFY_CLIENT_ID` for the poller and Stage 8. All are gitignored with a
+answers Stage 2's review list (name → MBID, `IGNORE` for things that were never artists, `NONE`
+for a real artist MusicBrainz lacks); `playlist_overrides.csv` answers Stage 8's "which genres
+deserve a playlist"; `consolidate_overrides.csv` answers Stage 9's review list
+(`data/consolidate_review.csv` is machine output, regenerated every run — copy a row across, fill in
+`keep` or `drop`, and it stops coming back); `running_overrides.csv` carries Stage 10's pins,
+vetoes, `discover` rows (a scene act MusicBrainz never tagged, offered as new music in the one
+playlist the row names) and `prefer` rows (a hand-built playlist whose members get a
+`RUN_PREFER_MARGIN` near-tie boost — not a pin, and a veto still wins);
+`.env` carries `SPOTIFY_CLIENT_ID` for the Spotify stages (6, 8, 9, 10). All are gitignored with a
 tracked `*.example.*` alongside documenting the format. When adding another, follow that pattern rather than introducing
 a config format.
 
@@ -108,31 +117,61 @@ correct.
 
 ## Invariants that break quietly if violated
 
-- **Total sort order on every Parquet write.** All writes go through `ORDER BY ALL`
-  (`ingest.write_parquet`, `analyze.write_outputs`). A partial sort key leaves ties for DuckDB's
-  parallel sort to break arbitrarily and byte-identical re-runs silently stop holding.
+- **Total sort order on every Parquet write, and one thread for float sums.** Writes go through
+  `ORDER BY ALL` (`ingest.write_parquet`, `analyze.write_outputs`) or a key unique per row where
+  reading order matters (`recommend`'s `score DESC, mbid`, Stage 2's review list on hours then name).
+  A partial sort key leaves ties for DuckDB's parallel sort to break arbitrarily and byte-identical
+  re-runs silently stop holding. `ORDER BY ALL` fixes rows, not bits: parallel aggregates add floats
+  in whatever order the threads finish, and two identical Stage 3 runs differed in 70,638 of 89,080
+  rows by up to 4.4e-16. Stages 1b, 3 and 7 run `SET threads = 1`; it costs seconds.
 - **Colour is anchored to the global genre ranking.** `figures.build_color_map(ranked_tags, mode,
   display_tags=...)` must receive the ranking over the *whole* dataset as `ranked_tags` and the
   currently-visible subset as `display_tags`. Passing the filtered list as `ranked_tags` repaints
   every remaining genre whenever one is filtered out.
-- **Network stages are resumable via append-only JSONL in `.cache/`,** fsynced per record. A
-  quarterly re-run must only spend requests on artists it has never seen. Do not add a step that
-  rebuilds a cache from scratch.
+- **Network caches are append-only JSONL in `.cache/`, fsynced per record, and hold only real
+  answers.** A quarterly re-run must only spend requests on keys it has never seen; do not add a step
+  that rebuilds a cache from scratch. A real answer is an HTTP 200, stamped `"status": 200` — an
+  empty 200 ("nobody is similar", "untagged", "Spotify does not carry them") is as final as a full
+  one. A 503, 429, error envelope or unreadable body is not an answer and is not written, so the next
+  run asks again: writing failures froze ~30 of 150 Stage 5 seeds as having no neighbours, and one 503
+  on a backfill would have left REAPER genreless for good. A legacy record with an empty list and no
+  status may have been a failure, so it is re-asked once and the new record wins on reload
+  (`recommend.cached_answer`, Stage 8's search cache, Stage 10's durations). Stage 2's release-group
+  backfill and Stage 9's release-group lookups likewise cache nothing on a failed request.
 - **MusicBrainz throttling.** `MB_MIN_INTERVAL = 1.1s` with a descriptive User-Agent, and a floored
   backoff on 503 — MusicBrainz sends `Retry-After: 0`, so trusting it means no backoff at all.
 - **Non-finite values are refused, not written.** `analyze.assert_no_nan` raises before
   `write_outputs`. MusicBrainz tag counts go negative on downvotes; they are clamped at 0 in
   `build_tag_weights` because an artist tagged `[-1, -1]` sums to zero and the resulting NaN spreads
   through three months of the rolling mean.
-- **Weights are normalised twice and neither creates nor destroys listening time.** Credit weight
-  partitions by the *play's identity* (`variant, ts, spotify_track_uri`) — partitioning by artist
-  hands every performer a full 1.0 and multiplies total time by the credit-list size.
+- **Weights are normalised twice and neither creates nor destroys listening time — enforced.**
+  Credit weight partitions by the play's ROW (`row_number()` as `play_id` in
+  `analyze.build_credit_weights`), not by `(ts, spotify_track_uri)`: 97 plays share that pair with a
+  different play (ingest dedupes on every content column, and these differ in `ms_played`), and the
+  old partition gave each half weight, losing 4.26 h. Partitioning by artist would hand every
+  performer a full 1.0 and multiply time by the credit-list size. A play with no album-artist credit
+  splits evenly under `album_artist_only` rather than vanishing as 0/0. `assert_time_conserved`
+  compares credited seconds in (measured from `plays`, never from the weights) with seconds out, per
+  variant, and refuses to write — shares are ratios, so time lost evenly moves no chart and only this
+  catches it. `recommend.build_seeds` splits a play the same way.
 - **Trend classification gates on absolute size before relative change** (`MIN_SHARE_FOR_TREND`), or
   a genre at a fraction of a percent posts "+540%/yr" off a 0.3pp move and swamps the rankings.
-- **Poller reconciliation is a coverage cut, not a dedup.** `ingest.merge_polled` keeps polled rows
-  only where `ts > max(export ts)`; the export is authoritative for everything it covers and
-  retroactively replaces the poller's estimated `ms_played`. Matching on `(ts, track)` instead would
-  leave stragglers whose timestamps drifted by a second.
+- **Poller reconciliation is a coverage cut, not a dedup — in rows and in time.** `ingest.merge_polled`
+  keeps polled rows only where `ts > max(export ts)`; the export is authoritative for everything it
+  covers and retroactively replaces the poller's estimated `ms_played`. Matching on `(ts, track)`
+  instead would leave stragglers whose timestamps drifted by a second. The same cut applies to time:
+  `config.ANALYSIS_HORIZON_SQL` is the export's last month, and every "last N months" window (Stage 5
+  seeds, Stage 8 anchors, Stage 10's known pool) anchors on it, never on `max(month) FROM plays`.
+  Stage 3 reads export rows only (`analyze.EXPORT_ONLY`), and the report and dashboard headlines count
+  polled plays separately. 50 polled plays made a one-day September that became the
+  highest-leverage point in every 12-month slope and flipped 10 of 11 trend classes. Polled rows
+  still repair credits and count as Stage 10 hours, but are never completion evidence: a NULL
+  `reason_end` reads as a skip, and it pulled Rain off its 0.846.
+- **Stage 3's month axis is the calendar.** The grid comes from `generate_series(min, max)`, not
+  `DISTINCT month`, and `month_idx` is calendar months since the first. An empty month is a row with
+  a NULL share and a NULL smoothed share, which `avg` and `regr_slope` skip — neither read as zero
+  listening in every genre, nor carried forward from the months before, nor collapsed so that the
+  months either side become neighbours.
 - **Credit repair is keyed on track URI, not on the play.** `credits.build_track_credits` takes
   `max(track_artists)` per URI, so one polled sighting fixes every play of that track including
   export rows years older. This is deliberate and has a cost: credits depend on poll state as well as
@@ -141,6 +180,17 @@ correct.
 - **`track_artists` is joined on `0x1f`, never a printable delimiter.** `", "` splits
   "Tyler, The Creator" into two artists who do not exist; every printable separator eventually
   collides with a real name ("AC/DC", "Simon & Garfunkel"). `poll.ARTIST_SEP` is the one definition.
+  Stage 10's credited lists are DuckDB `LIST`s and JSON arrays for the same reason.
+- **The title regex must not cut a name the library knows.** `credits.build_protected_names` takes
+  every album-artist and poller name `SPLIT_RE` would split ("Tyler, The Creator", "Chase & Status",
+  "Tones And I") and lifts it out of a `feat.` blob whole, in the library's spelling, before the
+  rest is split — Tyler alone had become four performers who do not exist. A name the library has
+  never seen is still split. `SPLIT_RE` also splits on an inner `feat.`/`ft.` ("21 Savage ft.
+  Project Pat" was one performer holding 5 h), and a capital ` X ` is NOT a separator: it cut
+  "Ty Dolla $ign feat. X Ambassadors" and "Ambassadors" resolved to an unrelated act. Lowercase ` x `
+  stays. The fragment junk filter (2–60 chars, an ASCII letter or digit) applies to regex output
+  only; it used to drop the album artist `¥$`, leaving "CARNIVAL - HOOLIGANS VERSION" (11 h)
+  credited to its remixer alone.
 - **MusicBrainz tag coverage tracks fame, not your listening, and the gap is measurable.** In this
   library 100% of artists with 50h+ carry a genre tag, 94% at 10–50h, 86% at 2–10h, 77% at 0.5–2h and
   64% below that — 331 hours sit on artists that resolved perfectly and contribute nothing to any
@@ -156,23 +206,35 @@ correct.
   nine wrong genres on him (ambient, art rock, downtempo, experimental, leftfield…). Mis-resolution is
   worse than non-resolution: it invents listening in genres the user has never played. When an artist
   looks wrong, check the *collaborators* — the right Henrik is the one credited beside GRAHAM on the
-  album the user actually played.
+  album the user actually played. A name whose fold discards as much as it keeps (`¥$` → `s`, `MØ` →
+  `m`, an all-Cyrillic name → `""`) is refused as ambiguous rather than exact-matched
+  (`enrich.fold_discards_name`); it needs an MBID or `NONE`.
 - **The override file outranks the resolution cache, and must keep doing so.** `enrich.py` purges
   cached override answers the CSV no longer backs (`purge_stale_overrides`) before applying it.
   Without that, deleting a row would leave its answer frozen in the append-only cache forever.
-  `IGNORE` entries cost no request, so they are recomputed every run and never written to the cache;
-  MBID entries are cached and re-fetched only when the pinned MBID changes. An override value that is
-  neither a UUID nor `IGNORE` is rejected with a warning — a typo'd MBID would otherwise be pinned as
-  fact, which is exactly the guessing Stage 2 refuses to do.
-- **`ignored` is a resolution status, not an absence.** It must stay out of the review list in both
-  `enrich.write_outputs` and `enrich.report`, or the names the override file was written to suppress
-  come straight back.
+  `IGNORE` and `NONE` entries cost no request, so they are recomputed every run and never written to
+  the cache — deleting the row lets the cached record show again, by design. MBID entries are cached
+  and re-fetched only when the pinned MBID changes; the release-group backfill keeps such a record's
+  `source = 'override'` and marks `tags_from = 'release-group'` instead, because rewriting `source`
+  broke `override_satisfied` and re-fetched seven pins (~14 requests) on every run. `NONE` exists
+  because a blank `mbid` cannot un-resolve: a tags-only row leaves resolution alone, so a wrong
+  auto-match (PLAT. on the vaporwave ＰＬＡＴ, Unconscious Mind on a black-metal band) kept its MBID —
+  and the MBID is what seeds ListenBrainz. `NONE` gives status `no_entry`, no MBID, and keeps the hand
+  tags. Stage 9 honours `IGNORE` and `NONE` too. An override value that is not a UUID, `IGNORE`,
+  `NONE` or blank is rejected with a warning — a typo'd MBID would otherwise be pinned as fact, which
+  is exactly the guessing Stage 2 refuses to do.
+- **`ignored` and `no_entry` are resolution statuses, not absences.** Both are answers the override
+  file gave. `enrich.REVIEW_PREDICATE` is the one definition both review sites (`write_outputs` and
+  `report`) use; a status missing from it brings the answered names straight back.
 - **Stage 8 never deletes or unfollows a playlist.** It writes only to IDs in
   `data/playlist_state.json` or an exact `PLAYLIST_NAME_TEMPLATE` name match — exact including case,
   because a near-miss is somebody's hand-made playlist and a duplicate is the far cheaper mistake.
   Before every replace it snapshots current contents into `data/playlists.parquet`
   (`kind = 'pre_replace_snapshot'`), so nothing it overwrites goes unrecorded. The `Spotify` client
-  deliberately has no `delete` method, and a test asserts that — keep it that way.
+  deliberately has no `delete` method, and a test asserts that — keep it that way. Stage 10 shares
+  `ensure_playlist` and may also pass exact legacy names (`config.RUN_PLAYLIST_LEGACY_NAMES`), tried
+  only when nothing carries the current name, so lost state after a rename finds the old playlist
+  instead of creating a second; Stage 8 passes none.
 - **Spotify scopes only ever widen.** `poll.access_token(client_id, scope)` re-consents with the
   union of granted + needed, so running Stage 8 never strips the poller's scope or vice versa. Two
   paths would silently narrow it and are guarded: a failed refresh re-authorises with what was held
@@ -214,29 +276,88 @@ correct.
   applies an absolute floor to strangers only — waived when a NARROW tag carries them, since
   `bass house(1)` states something `tech house(1)` does not. It must never apply to library artists:
   hand-supplied tags all carry `OVERRIDE_TAG_COUNT = 1`, so a floor of 2 would exclude every artist
-  answered by hand, John Summit's 36 hours included.
+  answered by hand, John Summit's 36 hours included. The share bar is higher for strangers too:
+  `RUN_MIN_CANDIDATE_SHARE = 0.85`, while library classification stays on
+  `RUN_MIN_INTENSITY_SHARE = 0.60`, where listening has already vouched for the artist. At 0.60
+  Netsky (drum and bass 10 vs liquid funk 3: 0.77), Rusko, Modestep and Basement Jaxx got in; 0.85
+  refuses them and keeps Pendulum 0.97, Bassnectar 0.92 and NERO 0.89.
+- **Stage 10 judges discovery per TRACK, on Spotify's own credits.** An artist clearing the bar says
+  nothing about a given record: MJ Cole's relevance page led with Tion Wayne's rap single, and every
+  hit used to be relabelled as the candidate. `gate_discovery` reads each pick against the credited
+  cache (`spotify_artist_tracks_credited.jsonl`, pinned to the candidate's own Spotify id, since
+  `DEM2` and `Dem 2` fold alike) and refuses live tracks, anything over `RUN_MAX_DISCOVERY_MS`
+  (4.5 min; known tracks exempt), a vetoed credit, anything already started (`plays_raw`, so a
+  20-second skip counts), and a drag LEAD or drag remixer. The drag test must stay on the lead and
+  the named remixer only: a featured vocalist can carry drag by hand (Inéz, `melodic dubstep`), and
+  library-artist supply passes through this gate — an unplayed Subtronics track must not be refused
+  for its singer.
 - **A merely adjacent tag poisons discovery far beyond the tracks it admits.** `electro house` was
   in `RUN_GARAGE_TAGS` and let in 43 artists (MSTRKRFT, Benny Benassi, Justice, Digitalism). Because
   Stage 10 seeds ListenBrainz on the cluster's *own top artists*, seeding on Justice and Tiësto
   returned Mr. Oizo, Boys Noize and Basement Jaxx as "speed garage". Removing one tag fixed the
-  whole discovery pool. Check what a tag admits before adding it.
+  whole discovery pool. Check what a tag admits before adding it. `breakbeat` and `breakbeat
+  hardcore` left both lists on the same reasoning (they carried The Prodigy into dubstep), and the
+  cost landed on library artists — jigitz (5.9 h) now classifies to neither run and comes back only
+  as pins. `liquid funk`, `big beat`, `future garage` and `psytrance` joined `RUN_DRAG_TAGS`, each
+  named in `config.py` for the act that proved it.
+- **Stage 10 seeds are one per artist, actually listened to, and normalised.** `cluster_seed_artists`
+  joins a one-row-per-name view of `artist_tags` and groups on MBID: a join per TAG row counted Todd
+  Edwards eighteen times, made him garage seed #17 on 0.54 h, and his ListenBrainz tail supplied 13 of
+  21 garage discovery tracks. `RUN_MIN_SEED_HOURS` is an hour, not a share. Similarity is normalised
+  per seed before pooling, since ListenBrainz scores share no scale (Skrillex tops out at 3955,
+  REAPER at 181) and a raw sum handed the pool to the hub. An artist-wide veto removes the seed
+  under every name sharing its MBID.
+- **Stage 10 fills discovery from the listener's own artists first; strangers never hold the
+  quota.** Supply order inside one budget (`build_selections`): hand-named `discover` acts → the
+  cluster's own artists' never-started tracks, one each, up to `RUN_LIBRARY_DISCOVERY_FRACTION` of
+  the budget → gated strangers → more of his own artists → known tracks scoring at least
+  `RUN_TOPUP_MIN_SCORE`. SJ's call (2026-09-26): when new music runs short, fill with more of his own,
+  never a weak stranger kept to hold the quota — once the seed fix cut Todd Edwards' chain, garage
+  discovery fell from 21 tracks to ~9, and an unplayed Sammy Virji record was a keep where the
+  strangers were not. The top-up floor means a playlist can come in under 240 min; the report prints
+  the shortfall rather than filling with Matt Sassari's 0.186 "Full Vocal Mix". There is no Stage 5
+  top-up: after the seed and share fixes its only garage contribution was Basement Jaxx.
+- **Stage 10 never admits a known track on a featured-only export credit, and a remix goes to its
+  remixer's run.** Admitting credits (`build_known_pool`) are the album artist, a remixer, or a
+  feature the POLLER saw. An export feature is the title regex's guess, and that guess (two Daft Punk
+  edits) is how Todd Edwards reached the seeds at all. Not a blanket feature ban: `credits.py` types
+  every non-first poller artist as `featured`, remixers included, so a ban would erode remixer keeps
+  as polling grows. When the title's remix credit names a credited cluster artist, the track goes to
+  that artist's cluster only — "The One - NGHTMRE Remix" is NGHTMRE's dubstep, not Habstrakt's
+  garage. A featured credit with no cluster (Inéz) neither admits nor refuses; the known side has no
+  drag test.
+- **Stage 10's label is identity, its title is display.** `running.CLUSTERS` carries both. The label
+  (`speed garage`, `dubstep`) is `artist_clusters.cluster`, the `running_state.json` key, the
+  archive's `gap_tag` and the override file's `playlist` value, and never changes; the title only
+  names the Spotify playlist (`RUN_PLAYLIST_NAME_TEMPLATE` formats `{title}`). The garage run became
+  "garage & house run · Claude" on 2026-09-26 because tech house and John Summit stay in it, and
+  nothing keyed on the label moved. A rename changes `title` and adds the old name to
+  `RUN_PLAYLIST_LEGACY_NAMES`; `publish` renames in place (same ID, URL, followers). Override rows
+  may use either spelling and are stored under the label.
 - **Vetoing one track promotes the next one by the same artist.** `RUN_TRACKS_PER_ARTIST` is a cap,
   so dropping a track frees a slot rather than shrinking the artist's presence. Dropping SLANDER's
   `Superhuman` pulled in `Back To U` and `GUD VIBRATIONS` and left THREE SLANDER tracks where there
-  had been two. When the artist is the problem rather than the track, the veto must be artist-wide
-  (blank `track_name`); to keep one track by an otherwise-vetoed artist, pin it as well, since
-  `resolve_pins` runs before the veto filter and a pin is the more specific statement.
+  had been two. This silently stopped holding once the cap ran in SQL before any filter — a vetoed,
+  live or already-placed track kept its artist's slot — and is true again because
+  `running.eligible_known` applies veto, live and fresh BEFORE `cap_per_artist`, lazily, so each row
+  is judged after the one before was placed. `test_running_selection.py` pins it. When the artist is
+  the problem rather than the track, the veto must be artist-wide (blank `track_name`); to keep one
+  track by an otherwise-vetoed artist, pin it as well, since `resolve_pins` runs before the veto
+  filter and a pin is the more specific statement.
 - **Stage 10 refuses live recordings, matched structurally.** Crowd noise and a tempo chosen on the
   night break a run, and none of it is visible to a genre tag — the track is correctly classified and
   still wrong. `RUN_LIVE_TITLE_RE` anchors on where a pressing note sits (` - live`, `(live`,
   `live at/from/in`, `unplugged`); a bare `live` substring would take Zeds Dead's and Dustycloud's
   `Alive`, both of which are in these playlists and both of which belong.
-- **A veto matches the credits, which are not what Spotify shows.** `GUD VIBRATIONS` is an
-  NGHTMRE & SLANDER record and Spotify's `artists` array says so, but the export credits NGHTMRE
-  alone and the title carries no `feat.` or remix marker for `credits.py` to parse — so an artist-wide
-  SLANDER veto does not touch it. Not a bug in the veto; the collaborator is genuinely absent from
-  the data. Verifying a veto against Spotify's live artist list will therefore disagree with the
-  pipeline, and the pipeline is doing what the data supports.
+- **A veto matches every credit — and on the known side the credits are not always what Spotify
+  shows.** `running.vetoed` tests the row's artist and every name in `credited`, artist-wide and as
+  (name, title). Known rows take `credited` from `track_credits` over every pressing (an artist-wide
+  ILLENIUM veto used to leave Dillon Francis' "Don't Let Me Let Go", where he is only featured);
+  discovery rows take Spotify's own `artists` list from the credited cache. A known credit exists
+  only if the export, the title regex or the poller supplied it: `GUD VIBRATIONS` is an NGHTMRE &
+  SLANDER record, but its credits carry NGHTMRE alone until a polled play repairs them, so today an
+  artist-wide SLANDER veto does not touch it. It is pinned to dubstep deliberately — once polling
+  credits SLANDER, the veto would take it, and the pin is the more specific statement.
 - **Stage 10 must not use `playlists.assemble`, and the reason only appears at length.** `assemble`
   spaces anchors every `size // len(anchors)` slots — correct for Stage 8 (six anchors, twenty-five
   slots, step 4) and silently degenerate once anchors are the MAJORITY, where the step becomes 1 and
@@ -244,14 +365,24 @@ correct.
   30-45 minute run, the listener never reaches the discovery half at all — the exact repetition the
   length exists to fix. `running.interleave` takes from whichever pool has consumed less of itself,
   so the ratio holds all the way down. Do not "unify" the two.
-- **Stage 10 uses MEDIAN ms_played for duration, not max.** A completed play's `ms_played` is the
-  track's length, but the odd play reports far more than the track runs. `max()` put SLANDER's
-  "Wish I Could Forget" at 9.6 minutes and let one track eat a tenth of the playlist.
-- **Dedupe tracks on the folded title, not the URI.** Spotify presses the album cut, the single and
-  the remaster as three distinct URIs, so URI-dedupe alone gives one artist's two slots to the same
-  song — the first dry run produced "Papa Roach — Last Resort" twice. `_title_key` drops everything
-  from the first ` - `, ` (` or ` [`, and a title that is *only* a suffix keeps its full form rather
-  than folding to `""` and matching everything.
+- **Stage 10 uses MEDIAN ms_played for duration, not max — known tracks and pins alike.** A completed
+  play's `ms_played` is the track's length, but the odd play reports far more than the track runs.
+  `max()` put SLANDER's "Wish I Could Forget" at 9.6 minutes and let one track eat a tenth of the
+  playlist, and in `resolve_pins` it overcharged the garage pins 4.8 minutes. The median is over
+  completed EXPORT plays; failing that, a polled `ms_played`, which the poller records as the whole
+  track's length.
+- **Dedupe on the folded title, not the URI — and Stage 10 keeps two keys.** Spotify presses the
+  album cut, the single and the remaster as three distinct URIs, so URI-dedupe alone gives one
+  artist's two slots to the same song — the first dry run produced "Papa Roach — Last Resort" twice.
+  `playlists._title_key` (Stage 8, and discovery's heard-check) drops everything from the first
+  ` - `, ` (` or ` [`, and a title that is *only* a suffix keeps its full form rather than folding to
+  `""` and matching everything. Stage 10 adds `running.version_key`, which drops only pressing notes
+  (`config.RUN_PRESSING_NOTE_RE`: remaster, radio/extended/original mix, feat./with, mono, explicit,
+  clean) and keeps remixes, VIPs, flips and edits. `Placements` holds a version once across BOTH
+  playlists and a song once per playlist, so a remix is its own record — a garage original no longer
+  keeps its remix out of dubstep — and the known pool sums pressings into one row ("tell you
+  straight" was two half-counted rows on 70 and 44 plays). The pattern runs in RE2 and Python alike,
+  so it avoids lookaround, backreferences and `\d`/`\s`; a test holds the two to the same answers.
 
 ## Privacy constraints
 
@@ -273,8 +404,8 @@ config are tracked. Before changing anything here, understand why it is the way 
 
 ## Gotchas
 
-- `SPOTIFY_CLIENT_ID` in `.env` is needed by `poll.py` and `playlists.py`, which share one developer
-  app (Authorization Code + PKCE, no client secret, redirect URI exactly `http://127.0.0.1:3000`).
+- `SPOTIFY_CLIENT_ID` in `.env` is needed by `poll.py`, `playlists.py`, `consolidate.py` and
+  `running.py`, which share one developer app (Authorization Code + PKCE, no client secret, redirect URI exactly `http://127.0.0.1:3000`).
   Every other stage runs with no `.env` at all. `SPOTIFY_CLIENT_SECRET` is read by nothing — do not
   add a flow that wants one.
 - **Spotify's February 2026 rename is why a 403 here may mean a dead endpoint, not a denied one.**
@@ -300,9 +431,9 @@ config are tracked. Before changing anything here, understand why it is the way 
   `credits.py` (a floor — features living solely in Spotify metadata stay invisible to it) and the
   poller's true track artists (exact, but only for tracks it has seen). Per-artist totals for
   never-polled tracks remain skewed.
-- The poller has never been run on this checkout — no `data/polled_plays.parquet`. So `credit_source`
-  is 100% `export` today and the repair path, while tested, is dormant. Do not read "it changed
-  nothing" as "it does not work". There *is* now a cached token, created by Stage 8's consent, but it
-  carries only the playlist scopes; the first `poll.py` run will re-consent for the union and keep
-  both. That is `missing_scopes` working as designed, not a bug.
+- The poller first ran on 2026-09-25 and merged 50 plays, so the repair path is live but thin:
+  `credit_source = 'poller'` covers 91 credit rows on 49 tracks, the rest is `export`. Do not read "it
+  changed little" as "it does not work". The token's consent now holds `user-read-recently-played`
+  alongside the playlist scopes — the union, as `missing_scopes` intends. Polled months are
+  provisional until the next export and stay out of every trend (see the coverage-cut invariant).
 - `ts` is UTC, so monthly buckets are UTC months.
