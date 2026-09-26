@@ -19,6 +19,7 @@ class FakeSp:
         self.pages = pages                  # optional paged /me/playlists
         self.verbs = []
         self.created = []
+        self.put_bodies = []
     def get(self, path, params=None):
         self.verbs.append(("GET", path))
         if path.startswith("/playlists/") and "/items" in path:
@@ -39,6 +40,7 @@ class FakeSp:
         return {"id": f"new-{len(self.created)}"}
     def put(self, path, json):
         self.verbs.append(("PUT", path))
+        self.put_bodies.append((path, json))
         return {"snapshot_id": "snap"}
 
 
@@ -104,6 +106,51 @@ try:
     check("failed create raises", False, True)
 except SystemExit:
     check("failed create raises", True, True)
+
+
+# --------------------------------------------------------------------------
+# Aliases — a rename adopts the playlist under its OLD name, exactly.
+# Stage 10's garage run became "garage & house" (2026-09-26). With its state
+# file lost, an exact match on the new name alone would find nothing and
+# create a second playlist; the old name is tried after it, just as exactly.
+# --------------------------------------------------------------------------
+
+NEW, OLD = "garage & house run · Claude", "speed garage run · Claude"
+
+sp = FakeSp(existing=[{"id": "legacy", "name": OLD}])
+check("no state: a playlist under the legacy name is adopted",
+      playlists.ensure_playlist(sp, "speed garage", NEW, {}, aliases=(OLD,)), "legacy")
+check("...with nothing POSTed", [v for v in sp.verbs if v[0] == "POST"], [])
+
+sp = FakeSp(existing=[{"id": "x", "name": "unrelated"}])
+check("neither name present: created",
+      playlists.ensure_playlist(sp, "speed garage", NEW, {}, aliases=(OLD,)), "new-1")
+check("...under the NEW name", sp.created[0]["name"], NEW)
+
+sp = FakeSp(existing=[{"id": "c", "name": OLD.upper()}])
+check("a legacy name that differs only in case is NOT adopted",
+      playlists.ensure_playlist(sp, "speed garage", NEW, {}, aliases=(OLD,)), "new-1")
+
+# The current name wins wherever it sits: an alias is only a fallback.
+sp = FakeSp(pages=[
+    {"items": [{"id": "legacy", "name": OLD}],
+     "next": f"{playlists.SP_API}/me/playlists?offset=50"},
+    {"items": [{"id": "current", "name": NEW}], "next": None},
+])
+check("the current name beats an alias listed before it",
+      playlists.ensure_playlist(sp, "speed garage", NEW, {}, aliases=(OLD,)), "current")
+
+sp = FakeSp(existing=[{"id": "legacy", "name": OLD}])
+check("a live stored id still wins over both",
+      playlists.ensure_playlist(sp, "speed garage", NEW,
+                                {"speed garage": {"id": "stored", "name": OLD}},
+                                aliases=(OLD,)), "stored")
+check("...without listing playlists at all",
+      [v for v in sp.verbs if v[1].startswith("/me/playlists")], [])
+
+sp = FakeSp(existing=[{"id": "legacy", "name": OLD}])
+check("with no aliases the old name is a near-miss like any other",
+      playlists.ensure_playlist(sp, "speed garage", NEW, {}), "new-1")
 
 
 # --------------------------------------------------------------------------
@@ -197,6 +244,65 @@ before = con.execute(f"SELECT count(*) FROM '{playlists.config.PLAYLISTS_PARQUET
 playlists.write_archive(con, [])
 after = con.execute(f"SELECT count(*) FROM '{playlists.config.PLAYLISTS_PARQUET}'").fetchone()[0]
 check("empty write is a no-op, not a truncation", after, before)
+
+
+# --------------------------------------------------------------------------
+# Stage 10's rename, through publish: the LABEL is the identity (state key,
+# archive gap_tag), the TITLE is only what Spotify shows.
+# --------------------------------------------------------------------------
+
+import json
+
+import running
+
+running.config.RUNNING_STATE_JSON = tmp / "running_state.json"
+
+
+def selections():
+    return [{"label": lab, "n_known": 1, "n_new": 0,
+             "tracks": [{"spotify_track_uri": f"u:{lab[:3]}", "slot": "anchor",
+                         "position": 0, "artist_name": "A", "track_name": "T"}]}
+            for lab in ("speed garage", "dubstep")]
+
+
+def meta_put(sp, pid):
+    return next(body for path, body in sp.put_bodies if path == f"/playlists/{pid}")
+
+
+check("the garage run is titled 'garage & house' in the playlist name",
+      (running.playlist_name("speed garage"), running.playlist_name("dubstep")),
+      (NEW, "dubstep run · Claude"))
+
+running.config.RUNNING_STATE_JSON.write_text(json.dumps(
+    {"speed garage": {"id": "pl-garage", "name": OLD},
+     "dubstep": {"id": "pl-dub", "name": "dubstep run · Claude"}}), encoding="utf-8")
+sp = FakeSp()
+archive = running.publish(sp, con, selections())
+check("a live stored id is reused: nothing POSTed",
+      [v for v in sp.verbs if v[0] == "POST"], [])
+check("...and the metadata PUT renames it in place",
+      meta_put(sp, "pl-garage")["name"], NEW)
+check("...with the title in the description",
+      meta_put(sp, "pl-garage")["description"].startswith("garage & house — "), True)
+check("the dubstep playlist keeps its name", meta_put(sp, "pl-dub")["name"],
+      "dubstep run · Claude")
+check("state stays keyed on the LABEL, now carrying the new name",
+      json.loads(running.config.RUNNING_STATE_JSON.read_text(encoding="utf-8")),
+      {"speed garage": {"id": "pl-garage", "name": NEW},
+       "dubstep": {"id": "pl-dub", "name": "dubstep run · Claude"}})
+check("the archive's gap_tag is still the label",
+      sorted({r["gap_tag"] for r in archive}), ["dubstep", "speed garage"])
+
+# Lost state: publish passes the legacy name, so the old playlist is found.
+running.config.RUNNING_STATE_JSON.unlink()
+sp = FakeSp(existing=[{"id": "legacy", "name": OLD},
+                      {"id": "pl-dub", "name": "dubstep run · Claude"}])
+running.publish(sp, con, selections())
+check("with no state, publish adopts the legacy-named playlist: nothing POSTed",
+      [v for v in sp.verbs if v[0] == "POST"], [])
+check("...and renames it", meta_put(sp, "legacy")["name"], NEW)
+check("no DELETE-shaped call anywhere in publish",
+      [v for v in sp.verbs if v[0] not in ("GET", "PUT", "POST")], [])
 
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)

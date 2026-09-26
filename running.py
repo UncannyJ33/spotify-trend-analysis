@@ -42,6 +42,20 @@ remix to the ORIGINAL artist, so an Ian Asher speed-garage rework of a Halsey
 song reads as pop and would be filtered out as drag. Credits are joined here
 across album artist, feature AND remixer for exactly that reason.
 
+DISCOVERY IS JUDGED PER TRACK.
+    A stranger clearing the share bar says the ARTIST belongs, not that a given
+    record by them does. Spotify's relevance page for MJ Cole led with Tion
+    Wayne's rap single, and every hit used to be relabelled as the candidate,
+    so nothing could tell. Each pick is now read against Spotify's own credit
+    list first — gate_discovery has the rules and the cases behind each.
+
+NEW MUSIC COMES FROM THE LISTENER'S OWN ARTISTS FIRST.
+    Hand-named acts, then unplayed tracks by his own cluster artists (up to a
+    quarter of the discovery budget), then strangers, then more of his own
+    artists, then known tracks. When new music runs short the playlist fills
+    with more of what he already plays; a weak stranger is never kept just to
+    hold the quota. build_selections has the order and the reason.
+
 Outputs: two playlists, data/running_state.json, rows in data/playlists.parquet
 """
 
@@ -53,26 +67,28 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from datetime import date
+from functools import partial
 
 import duckdb
 
 import config
-from consolidate import gentle_token
+from consolidate import find_playlist, gentle_token, read_playlist
+from credits import REMIX_CREDIT_RE, REMIX_FORMAT_STOPLIST, REMIX_NON_NAME_RE
 from enrich import MB_MIN_INTERVAL, Throttled, load_genre_vocabulary, normalise
 from playlists import (
-    ARTIST_TRACKS_CACHE,
     FORBIDDEN_NOTE,
     GENRE_RECORDINGS_CACHE,
     SP_API,
+    SP_SEARCH_LIMIT,
     Spotify,
+    _artist_match,
     _title_key,
     choose_tracks,
     ensure_playlist,
     mb_genre_recordings,
     playlist_items,
-    select_candidates,
-    sp_artist_tracks,
     write_archive,
 )
 from recommend import (
@@ -93,11 +109,137 @@ SCOPES_WRITE = SCOPES_READ + " playlist-modify-private playlist-modify-public"
 # cost one each.
 DURATION_CACHE = config.CACHE_DIR / "track_durations.jsonl"
 
-# The two clusters. `key` names the weight column; `label` names the playlist.
+# Discovery searches, with WHO IS ON each track. Stage 8's
+# spotify_artist_tracks.jsonl keeps a name and a URI per hit, and every hit was
+# then labelled as the candidate — so Tion Wayne's rap single went out as MJ
+# Cole garage, and Skrillex appeared seven times in the dubstep run under other
+# artists' names. This keeps Spotify's own credit list (name AND id) and the
+# duration search already carries. A new file, not a rewrite: the old one is
+# Stage 8's, and an append-only cache is never rebuilt.
+SP_TRACKS_CREDITED_CACHE = config.CACHE_DIR / "spotify_artist_tracks_credited.jsonl"
+
+# The two clusters. `key` names the weight column.
+#
+# LABEL IS IDENTITY, TITLE IS DISPLAY. The label is artist_clusters.cluster, the
+# running_state.json key, the archive's gap_tag and the override file's playlist
+# value, and it never changes. The title is only what Spotify shows. SJ kept tech
+# house and John Summit in the garage run and renamed it "garage & house"
+# (2026-09-26); nothing keyed on the label moved. A rename changes `title` and
+# adds the old name to config.RUN_PLAYLIST_LEGACY_NAMES.
 CLUSTERS = (
-    {"key": "garage", "label": "speed garage", "tags": config.RUN_GARAGE_TAGS},
-    {"key": "bass", "label": "dubstep", "tags": config.RUN_BASS_TAGS},
+    {"key": "garage", "label": "speed garage", "title": "garage & house",
+     "tags": config.RUN_GARAGE_TAGS},
+    {"key": "bass", "label": "dubstep", "title": "dubstep",
+     "tags": config.RUN_BASS_TAGS},
 )
+
+
+TITLES = {c["label"]: c["title"] for c in CLUSTERS}
+
+
+def playlist_name(label: str) -> str:
+    """The Spotify name of a cluster's playlist — from its title, never its
+    label."""
+    return config.RUN_PLAYLIST_NAME_TEMPLATE.format(title=TITLES[label])
+
+
+# --------------------------------------------------------------------------
+# Song identity — a SONG and a VERSION are different keys
+# --------------------------------------------------------------------------
+
+# What a version key throws away once pressing notes are gone: ASCII
+# punctuation and space, plus the typographic marks Spotify titles carry.
+# Spelled as code points both engines read alike; \W would not do, since
+# Python's is Unicode-aware and RE2's is ASCII-only. Non-ASCII letters stay,
+# so a title in another script does not fold to "".
+_VERSION_FOLD_RE = r"[\x00-\x2f\x3a-\x40\x5b-\x60\x7b-\x7f\xa0‘’“”–—…]+"
+
+
+def version_key(title: str) -> str:
+    """The RECORDING a title names: pressing notes dropped, remixes kept.
+
+    config.RUN_PRESSING_NOTE_RE says what a pressing note is. The song key,
+    playlists._title_key, folds harder and drops every suffix; the two
+    together let a playlist hold one version of a song while the other
+    playlist holds a different one. version_key_sql is the same key in DuckDB,
+    and a test holds the two to the same answers.
+    """
+    t = title or ""
+    head = re.sub(config.RUN_PRESSING_NOTE_RE, "", t)
+    # A title that is only a note ("(Remastered)") keeps its full form rather
+    # than folding to "" and matching every other such title.
+    return (re.sub(_VERSION_FOLD_RE, "", head.lower())
+            or re.sub(_VERSION_FOLD_RE, "", t.lower()))
+
+
+def version_key_sql(col: str) -> str:
+    """version_key as a DuckDB expression over the column `col`."""
+    note = config.RUN_PRESSING_NOTE_RE.replace("'", "''")
+    fold = _VERSION_FOLD_RE.replace("'", "''")
+    return (f"coalesce(nullif(regexp_replace(lower(regexp_replace("
+            f"{col}, '{note}', '', 'g')), '{fold}', '', 'g'), ''), "
+            f"regexp_replace(lower({col}), '{fold}', '', 'g'))")
+
+
+def register_song_key(con: duckdb.DuckDBPyConnection) -> None:
+    """song_key(title) in SQL — playlists._title_key itself, not a copy.
+
+    Its normalise() folds accents through NFKD and drops "the" and "and",
+    which DuckDB cannot reproduce, and a second definition is exactly how two
+    keys for one idea drift apart.
+    """
+    if not con.execute("SELECT count(*) FROM duckdb_functions() "
+                       "WHERE function_name = 'song_key'").fetchone()[0]:
+        con.create_function("song_key", _title_key, ["VARCHAR"], "VARCHAR")
+
+
+class Placements:
+    """What is already placed, in this playlist or the other one.
+
+    Three keys, because Spotify presses one recording as several URIs and one
+    song as several recordings:
+    - the URI;
+    - (artist, version_key), across BOTH playlists. The album cut, the single
+      and the remaster are one record, and the first dry run duly listed
+      jigitz's 'tell you straight' twice in one playlist;
+    - (artist, song_key), within the CURRENT playlist only. One version of a
+      song per playlist — but an original placed in garage no longer keeps its
+      own remix out of dubstep, which the folded title alone used to do.
+    """
+
+    def __init__(self) -> None:
+        self.uris: set[str] = set()
+        self.versions: set[tuple] = set()
+        self.songs: set[tuple] = set()
+
+    def new_playlist(self) -> None:
+        self.songs = set()
+
+    @staticmethod
+    def _keys(row: dict) -> tuple[tuple, tuple]:
+        artist = normalise(row.get("artist_name") or "")
+        title = row.get("track_name") or ""
+        return (artist, version_key(title)), (artist, _title_key(title))
+
+    def fresh(self, row: dict) -> bool:
+        version, song = self._keys(row)
+        return (row.get("spotify_track_uri") not in self.uris
+                and version not in self.versions and song not in self.songs)
+
+    def place(self, row: dict) -> dict:
+        version, song = self._keys(row)
+        self.uris.add(row.get("spotify_track_uri"))
+        self.versions.add(version)
+        self.songs.add(song)
+        return row
+
+    def release(self, row: dict) -> None:
+        """Un-claim a row the duration fill turned away, so the other
+        playlist can still be offered it."""
+        version, song = self._keys(row)
+        self.uris.discard(row.get("spotify_track_uri"))
+        self.versions.discard(version)
+        self.songs.discard(song)
 
 
 # --------------------------------------------------------------------------
@@ -173,15 +315,22 @@ def build_artist_clusters(con: duckdb.DuckDBPyConnection) -> None:
     )
 
 
-def classify_tags(tags: list[dict], min_weight: int = 0) -> tuple[str | None, float]:
+def classify_tags(tags: list[dict], min_weight: int = 0,
+                  min_share: float = config.RUN_MIN_INTENSITY_SHARE,
+                  ) -> tuple[str | None, float]:
     """The same weighted-share test as build_artist_clusters, for tag vectors
-    that are not in artist_tags — i.e. Stage 5 candidates, whose genres live in
-    the candidate_tags cache.
+    that are not in artist_tags — i.e. discovery candidates, whose genres live
+    in the candidate_tags cache.
 
-    A discovery artist must clear exactly the bar a library artist clears.
-    Without this, `select_candidates` admits anything sharing ONE tag with the
-    cluster, and a dry run duly offered Röyksopp, Basement Jaxx and 90 seconds
-    of Aphex Twin ambient as running music.
+    A discovery artist must clear at least the bar a library artist clears.
+    Without this, a candidate sharing ONE tag with the cluster is admitted, and
+    a dry run duly offered Röyksopp, Basement Jaxx and 90 seconds of Aphex Twin
+    ambient as running music.
+
+    `min_share` defaults to the library line so the SQL and this agree; callers
+    judging a stranger pass config.RUN_MIN_CANDIDATE_SHARE. At 0.60 Netsky
+    passed on drum and bass 10 against liquid funk 3 (0.77) — fine for an
+    artist the listener already plays, not for one nobody has vouched for.
     """
     broad = {b.casefold() for b in config.RUN_BROAD_TAGS}
     garage = bass = drag = 0
@@ -210,7 +359,7 @@ def classify_tags(tags: list[dict], min_weight: int = 0) -> tuple[str | None, fl
         garage, g_share = 0, 0.0
     if bass < min_weight and not narrow_bass:
         bass, b_share = 0, 0.0
-    thr = config.RUN_MIN_INTENSITY_SHARE
+    thr = min_share
     if g_share >= thr and b_share >= thr:
         return ("speed garage", g_share) if garage >= bass else ("dubstep", b_share)
     if g_share >= thr:
@@ -221,99 +370,277 @@ def classify_tags(tags: list[dict], min_weight: int = 0) -> tuple[str | None, fl
 
 
 def build_known_pool(con: duckdb.DuckDBPyConnection) -> None:
-    """Tracks from the listener's own recent history, per cluster.
+    """Versions from the listener's own recent history, per cluster.
 
     The join is on track_credits, NOT on plays.artist_name, so a track counts
-    for every artist actually on it — album artist, feature and remixer alike.
-    That is the whole reason Stage 1b learned to parse `- X Remix`: without it
-    a Halsey track remixed by Ian Asher is judged on Halsey's tags.
+    for the artists actually on it. That is the whole reason Stage 1b learned
+    to parse `- X Remix`: without it a Halsey track remixed by Ian Asher is
+    judged on Halsey's tags.
 
-    Duration comes from the longest COMPLETED play. A play that ended in
-    'trackdone' ran the track to its end, so its ms_played is the duration —
-    exact, free, and it saves a request per track against an endpoint whose
-    batch form answers 403.
+    ONE ROW PER VERSION, not per URI. Spotify presses the album cut, the single
+    and the remaster as distinct URIs, and per URI "tell you straight" was two
+    rows on 70 and 44 plays, each judged on part of its evidence. Pressings are
+    grouped on (album artist, version_key): plays, hours and completions are
+    summed, credits are the union over every pressing (the poller may have
+    seen one and not another), and the row carries the most-played URI, which
+    is what the playlist will play. `uris` keeps the rest. A remix is its own
+    version, so it is judged on its own plays.
+
+    POLLED PLAYS COUNT AS TIME, NOT AS EVIDENCE. A polled row carries an
+    estimated ms_played and a NULL reason_end, so read as completion every one
+    is a skip — the 09-25 re-run pulled Rain off its 0.846 and cut "Tough -
+    Gravagerz Remix" outright. Completion, the play count behind the Laplace
+    term and the skip floor come from export rows only; hours count all, since
+    the listening did happen. A track only the poller has heard sits at the
+    0.5 prior rather than vanishing.
+
+    THE WINDOW ENDS AT THE EXPORT HORIZON (config.ANALYSIS_HORIZON_SQL), not at
+    the latest play. Anchored on the poller, 36 months slid forward past the
+    export's coverage and lost 1,801 plays (82.6 h) off the far end. There is no
+    upper bound, so polled plays past the horizon are still counted.
+
+    Duration is the representative pressing's MEDIAN completed export play;
+    failing that, a polled ms_played, which the poller records as the whole
+    track's length; failing that, the median over its other pressings.
+
+    WHICH CREDITS MAY PLACE A TRACK. The album artist, a remixer, or a feature
+    the poller saw. A feature from the export is Stage 1b's title regex — a
+    guess — and never admits on its own: Todd Edwards' 0.54 h in this window is
+    two Daft Punk edits he is guessed onto, and that guess is how he reached
+    the garage seeds at all. A blanket ban on features would be wrong the other
+    way, eroding every remixer keep as polling grows, because credits.py types
+    every non-first poller artist as `featured`, remixers included.
+
+    A remix belongs to its REMIXER's run. Habstrakt's bass house put "The One -
+    NGHTMRE Remix" in garage; the record is NGHTMRE's. So when the title's
+    remix credit names a credited cluster artist, the track goes to that
+    artist's cluster only. It is read from the title, not from credit_type, for
+    the poller reason above.
+
+    A featured credit with no cluster (Inéz, hand-tagged house and melodic
+    dubstep) neither admits nor refuses. There is no drag test on the known
+    side: a hand tag on a singer must never move a track the listener plays.
+
+    ONE VERSION PER SONG PER CLUSTER. Where an album artist's original and its
+    remix both qualify, the one listened through more often takes the slot, as
+    long as it has RUN_MIN_VERSION_PLAYS plays behind it: "Drugs I Like (AVELLO
+    Remix)" over the original it outlasts, but not a remix finished twice.
 
     The per-artist cap is keyed on the ALBUM artist. A remixer who also has
     their own releases is capped on those separately, which is why Blair Muir
     can bring REHAB and Disturbia while his Luude remix counts against Luude.
     """
+    register_song_key(con)
     con.execute(
         f"""
         CREATE OR REPLACE TABLE known_pool AS
-        WITH recent AS (
+        WITH per_uri AS (
             SELECT
                 p.spotify_track_uri,
                 any_value(p.track_name)  AS track_name,
                 any_value(p.artist_name) AS album_artist,
-                count(*)                 AS n_plays,
+                -- Completion evidence: export plays only.
+                count(*) FILTER (WHERE NOT p.ms_played_estimated) AS n_plays,
+                count(*)                                          AS n_plays_all,
+                count(*) FILTER (WHERE NOT p.ms_played_estimated
+                                   AND p.reason_end = 'trackdone') AS n_done,
+                -- Polled estimates count as time.
                 sum(p.played_seconds) / 3600.0 AS hours,
-                avg(CASE WHEN p.reason_end = 'trackdone' THEN 1.0 ELSE 0 END)
-                    AS done_rate,
                 -- MEDIAN, not max. A completed play's ms_played is the track's
                 -- duration, but the odd play reports far more than the track
                 -- runs (a paused stream that kept counting). max() took
                 -- SLANDER's "Wish I Could Forget" to 9.6 minutes and let one
                 -- track eat a tenth of the playlist.
-                median(CASE WHEN p.reason_end = 'trackdone' THEN p.ms_played END)
-                    AS duration_ms
+                coalesce(
+                    median(CASE WHEN p.reason_end = 'trackdone'
+                                THEN p.ms_played END)
+                        FILTER (WHERE NOT p.ms_played_estimated),
+                    median(p.ms_played) FILTER (WHERE p.ms_played_estimated)
+                ) AS duration_ms
             FROM plays p
             WHERE p.spotify_track_uri IS NOT NULL
               AND p.track_name IS NOT NULL
-              AND p.month >= (SELECT max(month) FROM plays)
+              AND p.month >= {config.ANALYSIS_HORIZON_SQL}
                              - INTERVAL {config.RUN_WINDOW_MONTHS} MONTH
             GROUP BY 1
         ),
-        credited AS (
-            SELECT r.*, ac.cluster,
-                   -- One row per (track, cluster): a track crediting three
-                   -- qualifying artists is one track, not three.
-                   row_number() OVER (
-                       PARTITION BY r.spotify_track_uri, ac.cluster
-                       ORDER BY ac.garage_w + ac.bass_w DESC, c.artist_name
-                   ) AS rn
-            FROM recent r
-            JOIN track_credits c USING (spotify_track_uri)
+        members AS (
+            -- Every pressing points at its version's representative: the
+            -- most-played URI, which is the one the playlist carries.
+            SELECT *,
+                   first_value(spotify_track_uri) OVER (
+                       PARTITION BY coalesce(lower(album_artist), ''),
+                                    {version_key_sql('track_name')}
+                       ORDER BY n_plays_all DESC, hours DESC, spotify_track_uri
+                   ) AS rep_uri
+            FROM per_uri
+        ),
+        grouped AS (
+            SELECT rep_uri AS spotify_track_uri,
+                   list(spotify_track_uri ORDER BY spotify_track_uri) AS uris,
+                   sum(n_plays)::BIGINT     AS n_plays,
+                   sum(n_plays_all)::BIGINT AS n_plays_all,
+                   sum(n_done)::BIGINT      AS n_done,
+                   sum(hours)               AS hours,
+                   median(duration_ms)      AS any_duration_ms
+            FROM members
+            GROUP BY 1
+        ),
+        recent AS (
+            SELECT g.spotify_track_uri, p.track_name, p.album_artist, g.uris,
+                   g.n_plays, g.n_plays_all, g.hours,
+                   coalesce(g.n_done / nullif(g.n_plays, 0), 0) AS done_rate,
+                   coalesce(p.duration_ms, g.any_duration_ms)   AS duration_ms
+            FROM grouped g
+            JOIN per_uri p USING (spotify_track_uri)
+        ),
+        admitting AS (
+            -- The credits allowed to place a version in a cluster, over every
+            -- pressing's credits.
+            SELECT DISTINCT m.rep_uri AS spotify_track_uri, c.artist_name,
+                   ac.cluster, ac.garage_w + ac.bass_w AS w
+            FROM members m
+            JOIN track_credits c ON c.spotify_track_uri = m.spotify_track_uri
             JOIN artist_clusters ac ON ac.artist_name = c.artist_name
             WHERE ac.cluster IS NOT NULL
+              AND (c.credit_type IN ('album_artist', 'remixer')
+                   OR (c.credit_type = 'featured' AND c.credit_source = 'poller'))
+        ),
+        routed AS (
+            -- The remixer a pressing's TITLE names, when they are an admitting
+            -- cluster artist on the record. regexp_extract gives '' on no
+            -- match, and no credited name is that short.
+            SELECT a.spotify_track_uri,
+                   first(a.cluster ORDER BY a.w DESC, a.cluster) AS remix_cluster
+            FROM admitting a
+            JOIN members m ON m.rep_uri = a.spotify_track_uri
+            WHERE lower(trim(a.artist_name)) = lower(trim(
+                      regexp_extract(m.track_name, '{REMIX_CREDIT_RE}', 1, 'i')))
+            GROUP BY 1
+        ),
+        credited AS (
+            SELECT r.*, a.cluster,
+                   -- One row per (version, cluster): a track crediting three
+                   -- qualifying artists is one track, not three.
+                   row_number() OVER (
+                       PARTITION BY r.spotify_track_uri, a.cluster
+                       ORDER BY a.w DESC, a.artist_name
+                   ) AS rn
+            FROM recent r
+            JOIN admitting a USING (spotify_track_uri)
+            LEFT JOIN routed x USING (spotify_track_uri)
+            WHERE x.remix_cluster IS NULL OR a.cluster = x.remix_cluster
+        ),
+        scored AS (
+            SELECT
+                spotify_track_uri, track_name, album_artist, cluster, uris,
+                n_plays, n_plays_all, hours, done_rate, duration_ms,
+                -- Laplace-smoothed completion. A track played once and
+                -- finished is not evidence of the same strength as one
+                -- finished forty times, and (done+1)/(n+2) says so without
+                -- discarding the single play. n is the EXPORT count, so a
+                -- polled-only track sits at 0.5.
+                (done_rate * n_plays + 1) / (n_plays + 2) AS done_smoothed,
+                hours * ((done_rate * n_plays + 1) / (n_plays + 2)) AS score
+            FROM credited
+            WHERE rn = 1
+              -- A track skipped repeatedly is not a track that carries a run.
+              -- Applied only where there is enough evidence to mean anything,
+              -- and polled plays are not evidence.
+              AND NOT (n_plays >= 3
+                       AND done_rate < {config.RUN_MIN_TRACKDONE_RATE})
         )
-        SELECT
-            spotify_track_uri, track_name, album_artist, cluster,
-            n_plays, hours, done_rate, duration_ms,
-            -- Laplace-smoothed completion. A track played once and finished is
-            -- not evidence of the same strength as one finished forty times,
-            -- and (done+1)/(n+2) says so without discarding the single play.
-            (done_rate * n_plays + 1) / (n_plays + 2) AS done_smoothed,
-            hours * ((done_rate * n_plays + 1) / (n_plays + 2)) AS score
-        FROM credited
-        WHERE rn = 1
-          -- A track skipped repeatedly is not a track that carries a run.
-          -- Applied only where there is enough evidence to mean anything.
-          AND NOT (n_plays >= 3 AND done_rate < {config.RUN_MIN_TRACKDONE_RATE})
+        SELECT * FROM scored
+        -- One version per song per cluster, chosen after the skip floor so a
+        -- floored original leaves the slot to its remix.
+        QUALIFY row_number() OVER (
+            PARTITION BY cluster, coalesce(lower(album_artist), ''),
+                         song_key(track_name)
+            ORDER BY n_plays >= {config.RUN_MIN_VERSION_PLAYS} DESC,
+                     done_smoothed DESC, score DESC, spotify_track_uri
+        ) = 1
         ORDER BY ALL
         """
     )
 
 
 def select_known(con: duckdb.DuckDBPyConnection, label: str,
-                 limit: int) -> list[dict]:
-    """Top-scoring known tracks for one cluster, capped per album artist."""
+                 limit: int | None = None) -> list[dict]:
+    """One cluster's known tracks in score order, UNCAPPED.
+
+    The per-artist cap used to run here, in SQL, before any filter — so a
+    vetoed, live or already-placed track still took one of its artist's three
+    slots, and vetoing a track shrank the artist instead of promoting their
+    next one. The cap now runs after the filters (eligible_known).
+
+    `credited` is every artist on the record, over every pressing's credits,
+    as a LIST — the veto reads it. An artist-wide ILLENIUM veto left Dillon
+    Francis' "Don't Let Me Let Go" in the dubstep run because ILLENIUM is on it
+    only as a feature. `uris` is every pressing, for the prefer match.
+    """
     cols = ["spotify_track_uri", "track_name", "artist_name", "duration_ms",
-            "hours", "done_rate", "n_plays", "score"]
+            "hours", "done_rate", "n_plays", "score", "uris", "credited"]
     rows = con.execute(
         f"""
-        SELECT spotify_track_uri, track_name, album_artist AS artist_name,
-               duration_ms, hours, done_rate, n_plays, score
-        FROM known_pool
-        WHERE cluster = ?
-        QUALIFY row_number() OVER (
-            PARTITION BY album_artist ORDER BY score DESC, spotify_track_uri
-        ) <= {config.RUN_TRACKS_PER_ARTIST}
-        ORDER BY score DESC, spotify_track_uri
-        LIMIT {limit}
+        WITH pool AS (
+            SELECT * FROM known_pool WHERE cluster = ?
+        ),
+        members AS (
+            SELECT spotify_track_uri, unnest(uris) AS member_uri FROM pool
+        ),
+        credited AS (
+            SELECT m.spotify_track_uri,
+                   list(DISTINCT c.artist_name ORDER BY c.artist_name) AS credited
+            FROM members m
+            JOIN track_credits c ON c.spotify_track_uri = m.member_uri
+            GROUP BY 1
+        )
+        SELECT p.spotify_track_uri, p.track_name, p.album_artist AS artist_name,
+               p.duration_ms, p.hours, p.done_rate, p.n_plays, p.score, p.uris,
+               coalesce(c.credited, []::VARCHAR[]) AS credited
+        FROM pool p
+        LEFT JOIN credited c USING (spotify_track_uri)
+        ORDER BY p.score DESC, p.spotify_track_uri
+        {'' if limit is None else f'LIMIT {int(limit)}'}
         """,
         [label],
     ).fetchall()
     return [dict(zip(cols, r)) for r in rows]
+
+
+def cap_per_artist(rows, cap: int, already=()):
+    """At most `cap` rows per album artist, taken in the order given.
+
+    A GENERATOR, and build_selections relies on that: the rows it filters are
+    judged one at a time, after the row before was placed, so a row refused by
+    a veto, the live test or fresh() never reaches the count at all. That is
+    what makes "vetoing one track promotes the next one by the same artist"
+    true. `already` is what was placed first (the pins), which holds its
+    artist's slots too — one act must not own a playlist, hand-picked or not.
+    Keyed on the normalised name, so Skrillex and SKRILLEX share one cap.
+    """
+    counts: dict[str, int] = {}
+    for r in already:
+        key = normalise(r.get("artist_name") or "")
+        counts[key] = counts.get(key, 0) + 1
+    for r in rows:
+        key = normalise(r.get("artist_name") or "")
+        if counts.get(key, 0) >= cap:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        yield r
+
+
+def eligible_known(rows, vetoes: set[tuple], is_fresh, pinned=()):
+    """The known side's filters, in the one order that works: veto, then live,
+    then fresh, THEN the per-artist cap. Lazy all the way down, so a caller
+    placing each row as it arrives has that placement seen by the rows
+    behind it."""
+    return cap_per_artist(
+        (r for r in rows
+         if not vetoed(r, vetoes) and not is_live(r.get("track_name"))
+         and is_fresh(r)),
+        config.RUN_TRACKS_PER_ARTIST, already=pinned)
 
 
 # --------------------------------------------------------------------------
@@ -321,8 +648,82 @@ def select_known(con: duckdb.DuckDBPyConnection, label: str,
 # --------------------------------------------------------------------------
 
 
+def cluster_seed_artists(con: duckdb.DuckDBPyConnection, label: str,
+                         vetoes: set[tuple],
+                         with_unresolved: bool = False) -> list[dict]:
+    """This cluster's own artists, ranked by what their tracks earn in the known
+    pool — ONE row per MusicBrainz artist.
+
+    Joined to a one-row-per-name view of artist_tags, never to artist_tags
+    itself: that table has a row per TAG, and the old join counted an artist
+    once per tag. Todd Edwards carries eighteen, which lifted him from rank 31
+    to garage seed #17, and his ListenBrainz tail then supplied 13 of the 21
+    garage discovery tracks. Grouped on the MBID, so Skrillex and SKRILLEX
+    pool into one seed rather than counting him twice.
+
+    An artist-wide veto drops a seed under ANY name sharing its MBID. SLANDER
+    was dubstep seed #6 after being vetoed off the playlist itself; seeding on a
+    rejected artist asks ListenBrainz for more of exactly what was rejected.
+
+    Library-artist discovery (library_discovery) reads this list too, so the
+    ranking is total — ties broken on mbid, then name — and unlimited; callers
+    take what they need. It passes `with_unresolved`: an artist with no MBID
+    has nothing to ask ListenBrainz, but their own unplayed tracks are as good
+    a supply as anyone's, and hand-tagged acts (nate band, AVELLO) are often
+    exactly the ones MusicBrainz never resolved. Each is its own row, keyed
+    on the name, with mbid None.
+    """
+    rows = con.execute(
+        f"""
+        WITH a AS (
+            SELECT artist_name, any_value(mbid) AS mbid
+            FROM artist_tags
+            {'' if with_unresolved else 'WHERE mbid IS NOT NULL'}
+            GROUP BY 1
+        ),
+        per_name AS (
+            SELECT c.artist_name, a.mbid,
+                   sum(k.score) AS score, sum(k.hours) AS hours
+            FROM known_pool k
+            JOIN track_credits c USING (spotify_track_uri)
+            JOIN a ON a.artist_name = c.artist_name
+            JOIN artist_clusters ac ON ac.artist_name = c.artist_name
+            WHERE k.cluster = ? AND ac.cluster = ?
+            GROUP BY 1, 2
+        ),
+        seeds AS (
+            SELECT mbid,
+                   -- The spelling carrying more of the score names the seed;
+                   -- a tie falls to the name, so the choice is repeatable.
+                   first(artist_name ORDER BY score DESC, artist_name)
+                       AS artist_name,
+                   sum(score) AS score, sum(hours) AS hours
+            FROM per_name
+            -- An unresolved artist is one row per name: NULL is no identity.
+            GROUP BY mbid, CASE WHEN mbid IS NULL THEN artist_name END
+            HAVING sum(hours) >= {config.RUN_MIN_SEED_HOURS}
+        )
+        SELECT s.mbid, s.artist_name, s.score, s.hours,
+               (SELECT list(a.artist_name ORDER BY a.artist_name)
+                FROM a WHERE a.mbid = s.mbid) AS names
+        FROM seeds s
+        ORDER BY s.score DESC, s.mbid, s.artist_name
+        """,
+        [label, label],
+    ).fetchall()
+    out = []
+    for mbid, name, score, hours, names in rows:
+        if any(vetoed({"artist_name": n, "track_name": ""}, vetoes)
+               for n in names or [name]):
+            continue
+        out.append({"mbid": mbid, "artist_name": name,
+                    "score": float(score), "hours": float(hours)})
+    return out
+
+
 def cluster_candidates(con, http, label: str, tag_cache: dict,
-                       sim_cache: dict, vocab: set[str]) -> list[dict]:
+                       sim_cache: dict, vocab: set[str],
+                       vetoes: set[tuple]) -> list[dict]:
     """Discovery candidates seeded on THIS cluster's own top artists.
 
     Stage 5's recommendations.parquet is seeded across the whole library, so its
@@ -332,55 +733,64 @@ def cluster_candidates(con, http, label: str, tag_cache: dict,
     ListenBrainz "who is like Blair Muir, like NOTION, like Ian Asher" returns
     the right neighbourhood instead.
 
+    Similarity is normalised PER SEED before it is pooled. ListenBrainz scores
+    are not on a common scale: Skrillex's list tops out at 3955 and REAPER's at
+    181, so a raw sum handed the pool to whichever seed is a hub. All twelve
+    dubstep strangers carried a Skrillex contribution while Eptic, Sullivan King
+    and Space Laces went unused. Each neighbour now earns
+    (seed score / total used seed score) x (similarity / that seed's best), so
+    a bigger artist of yours still counts for more, and a hub does not.
+
     Both lookups are the cached, append-only kind the rest of the project uses,
     so a re-run inside the same quarter spends nothing.
     """
-    seeds = con.execute(
-        """
-        SELECT t.artist_name, any_value(t.mbid) AS mbid, sum(k.score) AS score
-        FROM known_pool k
-        JOIN track_credits c USING (spotify_track_uri)
-        JOIN artist_tags t ON t.artist_name = c.artist_name
-        JOIN artist_clusters ac ON ac.artist_name = t.artist_name
-        WHERE k.cluster = ? AND ac.cluster = ? AND t.mbid IS NOT NULL
-        GROUP BY t.artist_name
-        ORDER BY score DESC
-        LIMIT ?
-        """,
-        [label, label, config.RUN_DISCOVERY_SEEDS],
-    ).fetchall()
-    if not seeds:
+    used: list[tuple[dict, list[dict]]] = []
+    for seed in cluster_seed_artists(con, label, vetoes):
+        if len(used) >= config.RUN_DISCOVERY_SEEDS:
+            break
+        similar = fetch_similar(http, seed["mbid"], sim_cache)
+        # ListenBrainz knowing nothing about an artist is no reason to seed on
+        # one fewer: skip it and let the next artist down take the slot.
+        if similar:
+            used.append((seed, similar))
+    if not used:
         return []
-    print(f"  seeding discovery on {len(seeds)} of your own artists: "
-          f"{', '.join(s[0] for s in seeds[:5])}...")
+    print(f"  seeding discovery on {len(used)} of your own artists: "
+          f"{', '.join(s['artist_name'] for s, _ in used[:5])}...")
 
     known_names = {normalise(r[0]) for r in con.execute(
         "SELECT DISTINCT artist_name FROM plays WHERE artist_name IS NOT NULL"
     ).fetchall()}
 
+    total = sum(s["score"] for s, _ in used) or 1.0
     pooled: dict[str, dict] = {}
-    for name, mbid, seed_score in seeds:
-        for sim in fetch_similar(http, mbid, sim_cache):
+    for seed, similar in used:
+        best = max(float(x.get("score") or 0) for x in similar) or 1.0
+        weight = seed["score"] / total
+        for sim in similar:
             if normalise(sim["name"]) in known_names or not sim["mbid"]:
                 continue
             row = pooled.setdefault(sim["mbid"], {
                 "artist_name": sim["name"], "mbid": sim["mbid"], "score": 0.0})
             # Similar to several of your cluster artists beats similar to one.
-            row["score"] += float(sim.get("score") or 0)
+            row["score"] += weight * float(sim.get("score") or 0) / best
 
-    ranked = sorted(pooled.values(), key=lambda r: -r["score"])
+    # mbid breaks ties, so the tagging cutoff below never depends on the order
+    # the seeds happened to be walked in.
+    ranked = sorted(pooled.values(), key=lambda r: (-r["score"], r["mbid"]))
     out = []
     for cand in ranked[:config.RUN_MAX_CANDIDATES_TO_TAG]:
         tags = fetch_candidate_tags(http, cand["mbid"], vocab, tag_cache)
         cl, share = classify_tags(
-            tags, min_weight=config.RUN_MIN_CANDIDATE_CLUSTER_WEIGHT)
+            tags, min_weight=config.RUN_MIN_CANDIDATE_CLUSTER_WEIGHT,
+            min_share=config.RUN_MIN_CANDIDATE_SHARE)
         if cl == label:
             out.append(dict(cand, share=share))
     return out
 
 
-def load_overrides() -> tuple[list[dict], set[tuple]]:
-    """(pins, vetoes) from running_overrides.csv.
+def load_overrides() -> dict:
+    """{pins, vetoes, discover, prefer} from running_overrides.csv.
 
     Pins carry the FULL track title, not the folded one. `_title_key` drops
     everything from the first ' - ', and this library contains both Insania's
@@ -388,30 +798,71 @@ def load_overrides() -> tuple[list[dict], set[tuple]]:
     'iloveitiloveitiloveit' (4 plays). Folding the pin would let the wrong one
     take the slot.
 
-    A blank `playlist` applies to both.
+    A `discover` row names an act for ONE playlist's discovery — a scene act
+    MusicBrainz never tagged (Kanine, Bru-C), which no share test can admit.
+    It must name its playlist: a hand-named act is a claim about one run, so a
+    blank one is warned about and skipped rather than read as "both".
+
+    A `prefer` row names a playlist, not an artist: `,prefer,,<exact playlist
+    name>,note`, the name in `track_name`. So the "no artist, skip" guard is
+    scoped to the row types that need one — applied to every row, it dropped
+    each prefer row without a word.
+
+    A blank `playlist` applies to both. A row whose FIRST cell starts with '#'
+    is a comment, which is how the example file's rows are disabled — reading
+    only the artist cell let "# ,drop,A Melodic Act,," through as a veto.
+
+    `playlist` takes a cluster's label ("speed garage") or its title ("garage
+    & house"), case aside, and every entry carries the LABEL: the garage run
+    was renamed, and the rows written before and after must reach the same
+    playlist. A value that is neither is warned about and skipped — a pin
+    naming the playlist by its Spotify name would otherwise match nothing,
+    silently. A drop applies everywhere whatever the column says.
     """
-    pins: list[dict] = []
-    vetoes: set[tuple] = set()
+    out: dict = {"pins": [], "vetoes": set(), "discover": [], "prefer": []}
+    labels = {c["label"] for c in CLUSTERS}
+    to_label = {k.casefold(): c["label"]
+                for c in CLUSTERS for k in (c["label"], c["title"])}
     if not config.RUNNING_OVERRIDES_CSV.exists():
-        return pins, vetoes
+        return out
 
     with config.RUNNING_OVERRIDES_CSV.open(encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
+            raw_playlist = (row.get("playlist") or "").strip()
             decision = (row.get("decision") or "").strip().lower()
             artist = (row.get("artist_name") or "").strip()
-            if not artist or artist.startswith("#") or decision not in {"keep", "drop"}:
+            track = (row.get("track_name") or "").strip()
+            if raw_playlist.startswith("#") or artist.startswith("#"):
                 continue
-            entry = {
-                "playlist": (row.get("playlist") or "").strip(),
-                "artist_name": artist,
-                "track_name": (row.get("track_name") or "").strip(),
-                "note": (row.get("note") or "").strip(),
-            }
-            if decision == "keep":
-                pins.append(entry)
-            else:
-                vetoes.add((normalise(artist), normalise(entry["track_name"])))
-    return pins, vetoes
+            playlist = to_label.get(raw_playlist.casefold(), raw_playlist)
+            entry = {"playlist": playlist, "artist_name": artist,
+                     "track_name": track,
+                     "note": (row.get("note") or "").strip()}
+            if (decision in {"keep", "prefer"} and playlist
+                    and playlist not in labels):
+                print(f"  ! {decision} row {artist or track!r} names playlist "
+                      f"{raw_playlist!r}, which is neither a label nor a title "
+                      f"({', '.join(sorted(to_label))}); skipped")
+                continue
+            if decision == "prefer":
+                if not track:
+                    print("  ! a prefer row names no playlist in track_name; "
+                          "skipped")
+                    continue
+                out["prefer"].append(entry)
+            elif decision == "discover" and artist:
+                if playlist not in labels:
+                    print(f"  ! discover row for {artist!r} names no playlist "
+                          f"({raw_playlist or 'blank'}; one of "
+                          f"{', '.join(sorted(to_label))}); skipped")
+                    continue
+                out["discover"].append(entry)
+            elif decision in {"keep", "drop"} and artist:
+                if decision == "keep":
+                    out["pins"].append(entry)
+                else:
+                    out["vetoes"].add((normalise(artist), normalise(track)))
+    return out
 
 
 def is_live(track_name: str) -> bool:
@@ -429,10 +880,68 @@ def is_live(track_name: str) -> bool:
 
 
 def vetoed(row: dict, vetoes: set[tuple]) -> bool:
-    """A veto naming only an artist removes everything by them."""
-    a = normalise(row.get("artist_name", ""))
-    t = normalise(row.get("track_name", ""))
-    return (a, t) in vetoes or (a, "") in vetoes
+    """A veto naming only an artist removes everything they are ON.
+
+    Every credit is tested — the row's artist and each name in `credited`,
+    features included — artist-wide and as (name, title). An album-artist-only
+    veto left "Don't Let Me Let Go" in the dubstep run under an artist-wide
+    ILLENIUM veto, because he is on it as a feature.
+    """
+    t = normalise(row.get("track_name") or "")
+    names = [row.get("artist_name") or "", *(row.get("credited") or [])]
+    return any((a, t) in vetoes or (a, "") in vetoes
+               for a in {normalise(n) for n in names})
+
+
+def prefer_members(sp, names: list[str]) -> dict[str, set]:
+    """What the `prefer` playlists hold: their URIs, and (lead artist, song
+    key) pairs so a different pressing of a member still counts.
+
+    Read-only, through Stage 9's exact-name lookup. Its hard errors — no
+    playlist of that exact name, two of them, a failed listing — are right
+    for Stage 9, where a wrong source consolidates the wrong music. Here the
+    playlist is only a tie-breaker, so a failure is a warning and the boost is
+    simply absent: the selection is then exactly what it would be without the
+    row.
+    """
+    members: dict[str, set] = {"uris": set(), "songs": set()}
+    for name in names:
+        try:
+            tracks = read_playlist(sp, find_playlist(sp, name)["id"])
+        except SystemExit as e:
+            print(f"  ! prefer {name!r} skipped, no boost applied: {e}")
+            continue
+        for t in tracks:
+            members["uris"].add(t["spotify_track_uri"])
+            if t.get("artists"):
+                members["songs"].add((normalise(t["artists"][0]),
+                                      _title_key(t.get("track_name") or "")))
+    return members
+
+
+def apply_prefer(rows: list[dict], members: dict[str, set],
+                 margin: float = config.RUN_PREFER_MARGIN) -> list[dict]:
+    """Boost members by 1 + margin and re-rank; the input rows are untouched.
+
+    A member is any pressing's URI in the playlist, or the same album artist
+    and song. It runs before the filters, so a boosted member still has to
+    clear the veto, the live test and the cap like everything else; pins never
+    pass through here. The unboosted score rides along as `base_score`, which
+    is what the top-up floor tests (see known_topup).
+    """
+    uris, songs = members.get("uris") or set(), members.get("songs") or set()
+    if not uris and not songs:
+        return list(rows)
+    out = []
+    for r in rows:
+        key = (normalise(r.get("artist_name") or ""),
+               _title_key(r.get("track_name") or ""))
+        if (uris & {r.get("spotify_track_uri"), *(r.get("uris") or [])}
+                or key in songs):
+            r = dict(r, score=float(r["score"]) * (1 + margin),
+                     base_score=float(r["score"]), preferred=True)
+        out.append(r)
+    return sorted(out, key=lambda r: (-r["score"], r["spotify_track_uri"]))
 
 
 def resolve_pins(con: duckdb.DuckDBPyConnection, pins: list[dict],
@@ -442,6 +951,11 @@ def resolve_pins(con: duckdb.DuckDBPyConnection, pins: list[dict],
     Matched on the full title against plays, so the pin means the pressing the
     listener actually played rather than whichever one Spotify search happens
     to rank first.
+
+    Duration is measured as build_known_pool measures it: the MEDIAN completed
+    export play, failing that a polled ms_played (the whole track). It used to
+    be max(), which the odd over-long play inflated — the garage pins were
+    overcharged 4.8 minutes, and the run came in that much short.
     """
     out = []
     for pin in pins:
@@ -450,14 +964,18 @@ def resolve_pins(con: duckdb.DuckDBPyConnection, pins: list[dict],
         rows = con.execute(
             """
             SELECT spotify_track_uri, any_value(track_name), any_value(artist_name),
-                   max(CASE WHEN reason_end = 'trackdone' THEN ms_played END),
+                   coalesce(
+                       median(CASE WHEN reason_end = 'trackdone'
+                                   THEN ms_played END)
+                           FILTER (WHERE NOT ms_played_estimated),
+                       median(ms_played) FILTER (WHERE ms_played_estimated)),
                    sum(played_seconds) / 3600.0 AS hours
             FROM plays
             WHERE lower(artist_name) = lower(?)
               AND lower(track_name)  = lower(?)
               AND spotify_track_uri IS NOT NULL
             GROUP BY spotify_track_uri
-            ORDER BY hours DESC
+            ORDER BY hours DESC, spotify_track_uri
             LIMIT 1
             """,
             [pin["artist_name"], pin["track_name"]],
@@ -475,24 +993,323 @@ def resolve_pins(con: duckdb.DuckDBPyConnection, pins: list[dict],
 
 
 # --------------------------------------------------------------------------
+# Discovery tracks — judged per TRACK, not per artist
+# --------------------------------------------------------------------------
+
+
+def sp_artist_tracks_credited(sp, artist: str, cache: dict) -> list[dict]:
+    """This artist's tracks in Spotify's relevance order, with who is on each.
+
+    The same /search Stage 8 makes — one page of SP_SEARCH_LIMIT, hits kept only
+    where the artist is really credited — keeping what Stage 8 throws away:
+    every credited artist as {name, id}, in Spotify's order, and `duration_ms`,
+    which search returns for free. So the length cap and the time budget cost
+    no /tracks request unless a hit arrives without one.
+
+    Only an ANSWER is cached. A 200 with no usable hit is a fact ("Spotify does
+    not carry them") and is asked once. A 429, an error envelope or no response
+    at all is a missing answer, and caching it would freeze a transient failure
+    into "this artist has no tracks" for good.
+
+    Keyed on normalise(artist), like Stage 8's, so 'DEM2' and 'Dem 2' share a
+    key. The record holds every credited id, and pin_artist_id separates the
+    two on read; a namesake is a read-time filter, not a cache repair.
+    """
+    key = normalise(artist)
+    if key in cache:
+        return [dict(t, artist_name=artist) for t in cache[key]["tracks"]]
+    resp = sp.get("/search", params={
+        "q": f'artist:"{artist.replace(chr(34), "")}"',
+        "type": "track", "limit": SP_SEARCH_LIMIT,
+    })
+    if not isinstance(resp, dict) or "_status" in resp:
+        return []
+    tracks = [
+        {"track_name": it.get("name"), "spotify_track_uri": it.get("uri"),
+         "duration_ms": it.get("duration_ms"),
+         # A LIST of credits, never a joined string: every printable separator
+         # eventually collides with a real name ("Tyler, The Creator").
+         "artists": [{"name": a.get("name"), "id": a.get("id")}
+                     for a in it.get("artists", [])]}
+        for it in (resp.get("tracks") or {}).get("items", [])
+        if it.get("uri") and _artist_match(it, artist)
+    ]
+    rec = {"key": key, "artist": artist, "status": 200, "tracks": tracks}
+    append_jsonl(SP_TRACKS_CREDITED_CACHE, rec)
+    cache[key] = rec
+    return [dict(t, artist_name=artist) for t in tracks]
+
+
+def pin_artist_id(tracks: list[dict],
+                  artist: str) -> tuple[str | None, list[dict]]:
+    """The candidate's own Spotify artist id, and only the tracks crediting it.
+
+    normalise() is a comparison key, not an identity. 'DEM2' and 'Dem 2' both
+    fold to `dem2`, and the Dem 2 search duly returned DEM2's "Discoteca" — a
+    different act — which went out as Dem 2 discovery.
+
+    Among the ids whose name folds to the candidate, the one whose Spotify name
+    IS the candidate's (after NFKD, case and all) wins; failing that, the id on
+    the most tracks; failing that, whichever relevance put first. Exact name
+    first is what makes it deterministic: "most tracks" alone would hand a
+    search for one act to its namesake whenever the namesake had the bigger page.
+    """
+    want_key = normalise(artist)
+    want_exact = unicodedata.normalize("NFKD", artist)
+    exact: dict[str, bool] = {}
+    on_tracks: dict[str, set[int]] = {}
+    first_seen: dict[str, int] = {}
+    for i, t in enumerate(tracks):
+        for a in t.get("artists") or []:
+            aid, name = a.get("id"), a.get("name") or ""
+            if not aid or normalise(name) != want_key:
+                continue
+            first_seen.setdefault(aid, i)
+            on_tracks.setdefault(aid, set()).add(i)
+            exact[aid] = (exact.get(aid, False)
+                          or unicodedata.normalize("NFKD", name) == want_exact)
+    if not first_seen:
+        return None, []
+    pinned = min(first_seen, key=lambda aid: (
+        not exact[aid], -len(on_tracks[aid]), first_seen[aid]))
+    return pinned, [t for t in tracks
+                    if any(a.get("id") == pinned for a in t.get("artists") or [])]
+
+
+def drag_artists(con: duckdb.DuckDBPyConnection) -> set[str]:
+    """Normalised names of library artists whose drag weight OUTWEIGHS both
+    cluster weights — the pop, rap and melodic acts a discovery track must not
+    be led or remixed by. Level is not enough: an artist the library cannot
+    call either way is not evidence against a track."""
+    return {normalise(r[0]) for r in con.execute(
+        "SELECT artist_name FROM artist_clusters "
+        "WHERE drag_w > greatest(garage_w, bass_w)").fetchall()}
+
+
+def remix_credit(title: str) -> str | None:
+    """The remixer a title names, by Stage 1b's own rule.
+
+    credits.REMIX_CREDIT_RE and its two guards are imported, not copied, so a
+    title parses the same way here as it does in track_credits: "Bounce - Radio
+    Edit" names a format rather than a person, and "Song - 2019 Remix" names a
+    year. The pattern sits inside what both RE2 and Python accept.
+    """
+    m = re.search(REMIX_CREDIT_RE, title or "", re.IGNORECASE)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    if (not name or name.lower() in REMIX_FORMAT_STOPLIST
+            or re.match(REMIX_NON_NAME_RE, name) or " - " in name):
+        return None
+    return name
+
+
+def gate_discovery(tracks: list[dict], cand: dict, pinned_id: str | None,
+                   on_genre: set[str], drag: set[str], vetoes: set[tuple],
+                   is_fresh, k: int = config.RUN_DISCOVERY_TRACKS_PER_ARTIST,
+                   library: bool = False) -> list[dict]:
+    """Every discovery pick passes as a TRACK before choose_tracks sees it, so
+    each of the k picks it returns is usable rather than a slot wasted on a
+    track the loop then refuses.
+
+    The artist-level gate (classify_tags) says a candidate belongs; it cannot
+    say a given record by them does. Spotify's relevance page for MJ Cole led
+    with Tion Wayne's rap single "Crazy Love" — MJ Cole is its third credit, and
+    a title collision with his 2000 record flagged it as garage.
+
+    1. Live, or longer than RUN_MAX_DISCOVERY_MS: refused.
+    2. A vetoed credit — ANY credit, features included, artist-wide or as
+       (name, title) — or a track already placed: refused.
+    3. A drag LEAD, or a drag remixer Spotify credits on the record: refused.
+       Featured credits are not drag-tested. Every drag co-credit the
+       evaluation found was the lead (Tion Wayne, Bieber on the Wideboys mix,
+       Rihanna), while Inéz carries melodic dubstep by hand and sings on three
+       records SJ keeps. Library-artist discovery passes through here too, and
+       an unplayed Subtronics track must not be refused for its singer.
+    4. genre_matched needs the title in `on_genre` AND the record to be the
+       candidate's own: led by the pinned id with no other remixer named, or
+       naming the candidate as remixer. "Everyday - Netsky Remix" sat in
+       Rusko's list and inherited his `everyday` recording.
+    5. With recording tags, only matched tracks survive. Without any (Y U QT,
+       Dustycloud: keeps with nothing tagged in MusicBrainz), relevance stands.
+       Deliberately NOT added: "the lead must be the candidate or a cluster
+       artist" — Spotify bills a stranger's remix to the pop original first,
+       so that rule would refuse nearly every remix.
+       A `library` artist filters only when a track that survived steps 1-3 is
+       matched; otherwise relevance stands for them too. MusicBrainz tags the
+       records people know, and for an artist the listener already plays those
+       are the records already heard — removed before this gate ever runs. "All
+       their tagged work is heard" says nothing about the rest, and filtering
+       on it left exactly the well-tagged library artists supplying nothing.
+       Strangers stay strict: their tagged records are still on offer, and
+       filtering is what removes Tokyo Machine's ROCK IT and CANTINA.
+    6. choose_tracks, for its stable sort and same-song dedupe. Its own flag
+       agrees with step 4 by construction: after step 5, either every row is
+       matched and in `on_genre`, or it is handed an empty set and none is.
+       The library fallback hands it the empty set too, or its title-only flag
+       would sort "Everyday - Netsky Remix" first on Rusko after step 4 said no.
+    """
+    name = cand["artist_name"]
+    want = normalise(name)
+    eligible: list[dict] = []
+    for t in tracks:
+        title = t.get("track_name") or ""
+        artists = t.get("artists") or []
+        credited = [a.get("name") for a in artists if a.get("name")]
+        dur = t.get("duration_ms")
+        if is_live(title) or (dur and dur > config.RUN_MAX_DISCOVERY_MS):
+            continue
+
+        row = dict(t, artist_name=name, credited=credited)
+        if vetoed(row, vetoes) or not is_fresh(row):
+            continue
+
+        rc = remix_credit(title)
+        credited_keys = {normalise(n) for n in credited}
+        remixer = normalise(rc) if rc and normalise(rc) in credited_keys else None
+        lead = artists[0] if artists else {}
+        if normalise(lead.get("name") or "") in drag or (remixer and remixer in drag):
+            continue
+
+        names_cand = rc is not None and normalise(rc) == want
+        own_lead = pinned_id is not None and lead.get("id") == pinned_id
+        row["genre_matched"] = (_title_key(title) in on_genre
+                                and (own_lead or names_cand)
+                                and (rc is None or names_cand))
+        eligible.append(row)
+
+    if on_genre:
+        matched = [r for r in eligible if r["genre_matched"]]
+        if matched or not library:
+            return choose_tracks(matched, on_genre, k)
+    return choose_tracks(eligible, set(), k)
+
+
+def heard_keys(con: duckdb.DuckDBPyConnection) -> dict[str, set]:
+    """Everything the listener has STARTED: every URI, and every (artist, song
+    key), in plays_raw's music rows.
+
+    plays_raw, not plays. Stage 1's plays drops anything under 30 seconds, and
+    a track skipped at 20 seconds has been heard and turned down — offering it
+    as "new" would be the one discovery pick guaranteed to be skipped again.
+    The song key catches the other pressing: a single the listener never
+    played is not new if the album cut is in the history.
+    """
+    register_song_key(con)
+    uris = {r[0] for r in con.execute(
+        "SELECT DISTINCT spotify_track_uri FROM plays_raw "
+        "WHERE content_type = 'music' AND spotify_track_uri IS NOT NULL"
+    ).fetchall()}
+    songs = {(normalise(a), k) for a, k in con.execute(
+        """
+        SELECT artist_name, song_key(track_name)
+        FROM (SELECT DISTINCT artist_name, track_name FROM plays_raw
+              WHERE content_type = 'music' AND artist_name IS NOT NULL
+                AND track_name IS NOT NULL)
+        """).fetchall()}
+    return {"uris": uris, "songs": songs}
+
+
+def is_heard(track: dict, heard: dict[str, set]) -> bool:
+    """A search hit the listener has already started, under ANY of its
+    credits: plays_raw names the album artist, which for a feature or a remix
+    is not necessarily who Spotify lists first."""
+    if track.get("spotify_track_uri") in heard["uris"]:
+        return True
+    song = _title_key(track.get("track_name") or "")
+    names = [track.get("artist_name") or "",
+             *(a.get("name") or "" for a in track.get("artists") or [])]
+    return any((normalise(n), song) in heard["songs"] for n in names if n)
+
+
+def candidate_picks(sp, http, cand: dict, tags: list[str], credited_cache: dict,
+                    genre_cache: dict, drag: set[str], vetoes: set[tuple],
+                    is_fresh, heard: dict[str, set], k: int,
+                    library: bool = False) -> list[dict]:
+    """One act's usable discovery picks, best first — the same path for every
+    supply: search, keep only the act's own Spotify id, drop what the listener
+    has already started, ask MusicBrainz which recordings are on-genre, gate.
+
+    An act with no MBID (a hand-named scene act, a hand-tagged library artist)
+    skips MusicBrainz and takes Spotify's relevance order, as gate step 5 does
+    for an artist with no tagged recordings. `library` is gate step 5's rule
+    for an artist the listener already plays: tags that name only heard
+    records do not filter what is left.
+    """
+    name = cand["artist_name"]
+    pinned_id, tracks = pin_artist_id(
+        sp_artist_tracks_credited(sp, name, credited_cache), name)
+    tracks = [t for t in tracks if not is_heard(t, heard)]
+    if not tracks:
+        return []
+    on_genre = (mb_genre_recordings(http, cand["mbid"], tags, genre_cache)
+                if cand.get("mbid") else set())
+    return gate_discovery(tracks, cand, pinned_id, on_genre, drag, vetoes,
+                          is_fresh, k=k, library=library)
+
+
+def library_discovery(con, sp, http, label: str, tags: list[str],
+                      credited_cache: dict, genre_cache: dict, drag: set[str],
+                      vetoes: set[tuple], is_fresh,
+                      heard: dict[str, set]) -> list[tuple[dict, list[dict]]]:
+    """This cluster's own artists' tracks the listener has never started, as
+    (artist, picks) in seed-rank order — the first discovery supply after
+    hand-named acts.
+
+    The artists are the top RUN_LIBRARY_DISCOVERY_ARTISTS of
+    cluster_seed_artists, the same ranking that seeds ListenBrainz, but without
+    its skip for an artist ListenBrainz knows nothing about: that says nothing
+    about their own catalogue. An artist-wide veto is already out of that list,
+    and the gate refuses anything crediting a vetoed name.
+
+    Every pick passes the same track gate strangers face (candidate_picks), so
+    a drag-led single or a 6-minute cut is refused here too. The gate tests the
+    LEAD and a named remixer, never a featured vocalist, which is what keeps
+    an unplayed Subtronics record with Inéz on it. The one difference is gate
+    step 5: recording tags that name only records the listener has already
+    played do not filter the rest (see gate_discovery).
+    """
+    out = []
+    for artist in cluster_seed_artists(con, label, vetoes, with_unresolved=True
+                                       )[:config.RUN_LIBRARY_DISCOVERY_ARTISTS]:
+        picks = candidate_picks(
+            sp, http, artist, tags, credited_cache, genre_cache, drag, vetoes,
+            is_fresh, heard, k=config.RUN_LIBRARY_DISCOVERY_TRACKS_PER_ARTIST,
+            library=True)
+        if picks:
+            out.append((artist, picks))
+    return out
+
+
+# --------------------------------------------------------------------------
 # Duration — fill to time, not to a track count
 # --------------------------------------------------------------------------
 
 
 def track_duration(sp, uri: str, cache: dict) -> int | None:
-    """Duration for a track with no listening history. One request each:
-    the batch /tracks form answers 403 like every other batch endpoint."""
+    """Duration for a discovery track whose search hit carried none — search
+    usually does, so this is the fallback. One request each: the batch /tracks
+    form answers 403 like every other batch endpoint.
+
+    Only an ANSWER is cached, with its status. A 503 used to be written as
+    {duration_ms: null}, which then read as "no length known" for good — and
+    an unknown length is charged nothing against the budget. A record from
+    before the status existed that holds no length may be one of those, so it
+    is asked once more; the new record then wins.
+    """
     tid = (uri or "").rsplit(":", 1)[-1]
     if not tid:
         return None
-    if tid in cache:
-        return cache[tid]["duration_ms"]
+    hit = cache.get(tid)
+    if hit and ("status" in hit or hit.get("duration_ms") is not None):
+        return hit["duration_ms"]
     resp = sp.get(f"/tracks/{tid}", params={})
-    dur = resp.get("duration_ms") if isinstance(resp, dict) and "_status" not in resp else None
-    rec = {"key": tid, "duration_ms": dur}
+    if not isinstance(resp, dict) or "_status" in resp:
+        return None
+    rec = {"key": tid, "status": 200, "duration_ms": resp.get("duration_ms")}
     append_jsonl(DURATION_CACHE, rec)
     cache[tid] = rec
-    return dur
+    return rec["duration_ms"]
 
 
 def fill_to_target(rows: list[dict], target_ms: int) -> list[dict]:
@@ -512,6 +1329,97 @@ def fill_to_target(rows: list[dict], target_ms: int) -> list[dict]:
         out.append(dict(r, duration_ms=dur))
         used += dur
     return out
+
+
+def below_topup_floor(row: dict) -> bool:
+    """Under RUN_TOPUP_MIN_SCORE on the track's own, unboosted score."""
+    return row.get("base_score", row["score"]) < config.RUN_TOPUP_MIN_SCORE
+
+
+def known_topup(rows: list[dict], kept: set[str], spare_ms: int,
+                place) -> list[dict]:
+    """Known tracks for the time discovery could not fill, best first.
+
+    `rows` are the known side's eligible rows in rank order; those already in
+    the playlist (`kept`) are skipped, and so is anything scoring under
+    RUN_TOPUP_MIN_SCORE. Without that floor the gap filled with whatever came
+    next — Matt Sassari's "Give It To Me - Full Vocal Mix" at 0.186 — and the
+    playlist reached its four hours on tracks the listener lets go. The floor
+    tests the track's OWN score (`base_score` where the `prefer` boost set
+    one): the boost breaks near-ties between rows, and letting it lower the bar
+    would quietly move the floor to 0.16 for Workout members. Heavy Workout
+    tracks under the done-rate floor were left out rather than exempted, for
+    the same reason. Order is still the ranked order, so among rows that clear
+    it a member keeps its edge. A track with no known length, or too long for
+    what is left, is passed over rather than ending the fill.
+    """
+    out = []
+    for r in rows:
+        if r["spotify_track_uri"] in kept or below_topup_floor(r):
+            continue
+        dur = r.get("duration_ms") or 0
+        if dur and dur <= spare_ms:
+            out.append(place(dict(r, duration_ms=dur)))
+            spare_ms -= dur
+    return out
+
+
+class DiscoveryFill:
+    """One playlist's discovery budget, filled supply by supply.
+
+    A pick is re-checked against what is placed NOW, not when it was gated:
+    library picks are gated before any stranger is placed, and a stranger's
+    record can credit a library artist. Search carries the length; /tracks is
+    only the fallback for a hit without one, and what it returns gets the same
+    cap the gate applied to everything else. An unknown length is charged
+    nothing, as it always was.
+    """
+
+    def __init__(self, budget_ms: int, placed: Placements, sp,
+                 duration_cache: dict, elsewhere: set[str]) -> None:
+        self.budget_ms = budget_ms
+        self.placed = placed
+        self.sp = sp
+        self.duration_cache = duration_cache
+        # Acts that already supplied the OTHER playlist. The two runs are
+        # compared against each other, and one act in both says less.
+        self.elsewhere = elsewhere
+        self.rows: list[dict] = []
+
+    def ms(self, supply: str | None = None) -> int:
+        return sum(r["duration_ms"] or 0 for r in self.rows
+                   if supply in (None, r["supply"]))
+
+    @property
+    def full(self) -> bool:
+        return self.ms() >= self.budget_ms
+
+    def count(self, name: str) -> int:
+        """Picks this playlist already took from the act."""
+        key = normalise(name)
+        return sum(1 for r in self.rows if normalise(r["artist_name"]) == key)
+
+    def open_to(self, name: str) -> bool:
+        return normalise(name) not in self.elsewhere
+
+    def take(self, chosen: dict, supply: str, room_ms: int | None = None) -> bool:
+        """Place one pick if it is still fresh, under the length cap, and fits
+        both the budget and `room_ms` (a supply's own ceiling)."""
+        if not self.placed.fresh(chosen):
+            return False
+        dur = (chosen.get("duration_ms")
+               or track_duration(self.sp, chosen["spotify_track_uri"],
+                                 self.duration_cache))
+        if dur and dur > config.RUN_MAX_DISCOVERY_MS:
+            return False
+        room = self.budget_ms - self.ms()
+        if room_ms is not None:
+            room = min(room, room_ms)
+        if (dur or 0) > room:
+            return False
+        self.placed.place(chosen)
+        self.rows.append(dict(chosen, duration_ms=dur, supply=supply))
+        return True
 
 
 # --------------------------------------------------------------------------
@@ -555,11 +1463,16 @@ def interleave(known: list[dict], discovery: list[dict]) -> list[dict]:
 
 
 def register_sources(con: duckdb.DuckDBPyConnection) -> None:
+    # No recommendations.parquet: Stage 10 does not read Stage 5. Discovery is
+    # seeded on each cluster's own artists (cluster_candidates), and the old
+    # Stage 5 top-up is gone — see build_selections.
+    # plays_raw, not just plays, because "never heard" has to include the
+    # sub-30-second skips plays drops (heard_keys).
     needed = {
         "plays": config.PLAYS_PARQUET,
+        "plays_raw": config.PLAYS_RAW_PARQUET,
         "artist_tags": config.ARTIST_TAGS_PARQUET,
         "track_credits": config.DATA_DIR / "track_credits.parquet",
-        "recommendations": config.RECOMMENDATIONS_PARQUET,
     }
     for name, path in needed.items():
         if not path.exists():
@@ -572,140 +1485,195 @@ def build_selections(con, http, sp) -> list[dict]:
     previews exactly what a live run would do."""
     tag_cache = load_jsonl(config.CACHE_DIR / "candidate_tags.jsonl", "mbid")
     genre_rec_cache = load_jsonl(GENRE_RECORDINGS_CACHE, "key")
-    artist_tracks_cache = load_jsonl(ARTIST_TRACKS_CACHE, "key")
+    credited_cache = load_jsonl(SP_TRACKS_CREDITED_CACHE, "key")
     duration_cache = load_jsonl(DURATION_CACHE, "key")
     sim_cache = load_jsonl(SIMILAR_CACHE, "seed_mbid")
     vocab = load_genre_vocabulary(http)
+    drag = drag_artists(con)
 
-    pins, vetoes = load_overrides()
+    overrides = load_overrides()
+    pins, vetoes = overrides["pins"], overrides["vetoes"]
     target_ms = config.RUN_TARGET_MINUTES * 60_000
     known_ms = int(target_ms * config.RUN_KNOWN_FRACTION)
+
+    # Each prefer playlist is read once, however many runs it applies to.
+    prefer_sets = {name: prefer_members(sp, [name]) for name in dict.fromkeys(
+        p["track_name"] for p in overrides["prefer"])}
 
     # Shared across BOTH playlists. These are meant to be compared on real
     # runs, so a track — or an artist — appearing in both makes the comparison
     # say less. The first dry run put The Prodigy and Breathe Carolina in each.
-    used_uris: set[str] = set()
-    used_songs: set[str] = set()
-    used_discovery_artists: set[str] = set()
-
-    def fresh(row: dict) -> bool:
-        """Not already placed, in this playlist or the other one.
-
-        Song identity is the FOLDED title, not the URI: Spotify presses the
-        album cut, the single and the extended mix as distinct URIs, and the
-        first dry run duly listed jigitz's 'tell you straight' twice in one
-        playlist.
-        """
-        uri = row.get("spotify_track_uri")
-        song = (normalise(row.get("artist_name") or ""),
-                _title_key(row.get("track_name") or ""))
-        return uri not in used_uris and song not in used_songs
-
-    def place(row: dict) -> dict:
-        used_uris.add(row.get("spotify_track_uri"))
-        used_songs.add((normalise(row.get("artist_name") or ""),
-                        _title_key(row.get("track_name") or "")))
-        return row
+    # Placements says what "the same track" means; see its docstring.
+    placed = Placements()
+    fresh, place = placed.fresh, placed.place
+    supplied_elsewhere: set[str] = set()
+    heard = heard_keys(con)
 
     out = []
     for cluster in CLUSTERS:
         label, tags = cluster["label"], list(cluster["tags"])
-        print(f"\n{pretty(label)} run")
+        print(f"\n{pretty(cluster['title'])} run")
+        placed.new_playlist()
 
         # Pins are placed first and are exempt from folding: the suffix IS the
         # record, and folding would let a different pressing take the slot.
         pinned = [place(p) for p in resolve_pins(con, pins, label)]
-        known_rows = [r for r in select_known(con, label, limit=600)
-                      if not vetoed(r, vetoes) and not is_live(r["track_name"])
-                      and fresh(r)]
-        picked: list[dict] = []
-        for r in known_rows:
-            if fresh(r):
-                picked.append(place(r))
+
+        # The prefer boost re-ranks before anything is filtered, so a member
+        # still has to clear every filter below; pins never pass through it.
+        names = [p["track_name"] for p in overrides["prefer"]
+                 if not p["playlist"] or p["playlist"] == label]
+        members = {"uris": set(), "songs": set()}
+        for n in dict.fromkeys(names):
+            members["uris"] |= prefer_sets[n]["uris"]
+            members["songs"] |= prefer_sets[n]["songs"]
+        known_rows = apply_prefer(select_known(con, label), members)
+        prefer = None
+        if names:
+            prefer = {"names": list(dict.fromkeys(names)),
+                      "members": len(members["uris"]),
+                      "boosted": sum(1 for r in known_rows if r.get("preferred"))}
+            print(f"  {' + '.join(prefer['names'])}: {prefer['members']} "
+                  f"members, {prefer['boosted']} boosted")
+
+        # Veto, live, fresh, THEN the per-artist cap — so a filtered row never
+        # holds a slot, and dropping one track promotes that artist's next.
+        # eligible_known is lazy: each row is judged after the one before it
+        # was placed.
+        picked = [place(r) for r in eligible_known(known_rows, vetoes, fresh,
+                                                   pinned)]
         known = fill_to_target(pinned + picked, known_ms)
         # Anything the duration fill rejected must not stay claimed, or it
         # cannot be offered to the other playlist.
         kept = {k["spotify_track_uri"] for k in known}
         for r in pinned + picked:
             if r["spotify_track_uri"] not in kept:
-                used_uris.discard(r["spotify_track_uri"])
-                used_songs.discard((normalise(r.get("artist_name") or ""),
-                                    _title_key(r.get("track_name") or "")))
+                placed.release(r)
         print(f"  {len(known)} known tracks "
               f"({sum(1 for k in known if k.get('pinned'))} pinned), "
               f"{sum(k['duration_ms'] for k in known)/60000:.0f} min")
 
-        # Cluster-seeded candidates first; Stage 5's library-wide list is the
-        # top-up when ListenBrainz is thin. Both must clear the same intensity
-        # bar a library artist clears.
-        candidates = cluster_candidates(con, http, label, tag_cache,
-                                        sim_cache, vocab)
-        seeded = len(candidates)
-        have = {c["mbid"] for c in candidates}
-        for c in select_candidates(con, tags, tag_cache):
-            if c["mbid"] in have:
-                continue
-            cl, share = classify_tags(
-                (tag_cache.get(c["mbid"]) or {}).get("tags", []),
-                min_weight=config.RUN_MIN_CANDIDATE_CLUSTER_WEIGHT)
-            if cl == label:
-                candidates.append(dict(c, share=share))
-        print(f"  {len(candidates)} candidates clear the "
-              f"{config.RUN_MIN_INTENSITY_SHARE:.2f} intensity bar "
-              f"({seeded} from your own artists' neighbours)")
+        # DISCOVERY, in supply order within one budget. SJ's call (2026-09-26):
+        # when new music runs short, fill with more of his OWN, and never keep
+        # a weak stranger just to hold the quota. Once the seed fixes cut Todd
+        # Edwards' chain, garage discovery fell to about 9 tracks, and the
+        # known top-up alone would have turned the 40% discovery share into
+        # ~10%; an unplayed Sammy Virji record was a keep where the strangers
+        # were not. So:
+        #   1. acts named by hand (`discover` rows);
+        #   2. the cluster's own artists' unplayed tracks, one each, up to
+        #      RUN_LIBRARY_DISCOVERY_FRACTION of the budget;
+        #   3. strangers from the cluster's ListenBrainz neighbourhood;
+        #   4. more of the listener's own artists, into what strangers left;
+        #   5. known tracks, below.
+        # Every pick from every supply passes the same track gate, and nothing
+        # the listener has started — not even a 20-second skip — counts as new.
+        fill = DiscoveryFill(int(target_ms - sum(k["duration_ms"] for k in known)),
+                             placed, sp, duration_cache, supplied_elsewhere)
+        picks_for = partial(candidate_picks, sp, http, tags=tags,
+                            credited_cache=credited_cache,
+                            genre_cache=genre_rec_cache, drag=drag,
+                            vetoes=vetoes, is_fresh=fresh, heard=heard)
 
-        discovery: list[dict] = []
-        budget_ms = target_ms - sum(k["duration_ms"] for k in known)
-        got_ms = 0
-        for cand in candidates:
-            if got_ms >= budget_ms:
+        # 1. No share test — a hand answer outranks a computed one — and no
+        #    MBID, so Spotify's relevance order; but the same gate.
+        for row in overrides["discover"]:
+            name = row["artist_name"]
+            if row["playlist"] != label:
+                continue
+            if vetoed({"artist_name": name, "track_name": ""}, vetoes):
+                print(f"  ! discover row for {name!r} is vetoed artist-wide "
+                      f"too; the veto wins")
+                continue
+            if fill.full or not fill.open_to(name) or fill.count(name):
+                continue
+            for chosen in picks_for({"artist_name": name, "mbid": None},
+                                    k=config.RUN_DISCOVERY_TRACKS_PER_ARTIST):
+                fill.take(chosen, "discover-row")
+
+        # 2. One track per library artist, capped so strangers still get a
+        #    look-in; a pick too long for what is left of the cap is passed
+        #    over for the artist's next.
+        library = library_discovery(con, sp, http, label, tags, credited_cache,
+                                    genre_rec_cache, drag, vetoes, fresh, heard)
+        lib_cap = int(fill.budget_ms * config.RUN_LIBRARY_DISCOVERY_FRACTION)
+        for artist, picks in library:
+            name = artist["artist_name"]
+            if fill.full or fill.ms("library-artist") >= lib_cap:
                 break
-            if normalise(cand["artist_name"]) in used_discovery_artists:
+            if not fill.open_to(name) or fill.count(name):
                 continue
-            tracks = sp_artist_tracks(sp, cand["artist_name"], artist_tracks_cache)
-            if not tracks:
-                continue
-            on_genre = mb_genre_recordings(http, cand["mbid"], tags, genre_rec_cache)
-            for chosen in choose_tracks(tracks, on_genre,
-                                        config.RUN_DISCOVERY_TRACKS_PER_ARTIST):
-                if (not fresh(chosen) or vetoed(chosen, vetoes)
-                        or is_live(chosen.get("track_name", ""))):
-                    continue
-                dur = track_duration(sp, chosen["spotify_track_uri"], duration_cache)
-                if got_ms + (dur or 0) > budget_ms:
-                    continue
-                place(chosen)
-                used_discovery_artists.add(normalise(cand["artist_name"]))
-                discovery.append(dict(chosen, duration_ms=dur))
-                got_ms += dur or 0
+            for chosen in picks:
+                if fill.take(chosen, "library-artist",
+                             room_ms=lib_cap - fill.ms("library-artist")):
+                    break
 
+        # 3. Strangers come only from this cluster's own neighbourhood. There
+        #    is deliberately no Stage 5 top-up any more: once the seed and
+        #    share fixes landed, its only garage contribution was Basement
+        #    Jaxx — the very miss cluster seeding was built to fix — and every
+        #    dubstep act it passed was already seeded.
+        candidates = cluster_candidates(con, http, label, tag_cache,
+                                        sim_cache, vocab, vetoes)
+        print(f"  {len(candidates)} candidates clear the "
+              f"{config.RUN_MIN_CANDIDATE_SHARE:.2f} stranger bar")
+        for cand in candidates:
+            if fill.full:
+                break
+            if not fill.open_to(cand["artist_name"]) or fill.count(cand["artist_name"]):
+                continue
+            for chosen in picks_for(cand, k=config.RUN_DISCOVERY_TRACKS_PER_ARTIST):
+                fill.take(chosen, "stranger")
+
+        # 4. What strangers left goes back to the listener's own artists, up
+        #    to RUN_LIBRARY_DISCOVERY_TRACKS_PER_ARTIST each, with no cap.
+        for artist, picks in library:
+            name = artist["artist_name"]
+            if fill.full:
+                break
+            if not fill.open_to(name):
+                continue
+            for chosen in picks:
+                if fill.count(name) >= config.RUN_LIBRARY_DISCOVERY_TRACKS_PER_ARTIST:
+                    break
+                fill.take(chosen, "library-artist")
+
+        discovery = fill.rows
+        got_ms = fill.ms()
+        supplied_elsewhere |= {normalise(d["artist_name"]) for d in discovery}
+        supply = {s: sum(1 for d in discovery if d["supply"] == s)
+                  for s in ("discover-row", "library-artist", "stranger")}
         matched = sum(1 for d in discovery if d.get("genre_matched"))
         print(f"  {len(discovery)} discovery tracks "
-              f"({matched} matched on recording-level tags), {got_ms/60000:.0f} min")
+              f"({matched} matched on recording-level tags), {got_ms/60000:.0f} min: "
+              f"{supply['discover-row']} hand-named, "
+              f"{supply['library-artist']} library-artist, "
+              f"{supply['stranger']} strangers")
 
-        # Discovery that cannot fill its third hands the time back rather than
-        # shipping a short playlist. MusicBrainz barely tags current speed
+        # 5. Discovery that cannot fill its share hands the time back rather
+        # than shipping a short playlist. MusicBrainz barely tags current speed
         # garage, so that cluster's candidate pool is thin through no fault of
         # the listener's — and a known track they already like beats a gap.
+        # But not at any score: known_topup has the floor and why.
         spare_ms = target_ms - sum(k["duration_ms"] for k in known) - got_ms
-        if spare_ms > 0:
-            topup = []
-            for r in picked:
-                if r["spotify_track_uri"] in kept:
-                    continue
-                dur = r.get("duration_ms") or 0
-                if dur and dur <= spare_ms:
-                    topup.append(place(dict(r, duration_ms=dur)))
-                    spare_ms -= dur
-            if topup:
-                print(f"  + {len(topup)} more known tracks to fill the gap "
-                      f"discovery left, "
-                      f"{sum(t['duration_ms'] for t in topup)/60000:.0f} min")
-                known = known + topup
+        topup = known_topup(picked, kept, spare_ms, place) if spare_ms > 0 else []
+        if topup:
+            print(f"  + {len(topup)} more known tracks to fill the gap "
+                  f"discovery left, "
+                  f"{sum(t['duration_ms'] for t in topup)/60000:.0f} min")
+            known = known + topup
+        floored = sum(1 for r in picked if r["spotify_track_uri"] not in kept
+                      and below_topup_floor(r))
+        if spare_ms > 0 and floored:
+            print(f"  ({floored} more known tracks score under the "
+                  f"{config.RUN_TOPUP_MIN_SCORE:.2f} top-up floor and stay out)")
 
         tracks = interleave(known, discovery)
+        total_ms = sum((t.get("duration_ms") or 0) for t in tracks)
         out.append({"label": label, "tags": tags, "tracks": tracks,
-                    "n_known": len(known), "n_new": len(discovery)})
+                    "n_known": len(known), "n_new": len(discovery),
+                    "prefer": prefer, "supply": supply, "n_topup": len(topup),
+                    "short_min": max(0.0, (target_ms - total_ms) / 60_000)})
     return out
 
 
@@ -733,6 +1701,11 @@ def publish(sp, con, selections: list[dict]) -> list[dict]:
 
     Contents are snapshotted into data/playlists.parquet BEFORE any replace, so
     nothing this overwrites goes unrecorded — hand-added tracks included.
+
+    A RENAME HAPPENS IN PLACE. The playlist is found by its stored ID, then by
+    its current name, then by a legacy name — all exact — and the metadata PUT
+    below carries the current name, so the old playlist keeps its ID, URL and
+    followers. State, archive and overrides stay keyed on the label.
     """
     state = load_state()
     run_date = date.today().isoformat()
@@ -740,8 +1713,9 @@ def publish(sp, con, selections: list[dict]) -> list[dict]:
 
     for sel in selections:
         label = sel["label"]
-        name = config.RUN_PLAYLIST_NAME_TEMPLATE.format(label=label)
-        pid = ensure_playlist(sp, label, name, state)
+        name = playlist_name(label)
+        pid = ensure_playlist(sp, label, name, state,
+                              aliases=config.RUN_PLAYLIST_LEGACY_NAMES.get(label, ()))
         state[label] = {"id": pid, "name": name}
 
         for row in playlist_items(sp, pid):
@@ -766,10 +1740,12 @@ def publish(sp, con, selections: list[dict]) -> list[dict]:
         # `public: false` is accepted on create and then reported as true, and a
         # later PUT does not change it either. These stay off the public profile
         # page but ARE readable by direct link; the description must not claim
-        # otherwise.
+        # otherwise. `name` rides along so a renamed cluster's playlist takes
+        # its new title here, as Stage 8 already does.
         sp.put(f"/playlists/{pid}", json={
+            "name": name,
             "description": config.RUN_PLAYLIST_DESCRIPTION_TEMPLATE.format(
-                label=label, known=sel["n_known"], new=sel["n_new"],
+                title=TITLES[label], known=sel["n_known"], new=sel["n_new"],
                 date=run_date),
         })
 
@@ -780,7 +1756,11 @@ def publish(sp, con, selections: list[dict]) -> list[dict]:
                 "slot": t.get("slot"), "artist_name": t.get("artist_name"),
                 "track_name": t.get("track_name"),
                 "spotify_track_uri": t.get("spotify_track_uri"),
-                "source": "library" if t.get("slot") == "anchor" else "discovery",
+                # Known rows stay `library`; a discovery row says which supply
+                # it came from, so a verdict can be read per supply. Same
+                # column, same type: the archive schema does not change.
+                "source": ("library" if t.get("slot") == "anchor"
+                           else t.get("supply") or "discovery"),
             })
         print(f"  wrote {len(uris)} tracks to {name!r}")
 
@@ -792,6 +1772,10 @@ def publish(sp, con, selections: list[dict]) -> list[dict]:
 # --------------------------------------------------------------------------
 # Report — the verification surface, as with every other stage
 # --------------------------------------------------------------------------
+
+# One mark per discovery supply, so a dry run reads per supply without a
+# second listing. Known rows print blank, pins `*`.
+SUPPLY_FLAGS = {"stranger": "+", "library-artist": "~", "discover-row": "#"}
 
 
 def report(con, selections: list[dict], dry: bool) -> None:
@@ -818,7 +1802,8 @@ def report(con, selections: list[dict], dry: bool) -> None:
         FROM artist_clusters
         WHERE greatest(coalesce(garage_share, 0), coalesce(bass_share, 0))
               BETWEEN {lo} AND {hi}
-        ORDER BY best DESC LIMIT 15
+        -- The name breaks ties, or the LIMIT picks among them at random.
+        ORDER BY best DESC, artist_name LIMIT 15
         """
     ).fetchall()
     if border:
@@ -833,7 +1818,7 @@ def report(con, selections: list[dict], dry: bool) -> None:
         FROM plays p
         LEFT JOIN artist_tags t ON t.artist_name = p.artist_name
         WHERE t.artist_name IS NULL AND p.artist_name IS NOT NULL
-          AND p.month >= (SELECT max(month) FROM plays)
+          AND p.month >= {config.ANALYSIS_HORIZON_SQL}
                          - INTERVAL {config.RUN_WINDOW_MONTHS} MONTH
         GROUP BY 1 ORDER BY h DESC LIMIT 12
         """
@@ -846,17 +1831,33 @@ def report(con, selections: list[dict], dry: bool) -> None:
 
     for sel in selections:
         mins = sum((t.get("duration_ms") or 0) for t in sel["tracks"]) / 60000
-        print(f"\n--- {config.RUN_PLAYLIST_NAME_TEMPLATE.format(label=sel['label'])}")
+        print(f"\n--- {playlist_name(sel['label'])}")
         print(f"    {len(sel['tracks'])} tracks, {mins:.0f} min "
               f"({sel['n_known']} known + {sel['n_new']} new)")
+        if sel.get("supply") is not None:
+            s = sel["supply"]
+            print(f"    {s['discover-row']} hand-named, "
+                  f"{s['library-artist']} library-artist, "
+                  f"{s['stranger']} strangers, {sel['n_topup']} known top-up, "
+                  f"{sel['short_min']:.0f} min short")
+        if round(sel.get("short_min") or 0) >= 1:
+            print(f"    ! {sel['short_min']:.0f} min short of the "
+                  f"{config.RUN_TARGET_MINUTES}-min target: nothing else fits "
+                  f"that clears the {config.RUN_TOPUP_MIN_SCORE:.2f} top-up floor")
+        if sel.get("prefer"):
+            p = sel["prefer"]
+            print(f"    {' + '.join(p['names'])}: {p['members']} members, "
+                  f"{p['boosted']} boosted")
         for t in sel["tracks"]:
             flag = "*" if t.get("pinned") else (
-                "+" if t.get("slot") == "discovery" else " ")
+                SUPPLY_FLAGS.get(t.get("supply"), "+")
+                if t.get("slot") == "discovery" else " ")
             dur = (t.get("duration_ms") or 0) / 60000
             print(f"    {t.get('position', 0):>2}{flag} {dur:4.1f}m  "
                   f"{(t.get('artist_name') or '')[:26]:<26} "
                   f"{(t.get('track_name') or '')[:40]}")
-    print("\n    * pinned by hand    + discovery (not in your library)")
+    print("\n    * pinned by hand    + stranger    ~ your artist, a track you "
+          "have never started    # hand-named act")
     if dry:
         print("\nNothing was written. Re-run with --write to build them.")
     print("=" * 74)

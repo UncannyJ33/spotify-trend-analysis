@@ -96,6 +96,73 @@ check("error envelope yields no tracks",
 
 
 # --------------------------------------------------------------------------
+# Only an ANSWER is cached. A 429 or a dropped connection used to be written
+# as "this artist has no tracks", and an append-only cache never asks again.
+# --------------------------------------------------------------------------
+
+appended = []
+playlists.append_jsonl = lambda path, rec: appended.append(rec)
+
+
+class SeqSp:
+    """Answers each /search with the next canned response."""
+    def __init__(self, *resps):
+        self.resps = list(resps)
+        self.calls = 0
+    def get(self, path, params=None):
+        self.calls += 1
+        return self.resps.pop(0)
+
+
+ok_page = {"tracks": {"items": [item("spotify:track:ok", "Energy Drink", "Virtual Riot")]}}
+cache = {}
+sp = SeqSp({"_status": 429, "_body": "slow down"}, ok_page)
+check("a 429 yields no tracks", playlists.sp_artist_tracks(sp, "Virtual Riot", cache), [])
+check("...and is not cached", (appended, cache), ([], {}))
+check("...so the next call re-asks, and gets the answer",
+      [t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "Virtual Riot", cache)],
+      ["spotify:track:ok"])
+check("...having asked twice", sp.calls, 2)
+check("the answer is cached with its status",
+      appended, [{"key": playlists.normalise("Virtual Riot"), "artist": "Virtual Riot",
+                  "status": 200, "tracks": [{"track_name": "Energy Drink",
+                                             "spotify_track_uri": "spotify:track:ok"}]}])
+
+appended.clear()
+sp = SeqSp(None)
+check("no response at all yields no tracks, and caches nothing",
+      (playlists.sp_artist_tracks(sp, "Virtual Riot", {}), appended), ([], []))
+
+# An empty 200 is an answer: Spotify does not carry them. Asked once.
+sp = SeqSp({"tracks": {"items": []}})
+cache = {}
+playlists.sp_artist_tracks(sp, "Nobody At All", cache)
+playlists.sp_artist_tracks(sp, "Nobody At All", cache)
+check("an empty 200 is cached, with its status, and asked once",
+      (appended[-1]["status"], appended[-1]["tracks"], sp.calls), (200, [], 1))
+
+# Records from before the status existed: an empty one may have been a
+# failure, so it is re-asked ONCE and the new record wins; one with tracks is
+# a real answer and never re-asked.
+appended.clear()
+legacy = {playlists.normalise("Was Throttled"):
+              {"key": playlists.normalise("Was Throttled"), "artist": "Was Throttled",
+               "tracks": []},
+          playlists.normalise("Had Tracks"):
+              {"key": playlists.normalise("Had Tracks"), "artist": "Had Tracks",
+               "tracks": [{"track_name": "Old", "spotify_track_uri": "spotify:track:old"}]}}
+sp = SeqSp({"tracks": {"items": [item("spotify:track:wt", "Now Here", "Was Throttled")]}})
+check("a legacy empty entry is re-asked",
+      [t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "Was Throttled", legacy)],
+      ["spotify:track:wt"])
+playlists.sp_artist_tracks(sp, "Was Throttled", legacy)
+check("...once: the new record then wins", (sp.calls, len(appended)), (1, 1))
+check("a legacy entry with tracks is never re-asked",
+      ([t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "Had Tracks", legacy)],
+       sp.calls), (["spotify:track:old"], 1))
+
+
+# --------------------------------------------------------------------------
 # The client itself: 429 handling, error envelopes, and the missing verb.
 # --------------------------------------------------------------------------
 
