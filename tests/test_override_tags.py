@@ -5,6 +5,9 @@ Tag coverage in this library falls monotonically with listening time: 100% of
 resolve perfectly and still contribute nothing, and the smaller the act the
 likelier that is. This is the only path by which a genre enters the project by
 hand rather than by lookup, so it has to refuse bad input loudly.
+
+The last section covers the other side of that file: the names resolution must
+refuse, so that they reach the review list the file answers.
 """
 import sys
 sys.path.insert(0, ".")
@@ -426,6 +429,87 @@ check("second run: the tags-only name is cached, so zero requests",
       sum(http.calls.values()), 0)
 check("second run: its hand tags are still applied",
       [t for t in tags if t[0] == "Tiny Act"], [("Tiny Act", "pop rap", "override")])
+
+# --------------------------------------------------------------------------
+# A name the fold throws away must never exact-match — the resolution side of
+# the review list the override file answers. normalise() keeps only [a-z0-9]:
+# an all-non-Latin name folds to '' and so does every non-Latin candidate, so
+# all of them compared equal; `¥$` folds to 's' and a candidate literally named
+# "S" was an exact primary match. Such a name must land on the review list as
+# ambiguous, for a hand answer (an MBID or NONE), never as `resolved`.
+# --------------------------------------------------------------------------
+class CandidateHttp:
+    """The name search only, answering every query with a fixed candidate list."""
+    def __init__(self, artists):
+        self.artists, self.calls = artists, 0
+    def get(self, url, **kw):
+        if url != enrich.MB_SEARCH_URL:
+            raise AssertionError(f"unexpected request: {url}")
+        self.calls += 1
+        return FakeResponse({"artists": self.artists})
+
+
+def tagged(mbid, name, score, aliases=(), tag="rock"):
+    return {"id": mbid, "name": name, "score": score,
+            "aliases": [{"name": a} for a in aliases],
+            "tags": [{"name": tag, "count": 5}]}
+
+
+NON_LATIN = [tagged(WRONG, "Кино", 100, tag="post-punk"),
+             tagged(WRONG2, "坂本龍一", 95, aliases=["さかもと りゅういち"])]
+S_LIKE = [tagged(WRONG, "S", 100, tag="indie rock"),
+          tagged(WRONG2, "Somebody Else", 80, aliases=["S"])]
+
+for name, cands, why in (
+    ("Кино", NON_LATIN, "an all-Cyrillic name (folds to '')"),
+    ("ヨルシカ", NON_LATIN, "an all-Japanese name (folds to '')"),
+    ("¥$", S_LIKE, "¥$ against a candidate named, and one aliased, 'S'"),
+    ("¥$", NON_LATIN, "¥$ against non-Latin candidates"),
+    ("M", [tagged(WRONG, "MØ", 100, tag="electropop")],
+     "a candidate whose own name folds away ('MØ' -> 'm')"),
+):
+    http = CandidateHttp(cands)
+    rec = enrich.resolve_via_musicbrainz(http, name)
+    check(f"{why}: not resolved",
+          (rec["status"], rec["mbid"], rec["tags"]), ("ambiguous", None, []))
+    check(f"{why}: the nearest candidate is kept for the reviewer",
+          (rec["matched_name"], rec["n_candidates"], http.calls),
+          (cands[0]["name"], len(cands), 1))
+
+# The rule must not cost the names that resolve today.
+for name, cands, want in (
+    # How the real cache holds him: non-Latin primary name, Latin alias.
+    ("Valentin Silvestrov",
+     [tagged(ORGANIC, "Валентин Сильвестров", 100, aliases=["Valentin Silvestrov"])],
+     ORGANIC),
+    ("Snøw", [tagged(ORGANIC, "Snøw", 90)], ORGANIC),          # loses 1 of 4
+    ("The xx", [tagged(ORGANIC, "The xx", 100)], ORGANIC),     # the/and is not loss
+    ("ＰＬＡＴ", [tagged(ORGANIC, "PLAT", 100)], ORGANIC),       # NFKD folds, not drops
+    ("S", S_LIKE, WRONG),     # a genuine 'S' still matches its own name
+):
+    rec = enrich.resolve_via_musicbrainz(CandidateHttp(cands), name)
+    check(f"{name!r} still resolves", (rec["status"], rec["mbid"]), ("resolved", want))
+
+for name, want in (("¥$", True), ("Кино", True), ("MØ", True), ("The The", True),
+                   ("BTS (방탄소년단)", True), ("", True),
+                   ("M", False), ("Snøw", False), ("The xx", False),
+                   ("A$AP Rocky", False), ("Florence + The Machine", False),
+                   ("Beyoncé", False), ("AC/DC", False)):
+    check(f"fold_discards_name({name!r})", enrich.fold_discards_name(name), want)
+
+# And the consequence that matters: ambiguous is on the review list.
+cache = {n: enrich.resolve_via_musicbrainz(CandidateHttp(c), n)
+         for n, c in (("¥$", S_LIKE), ("Кино", NON_LATIN))}
+con = duckdb.connect()
+con.execute("CREATE TABLE artist_weight (artist_name VARCHAR, listening_hours DOUBLE)")
+con.executemany("INSERT INTO artist_weight VALUES (?, ?)", [("¥$", 11.0), ("Кино", 1.0)])
+enrich.write_outputs(con, cache, VOCAB)
+check("both land on artist_review.parquet, by hours",
+      [r[0] for r in duckdb.sql(f"SELECT artist_name FROM '{enrich.REVIEW_PARQUET}'")
+       .fetchall()], ["¥$", "Кино"])
+check("neither reaches artist_tags",
+      duckdb.sql(f"SELECT count(*) FROM '{enrich.config.ARTIST_TAGS_PARQUET}'")
+      .fetchone()[0], 0)
 
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)

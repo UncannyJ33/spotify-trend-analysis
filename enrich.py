@@ -75,16 +75,53 @@ RESOLUTION_PARQUET = config.DATA_DIR / "artist_resolution.parquet"
 _SUBSTITUTIONS = {"$": "s", "€": "e", "£": "l", "@": "a", "!": "i", "0": "o"}
 
 
+def _prefold(name: str) -> str:
+    """normalise() up to the point where it starts discarding characters."""
+    name = "".join(_SUBSTITUTIONS.get(ch, ch) for ch in name)
+    name = unicodedata.normalize("NFKD", name)
+    name = "".join(c for c in name if not unicodedata.combining(c))
+    return name.casefold()
+
+
 def normalise(name: str) -> str:
     """Fold a name to a comparison key: accents, case and punctuation removed."""
     if not name:
         return ""
-    name = "".join(_SUBSTITUTIONS.get(ch, ch) for ch in name)
-    name = unicodedata.normalize("NFKD", name)
-    name = "".join(c for c in name if not unicodedata.combining(c))
-    name = name.casefold()
-    name = re.sub(r"\b(?:the|and)\b", "", name)
+    name = re.sub(r"\b(?:the|and)\b", "", _prefold(name))
     return re.sub(r"[^a-z0-9]+", "", name)
+
+
+def fold_discards_name(name: str) -> bool:
+    """Has normalise() thrown away so much of `name` that its key proves nothing?
+
+    normalise() keeps only [a-z0-9], so a character outside the Latin script is
+    discarded rather than folded. An all-Cyrillic or all-Japanese name comes out
+    as '' — and so does every non-Latin MusicBrainz candidate, so they all
+    compare equal and whichever ranks first is taken as an exact primary-name
+    match. `¥$` is the partial case, and the one that reaches Stage 2 now that
+    credits.py keeps non-ASCII album artists: `¥` has no Latin decomposition and
+    is dropped, `$` becomes `s` (the A$AP substitution), and the key is the
+    single letter 's' — which a candidate literally named "S" matches exactly.
+    MØ folds to 'm' the same way.
+
+    The rule: the key must keep MORE of the name's identity-bearing characters
+    (letters, digits and symbols, in any script) than the fold discards. `¥$`
+    keeps one and loses one, so it is refused; `Snøw` keeps three of four and
+    still resolves. Spaces, punctuation and the/and are not counted, because
+    dropping those is the fold working as designed — "The xx" folds to 'xx'
+    having lost nothing that identifies it. A length floor on the key (under 2)
+    was the obvious alternative and refuses the same two names in this library,
+    ¥$ and MØ out of ~3,100, but it measures the wrong thing: it would refuse a
+    one-letter name that lost nothing, and pass "BTS (방탄소년단)" having
+    silently compared only the part it could read.
+    """
+    kept = len(normalise(name))
+    if not kept:
+        return True
+    lost = sum(1 for c in _prefold(name)
+               if unicodedata.category(c)[0] in "LNS"
+               and not ("a" <= c <= "z" or "0" <= c <= "9"))
+    return lost >= kept
 
 
 # --------------------------------------------------------------------------
@@ -446,6 +483,15 @@ def resolve_via_musicbrainz(http: Throttled, name: str) -> dict:
 
     target = normalise(name)
 
+    def same(candidate_name: str) -> bool:
+        # Checked on the candidate's side too: searching a genuine "M", a
+        # candidate called "MØ" folds to 'm' and would otherwise be an exact
+        # primary match. A candidate whose non-Latin primary name folds away
+        # can still match on a Latin alias — that is how Valentin Silvestrov
+        # resolves to "Валентин Сильвестров" — because each name is tested
+        # on its own.
+        return normalise(candidate_name) == target and not fold_discards_name(candidate_name)
+
     def match_rank(c: dict) -> tuple | None:
         """Rank an exact match, or None if it does not match at all.
 
@@ -456,22 +502,25 @@ def resolve_via_musicbrainz(http: Throttled, name: str) -> dict:
         at 82 — and the rapper is the one with tags. Preferring a primary-name
         match over an alias match settles it; tags and score break ties.
         """
-        primary = normalise(c.get("name", "")) == target
-        alias = any(
-            normalise(a.get("name", "")) == target
-            for a in (c.get("aliases") or [])
-        )
+        primary = same(c.get("name", ""))
+        alias = any(same(a.get("name", "")) for a in (c.get("aliases") or []))
         if not (primary or alias):
             return None
         n_tags = len(c.get("tags") or [])
         return (primary, n_tags > 0, c.get("score") or 0, n_tags)
 
-    ranked = sorted(
-        ((match_rank(c), c) for c in candidates),
-        key=lambda pair: pair[0] or (),
-        reverse=True,
-    )
-    exact = next((c for rank, c in ranked if rank is not None), None)
+    exact = None
+    # A name whose fold discarded it (see fold_discards_name) can be matched
+    # by nothing: every candidate is refused and the name goes to the review
+    # list as ambiguous, for a hand answer — an MBID, or NONE. The search is
+    # still made, so the review row can show the nearest candidate.
+    if not fold_discards_name(name):
+        ranked = sorted(
+            ((match_rank(c), c) for c in candidates),
+            key=lambda pair: pair[0] or (),
+            reverse=True,
+        )
+        exact = next((c for rank, c in ranked if rank is not None), None)
 
     if exact is None:
         top = candidates[0]
