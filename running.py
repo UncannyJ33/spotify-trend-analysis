@@ -328,8 +328,74 @@ def select_known(con: duckdb.DuckDBPyConnection, label: str,
 # --------------------------------------------------------------------------
 
 
+def cluster_seed_artists(con: duckdb.DuckDBPyConnection, label: str,
+                         vetoes: set[tuple]) -> list[dict]:
+    """This cluster's own artists, ranked by what their tracks earn in the known
+    pool — ONE row per MusicBrainz artist.
+
+    Joined to a one-row-per-name view of artist_tags, never to artist_tags
+    itself: that table has a row per TAG, and the old join counted an artist
+    once per tag. Todd Edwards carries eighteen, which lifted him from rank 31
+    to garage seed #17, and his ListenBrainz tail then supplied 13 of the 21
+    garage discovery tracks. Grouped on the MBID, so Skrillex and SKRILLEX
+    pool into one seed rather than counting him twice.
+
+    An artist-wide veto drops a seed under ANY name sharing its MBID. SLANDER
+    was dubstep seed #6 after being vetoed off the playlist itself; seeding on a
+    rejected artist asks ListenBrainz for more of exactly what was rejected.
+
+    Task 8's library-artist discovery reads this list too, so the ranking is
+    total — ties broken on mbid — and unlimited; callers take what they need.
+    """
+    rows = con.execute(
+        f"""
+        WITH a AS (
+            SELECT artist_name, any_value(mbid) AS mbid
+            FROM artist_tags WHERE mbid IS NOT NULL
+            GROUP BY 1
+        ),
+        per_name AS (
+            SELECT c.artist_name, a.mbid,
+                   sum(k.score) AS score, sum(k.hours) AS hours
+            FROM known_pool k
+            JOIN track_credits c USING (spotify_track_uri)
+            JOIN a ON a.artist_name = c.artist_name
+            JOIN artist_clusters ac ON ac.artist_name = c.artist_name
+            WHERE k.cluster = ? AND ac.cluster = ?
+            GROUP BY 1, 2
+        ),
+        seeds AS (
+            SELECT mbid,
+                   -- The spelling carrying more of the score names the seed;
+                   -- a tie falls to the name, so the choice is repeatable.
+                   first(artist_name ORDER BY score DESC, artist_name)
+                       AS artist_name,
+                   sum(score) AS score, sum(hours) AS hours
+            FROM per_name
+            GROUP BY mbid
+            HAVING sum(hours) >= {config.RUN_MIN_SEED_HOURS}
+        )
+        SELECT s.mbid, s.artist_name, s.score, s.hours,
+               (SELECT list(a.artist_name ORDER BY a.artist_name)
+                FROM a WHERE a.mbid = s.mbid) AS names
+        FROM seeds s
+        ORDER BY s.score DESC, s.mbid
+        """,
+        [label, label],
+    ).fetchall()
+    out = []
+    for mbid, name, score, hours, names in rows:
+        if any(vetoed({"artist_name": n, "track_name": ""}, vetoes)
+               for n in names or [name]):
+            continue
+        out.append({"mbid": mbid, "artist_name": name,
+                    "score": float(score), "hours": float(hours)})
+    return out
+
+
 def cluster_candidates(con, http, label: str, tag_cache: dict,
-                       sim_cache: dict, vocab: set[str]) -> list[dict]:
+                       sim_cache: dict, vocab: set[str],
+                       vetoes: set[tuple]) -> list[dict]:
     """Discovery candidates seeded on THIS cluster's own top artists.
 
     Stage 5's recommendations.parquet is seeded across the whole library, so its
@@ -339,43 +405,51 @@ def cluster_candidates(con, http, label: str, tag_cache: dict,
     ListenBrainz "who is like Blair Muir, like NOTION, like Ian Asher" returns
     the right neighbourhood instead.
 
+    Similarity is normalised PER SEED before it is pooled. ListenBrainz scores
+    are not on a common scale: Skrillex's list tops out at 3955 and REAPER's at
+    181, so a raw sum handed the pool to whichever seed is a hub. All twelve
+    dubstep strangers carried a Skrillex contribution while Eptic, Sullivan King
+    and Space Laces went unused. Each neighbour now earns
+    (seed score / total used seed score) x (similarity / that seed's best), so
+    a bigger artist of yours still counts for more, and a hub does not.
+
     Both lookups are the cached, append-only kind the rest of the project uses,
     so a re-run inside the same quarter spends nothing.
     """
-    seeds = con.execute(
-        """
-        SELECT t.artist_name, any_value(t.mbid) AS mbid, sum(k.score) AS score
-        FROM known_pool k
-        JOIN track_credits c USING (spotify_track_uri)
-        JOIN artist_tags t ON t.artist_name = c.artist_name
-        JOIN artist_clusters ac ON ac.artist_name = t.artist_name
-        WHERE k.cluster = ? AND ac.cluster = ? AND t.mbid IS NOT NULL
-        GROUP BY t.artist_name
-        ORDER BY score DESC
-        LIMIT ?
-        """,
-        [label, label, config.RUN_DISCOVERY_SEEDS],
-    ).fetchall()
-    if not seeds:
+    used: list[tuple[dict, list[dict]]] = []
+    for seed in cluster_seed_artists(con, label, vetoes):
+        if len(used) >= config.RUN_DISCOVERY_SEEDS:
+            break
+        similar = fetch_similar(http, seed["mbid"], sim_cache)
+        # ListenBrainz knowing nothing about an artist is no reason to seed on
+        # one fewer: skip it and let the next artist down take the slot.
+        if similar:
+            used.append((seed, similar))
+    if not used:
         return []
-    print(f"  seeding discovery on {len(seeds)} of your own artists: "
-          f"{', '.join(s[0] for s in seeds[:5])}...")
+    print(f"  seeding discovery on {len(used)} of your own artists: "
+          f"{', '.join(s['artist_name'] for s, _ in used[:5])}...")
 
     known_names = {normalise(r[0]) for r in con.execute(
         "SELECT DISTINCT artist_name FROM plays WHERE artist_name IS NOT NULL"
     ).fetchall()}
 
+    total = sum(s["score"] for s, _ in used) or 1.0
     pooled: dict[str, dict] = {}
-    for name, mbid, seed_score in seeds:
-        for sim in fetch_similar(http, mbid, sim_cache):
+    for seed, similar in used:
+        best = max(float(x.get("score") or 0) for x in similar) or 1.0
+        weight = seed["score"] / total
+        for sim in similar:
             if normalise(sim["name"]) in known_names or not sim["mbid"]:
                 continue
             row = pooled.setdefault(sim["mbid"], {
                 "artist_name": sim["name"], "mbid": sim["mbid"], "score": 0.0})
             # Similar to several of your cluster artists beats similar to one.
-            row["score"] += float(sim.get("score") or 0)
+            row["score"] += weight * float(sim.get("score") or 0) / best
 
-    ranked = sorted(pooled.values(), key=lambda r: -r["score"])
+    # mbid breaks ties, so the tagging cutoff below never depends on the order
+    # the seeds happened to be walked in.
+    ranked = sorted(pooled.values(), key=lambda r: (-r["score"], r["mbid"]))
     out = []
     for cand in ranked[:config.RUN_MAX_CANDIDATES_TO_TAG]:
         tags = fetch_candidate_tags(http, cand["mbid"], vocab, tag_cache)
@@ -647,7 +721,7 @@ def build_selections(con, http, sp) -> list[dict]:
         # top-up when ListenBrainz is thin. Both must clear the same intensity
         # bar a library artist clears.
         candidates = cluster_candidates(con, http, label, tag_cache,
-                                        sim_cache, vocab)
+                                        sim_cache, vocab, vetoes)
         seeded = len(candidates)
         have = {c["mbid"] for c in candidates}
         for c in select_candidates(con, tags, tag_cache):

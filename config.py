@@ -274,8 +274,9 @@ RUN_BASS_TAGS = (
 # each named for the act that proved it: `liquid funk` is drum and bass with the
 # intensity taken out (Netsky), `big beat` is The Prodigy's home genre (21 votes,
 # more than his breakbeat), `future garage` is garage's ambient offshoot, and
-# `psytrance` let Infected Mushroom through as dubstep. All four are in the
-# MusicBrainz genre vocabulary, so they can match and be supplied by hand.
+# `psytrance` (18 votes) had Infected Mushroom next in line for a dubstep slot.
+# All four are in the MusicBrainz genre vocabulary, so they can match and be
+# supplied by hand.
 RUN_DRAG_TAGS = (
     "melodic dubstep", "future bass", "chillstep", "deep house",
     "progressive house", "melodic house", "melodic techno", "ambient",
@@ -339,8 +340,19 @@ RUN_MIN_TRACKDONE_RATE = 0.45
 # electronic candidates skew canonical — a first dry run offered Basement Jaxx,
 # Busy P and Mr. Oizo as speed garage, and The Prodigy as dubstep. Asking
 # ListenBrainz "who is like Blair Muir" instead returns the right neighbourhood.
-RUN_DISCOVERY_SEEDS = 20         # top cluster artists to ask about
+# Seeds are counted by ANSWER: an artist ListenBrainz knows nothing about is
+# skipped and the next one down takes the slot, so 20 means 20 real lists.
+RUN_DISCOVERY_SEEDS = 20         # cluster artists with a non-empty answer
 RUN_MAX_CANDIDATES_TO_TAG = 150  # MusicBrainz lookups per cluster, at 1.1s each
+
+# A seed must have been LISTENED to, not just credited. Todd Edwards has 0.54 h
+# in the window — his only known-pool tracks are two Daft Punk edits he is
+# featured on — yet a join per tag row made him garage seed #17, and his
+# neighbours brought thirteen tracks (Crazy Love, Beauty And A Beat, Don't Stop
+# The Music). The one-row-per-artist join and this floor both remove him.
+# An hour, not a share of the cluster's score: a 1% floor would pass Sammy Virji
+# (1.43 h) by 0.001 and fail Knock2 (1.48 h), both of whom belong.
+RUN_MIN_SEED_HOURS = 1.0
 
 # A share alone cannot judge a STRANGER. Boys Noize and Mr. Oizo carry exactly
 # one cluster tag — `tech house` at count 1 — and no drag tags at all, so the
@@ -371,8 +383,8 @@ RUN_BROAD_TAGS = frozenset({
 # ...and a stranger's SHARE must clear a higher line than a library artist's.
 # 0.60 is right for the library, where listening has already vouched for the
 # artist; for a stranger it admitted Netsky (drum and bass 10 against liquid
-# funk 3: 0.77), Rusko, Modestep and Basement Jaxx, four acts whose tracks the
-# evaluation cut. 0.85 refuses all four and keeps every discovery keep —
+# funk 3: 0.77), Rusko, Modestep and Basement Jaxx, four acts the evaluation
+# wanted out. 0.85 refuses all four and keeps every discovery keep —
 # Pendulum 0.97, Bassnectar 0.92, NERO 0.89 — and also refuses Slushii and
 # Pixel Terror (0.67), which the normalised seed ranking would otherwise lift.
 # Library classification (build_artist_clusters) stays on RUN_MIN_INTENSITY_SHARE.
