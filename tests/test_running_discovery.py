@@ -251,6 +251,328 @@ check("...and does not register recommendations", "recommendations" in views,
 check("select_candidates is no longer imported",
       hasattr(running, "select_candidates"), False)
 
+# --- C2/B4: every discovery pick is judged as a TRACK -------------------
+# Stage 8's search cache kept a name and a URI per hit and relabelled every hit
+# as the candidate, so nothing downstream could see who was actually on it.
+# Tion Wayne's 2025 rap single "Crazy Love" went out as MJ Cole garage (a title
+# collision with MJ Cole's 2000 record), the Wideboys slot went to a Bieber
+# remix, "Everyday - Netsky Remix" inherited Rusko's own `everyday` recording,
+# and DEM2's "Discoteca" went out as Dem 2. Each of those is a case below.
+gcon = duckdb.connect()
+gcon.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('MJ Cole',         'uk garage',       3, TRUE),
+  ('Sammy Virji',     'uk garage',       2, TRUE),
+  ('Subtronics',      'dubstep',         5, TRUE),
+  -- hip hop 2 against uk garage 1: drag outweighs his cluster weight.
+  ('Tion Wayne',      'hip hop',         2, TRUE),
+  ('Tion Wayne',      'uk garage',       1, TRUE),
+  ('Justin Bieber',   'pop',            22, TRUE),
+  -- Hand tags at count 1. `house` is on neither list, melodic dubstep is drag.
+  ('Inéz',            'house',           1, TRUE),
+  ('Inéz',            'melodic dubstep', 1, TRUE),
+  ('Melodic Remixer', 'melodic dubstep', 3, TRUE),
+  ('Melodic Remixer', 'future bass',     2, TRUE),
+  -- Level is not drag: drag must OUTWEIGH the cluster weight.
+  ('Even Act',        'dubstep',         2, TRUE),
+  ('Even Act',        'pop',             2, TRUE)
+) t(artist_name, tag, tag_count, is_genre)""")
+running.build_artist_clusters(gcon)
+drag = running.drag_artists(gcon)
+check("drag_artists: drag outweighs both cluster weights, names normalised",
+      drag, {N("Tion Wayne"), N("Justin Bieber"), N("Inéz"),
+             N("Melodic Remixer")})
+
+
+def trk(uri, name, ms, *artists):
+    """A track as the credited cache returns it: Spotify's own credit list."""
+    return {"track_name": name, "spotify_track_uri": uri, "duration_ms": ms,
+            "artists": [{"name": a, "id": i} for a, i in artists]}
+
+
+def gate(tracks, cand, pinned, on_genre=(), vetoes=(), is_fresh=None, k=10):
+    rows = [dict(t, artist_name=cand) for t in tracks]
+    return running.gate_discovery(
+        rows, {"artist_name": cand, "mbid": "m-x"}, pinned, set(on_genre),
+        drag, set(vetoes), is_fresh or (lambda r: True), k=k)
+
+
+def uris(rows):
+    return [r["spotify_track_uri"] for r in rows]
+
+
+MJ, TION, LEO = ("MJ Cole", "sp-mj"), ("Tion Wayne", "sp-tion"), ("LeoStayTrill", "sp-leo")
+SUB, INEZ, SV = ("Subtronics", "sp-sub"), ("Inéz", "sp-inez"), ("Sammy Virji", "sp-sv")
+
+# (iii) A drag LEAD refuses the track. on_genre is empty here so relevance order
+# applies and nothing but the drag test can refuse it.
+crazy = trk("u:crazy", "Crazy Love", 190_000, TION, LEO, MJ)
+sincere = trk("u:sincere", "Sincere", 230_000, MJ)
+check("Crazy Love refused on MJ Cole: Tion Wayne is the drag lead",
+      uris(gate([crazy, sincere], "MJ Cole", "sp-mj")), ["u:sincere"])
+check("...and the title collision that let it in no longer helps",
+      uris(gate([crazy], "MJ Cole", "sp-mj", on_genre={"crazylove"})), [])
+wideboys = trk("u:bab", "Beauty And A Beat - Wideboys Radio Mix", 200_000,
+               ("Justin Bieber", "sp-jb"), ("Nicki Minaj", "sp-nm"),
+               ("Wideboys", "sp-wb"))
+check("the Wideboys mix is refused: Bieber is the drag lead",
+      uris(gate([wideboys], "Wideboys", "sp-wb")), [])
+
+# A FEATURED vocalist is never drag-tested. Inéz carries melodic dubstep by
+# hand, and she is on three records SJ already keeps.
+ecd = trk("u:ecd", "Eyes Cut Deeper", 200_000, SUB, INEZ)
+check("a drag-tagged featured vocalist does not refuse the track",
+      uris(gate([ecd], "Subtronics", "sp-sub")), ["u:ecd"])
+ecd_led = trk("u:ecd2", "Eyes Cut Deeper", 200_000, INEZ, SUB)
+check("...the same track with her as lead is refused",
+      uris(gate([ecd_led], "Subtronics", "sp-sub")), [])
+
+# The named remixer is drag-tested when Spotify credits them on the record.
+remixed = trk("u:rmx", "Song - Melodic Remixer Remix", 200_000, SV,
+              ("Melodic Remixer", "sp-mr"))
+check("a cluster-led track remixed by a drag artist is refused",
+      uris(gate([remixed], "Sammy Virji", "sp-sv")), [])
+uncredited = trk("u:rmx2", "Song - Melodic Remixer Remix", 200_000, SV)
+check("...but a remixer named only by the title regex is not trusted to refuse",
+      uris(gate([uncredited], "Sammy Virji", "sp-sv")), ["u:rmx2"])
+
+# (vi) Length and live recordings, before choose_tracks spends a pick on them.
+long_one = trk("u:long", "Bass Head", 384_000, SUB)
+ok_one = trk("u:ok", "Ok Length", 264_000, SUB)
+unknown = trk("u:unk", "No Length Yet", None, SUB)
+check("6.4 min refused, 4.4 min kept, unknown left for the fallback",
+      uris(gate([long_one, ok_one, unknown], "Subtronics", "sp-sub")),
+      ["u:ok", "u:unk"])
+check("a live recording is refused",
+      uris(gate([trk("u:live", "Energy (Live at Red Rocks)", 200_000, SUB)],
+                "Subtronics", "sp-sub")), [])
+
+# (ii)/(iv) A genre flag is the candidate's own. Rusko's `everyday` recording
+# is dubstep; Netsky's remix of it is not Rusko's work and must not inherit it.
+everyday = trk("u:ev", "Everyday", 230_000, ("Rusko", "sp-rusko"))
+netsky_mix = trk("u:evn", "Everyday - Netsky Remix", 250_000,
+                 ("Rusko", "sp-rusko"), ("Netsky", "sp-netsky"))
+got = gate([everyday], "Rusko", "sp-rusko", on_genre={"everyday"})
+check("the candidate's own recording is genre-matched",
+      [(r["spotify_track_uri"], r["genre_matched"]) for r in got],
+      [("u:ev", True)])
+check("'Everyday - Netsky Remix' is not matched on Rusko, so it is dropped",
+      uris(gate([netsky_mix], "Rusko", "sp-rusko", on_genre={"everyday"})), [])
+got = gate([netsky_mix], "Netsky", "sp-netsky", on_genre={"everyday"})
+check("...but IS matched on Netsky, who the title names as remixer",
+      [(r["spotify_track_uri"], r["genre_matched"]) for r in got],
+      [("u:evn", True)])
+featured_only = trk("u:fo", "Everyday", 230_000, ("Other Lead", "sp-ol"),
+                    ("Rusko", "sp-rusko"))
+check("a matched title led by someone else, with no remix credit, is not",
+      uris(gate([featured_only], "Rusko", "sp-rusko", on_genre={"everyday"})),
+      [])
+
+# (i) With recording tags, only matched tracks; without, plain relevance.
+a, b, c = (trk(f"u:{x}", x.upper(), 200_000, SUB) for x in "abc")
+check("empty on_genre keeps relevance order",
+      uris(gate([a, b, c], "Subtronics", "sp-sub")), ["u:a", "u:b", "u:c"])
+check("...with every row unmatched",
+      {r["genre_matched"] for r in gate([a, b, c], "Subtronics", "sp-sub")},
+      {False})
+check("non-empty on_genre keeps only matched tracks",
+      uris(gate([a, b, c], "Subtronics", "sp-sub", on_genre={"b"})), ["u:b"])
+check("choose_tracks still caps at k",
+      uris(gate([a, b, c], "Subtronics", "sp-sub", k=2)), ["u:a", "u:b"])
+
+# C3 on the discovery side: a veto tests every credit, features included.
+gud = trk("u:gud", "GUD VIBRATIONS", 200_000, ("NGHTMRE", "sp-ng"),
+          ("SLANDER", "sp-sl"))
+other = trk("u:oth", "Other Record", 200_000, ("NGHTMRE", "sp-ng"),
+            ("SLANDER", "sp-sl"))
+check("a track crediting an artist-wide-vetoed name is dropped",
+      uris(gate([gud, other], "NGHTMRE", "sp-ng",
+                vetoes={(N("SLANDER"), "")})), [])
+check("a (credited name, title) veto drops only that title",
+      uris(gate([gud, other], "NGHTMRE", "sp-ng",
+                vetoes={(N("SLANDER"), N("GUD VIBRATIONS"))})), ["u:oth"])
+check("a track that is not fresh is dropped",
+      uris(gate([gud, other], "NGHTMRE", "sp-ng",
+                is_fresh=lambda r: r["spotify_track_uri"] != "u:gud")),
+      ["u:oth"])
+got = gate([ecd], "Subtronics", "sp-sub")
+check("rows carry every credit as a LIST, never a joined string",
+      got[0]["credited"], ["Subtronics", "Inéz"])
+check("...and stay labelled as the candidate", got[0]["artist_name"],
+      "Subtronics")
+
+# --- namesakes: pin the candidate's Spotify artist id --------------------
+dem = [trk("u:d1", "Discoteca", 200_000, ("DEM2", "sp-DEM2")),
+       trk("u:d2", "Second", 200_000, ("DEM2", "sp-DEM2")),
+       trk("u:d3", "Third", 200_000, ("DEM2", "sp-DEM2")),
+       trk("u:d4", "Destiny", 200_000, ("Dem 2", "sp-dem-2")),
+       trk("u:d5", "Dig", 200_000, ("Dem 2", "sp-dem-2"))]
+pid, kept = running.pin_artist_id(dem, "Dem 2")
+check("'Dem 2' pins the exact-name id over the one on more tracks",
+      pid, "sp-dem-2")
+check("...and DEM2's Discoteca is dropped", uris(kept), ["u:d4", "u:d5"])
+pid, kept = running.pin_artist_id(dem, "Dem2")
+check("with no exact name, the id on the most tracks wins", pid, "sp-DEM2")
+pid, _ = running.pin_artist_id(
+    [trk("u:t1", "One", 1, ("dem 2", "sp-first")),
+     trk("u:t2", "Two", 1, ("DEM 2", "sp-second"))], "Dem2")
+check("a remaining tie goes to relevance order", pid, "sp-first")
+pid, _ = running.pin_artist_id(
+    [trk("u:n1", "One", 1, ("INEZ", "sp-caps")),
+     trk("u:n2", "Two", 1, ("INEZ", "sp-caps")),
+     trk("u:n3", "Three", 1, ("Inéz", "sp-inez"))], "Inéz")
+check("exact is compared after NFKD, so composed and decomposed agree",
+      pid, "sp-inez")
+check("no credit folding to the candidate pins nothing",
+      running.pin_artist_id([trk("u:x", "X", 1, ("Someone", "sp-s"))], "Dem 2"),
+      (None, []))
+
+# --- remix credit: credits.py's pattern, imported, not copied -----------
+for title, want in [("Everyday - Netsky Remix", "Netsky"),
+                    ("Halsey - Ian Asher Remix", "Ian Asher"),
+                    ("Bounce - Radio Edit", None),
+                    ("War Pigs - 2012 - Remaster", None),
+                    ("Song - 2019 Remix", None),
+                    ("Plain Title", None)]:
+    check(f"remix_credit({title!r})", running.remix_credit(title), want)
+for title in ("Everyday - Netsky Remix", "Beauty And A Beat - Wideboys Radio Mix"):
+    sql = gcon.execute(
+        f"SELECT trim(regexp_extract(?, '{running.REMIX_CREDIT_RE}', 1, 'i'))",
+        [title]).fetchone()[0]
+    check(f"...Python agrees with Stage 1b's SQL on {title!r}",
+          running.remix_credit(title), sql)
+
+# --- the credited search cache: only answers are kept --------------------
+class FakeSp:
+    def __init__(self, resp):
+        self.resp = resp
+        self.calls = []
+    def get(self, path, params=None):
+        self.calls.append((path, params))
+        return self.resp
+
+
+def item(uri, name, ms, *artists):
+    return {"uri": uri, "name": name, "duration_ms": ms,
+            "artists": [{"name": a, "id": i} for a, i in artists]}
+
+
+def cache_lines():
+    p = running.SP_TRACKS_CREDITED_CACHE
+    return p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+
+
+check("the credited cache is a new file, not Stage 8's",
+      running.SP_TRACKS_CREDITED_CACHE.name,
+      "spotify_artist_tracks_credited.jsonl")
+cc = {}
+check("a 429 returns nothing",
+      running.sp_artist_tracks_credited(
+          FakeSp({"_status": 429, "_body": "slow down"}), "Dem 2", cc), [])
+check("...and appends nothing", (cache_lines(), cc), ([], {}))
+check("no response returns nothing",
+      running.sp_artist_tracks_credited(FakeSp(None), "Dem 2", cc), [])
+check("...and appends nothing", (cache_lines(), cc), ([], {}))
+
+sp = FakeSp({"tracks": {"items": []}})
+check("an empty 200 returns nothing",
+      running.sp_artist_tracks_credited(sp, "Nobody At All", cc), [])
+check("...and IS cached, with its status",
+      [running.json.loads(x) for x in cache_lines()],
+      [{"key": N("Nobody At All"), "artist": "Nobody At All", "status": 200,
+        "tracks": []}])
+running.sp_artist_tracks_credited(sp, "Nobody At All", cc)
+check("...so it is asked once", len(sp.calls), 1)
+
+sp = FakeSp({"tracks": {"items": [
+    item("spotify:track:d4", "Destiny", 250_000, ("Dem 2", "sp-dem-2")),
+    item("spotify:track:k", "Tribute", 180_000, ("Karaoke Crew", "sp-k")),
+    item(None, "Ghost", 180_000, ("Dem 2", "sp-dem-2")),
+    item("spotify:track:d1", "Discoteca", 200_000, ("DEM2", "sp-DEM2"),
+         ("Feature", "sp-f")),
+]}})
+live = running.sp_artist_tracks_credited(sp, "Dem 2", cc)
+check("search is scoped to the artist, one page of SP_SEARCH_LIMIT",
+      (sp.calls[0][0], sp.calls[0][1]["q"], sp.calls[0][1]["limit"]),
+      ("/search", 'artist:"Dem 2"', running.SP_SEARCH_LIMIT))
+check("wrong-artist and URI-less hits dropped, relevance order kept",
+      uris(live), ["spotify:track:d4", "spotify:track:d1"])
+check("every credit kept as {name, id}, in Spotify's order",
+      live[1]["artists"], [{"name": "DEM2", "id": "sp-DEM2"},
+                           {"name": "Feature", "id": "sp-f"}])
+check("duration comes from search, costing no /tracks request",
+      [t["duration_ms"] for t in live], [250_000, 200_000])
+check("rows are labelled as the name asked for", {t["artist_name"] for t in live},
+      {"Dem 2"})
+cached = running.sp_artist_tracks_credited(sp, "Dem 2", cc)
+check("a cache hit spends no request", len(sp.calls), 1)
+check("...and has the same shape as a live call", cached, live)
+reloaded = running.load_jsonl(running.SP_TRACKS_CREDITED_CACHE, "key")
+check("the record survives a reload from disk",
+      reloaded[N("Dem 2")]["tracks"], cc[N("Dem 2")]["tracks"])
+check("Stage 8's search cache is never written",
+      running.config.CACHE_DIR.joinpath("spotify_artist_tracks.jsonl").exists(),
+      False)
+
+# --- the loop: build_selections puts every pick through the gate --------
+# Wiring only. Known pool empty, one garage stranger, recording tags absent so
+# relevance applies; the gate itself is pinned above.
+lcon = duckdb.connect()
+lcon.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Tion Wayne', 'hip hop',   2, TRUE),
+  ('Tion Wayne', 'uk garage', 1, TRUE)
+) t(artist_name, tag, tag_count, is_genre)""")
+running.build_artist_clusters(lcon)
+lcon.execute("""
+CREATE TABLE known_pool (spotify_track_uri VARCHAR, track_name VARCHAR,
+    album_artist VARCHAR, cluster VARCHAR, duration_ms DOUBLE, hours DOUBLE,
+    done_rate DOUBLE, n_plays BIGINT, score DOUBLE)""")
+
+
+class LoopSp:
+    def __init__(self):
+        self.calls = []
+    def get(self, path, params=None):
+        self.calls.append(path)
+        if path == "/search":
+            return {"tracks": {"items": [
+                item("spotify:track:drag", "Crazy Love", 190_000,
+                     ("Tion Wayne", "sp-tion"), ("Garage Stranger", "sp-gs")),
+                item("spotify:track:ok", "Clean One", 200_000,
+                     ("Garage Stranger", "sp-gs"), ("Feat Person", "sp-fp")),
+                # No duration in the search hit: fetched, then capped too.
+                item("spotify:track:nolen", "No Length", None,
+                     ("Garage Stranger", "sp-gs")),
+            ]}}
+        if path == "/tracks/nolen":
+            return {"duration_ms": 300_000}
+        failures.append(f"unexpected Spotify call {path}")
+        return None
+
+
+saved = (running.cluster_candidates, running.load_genre_vocabulary,
+         running.mb_genre_recordings)
+running.cluster_candidates = lambda con, http, label, *a: (
+    [{"artist_name": "Garage Stranger", "mbid": "m-gs", "score": 1.0,
+      "share": 1.0}] if label == "speed garage" else [])
+running.load_genre_vocabulary = lambda http: set()
+running.mb_genre_recordings = lambda http, mbid, tags, cache: set()
+loop_sp = LoopSp()
+try:
+    sels = running.build_selections(lcon, NoNetwork(), loop_sp)
+finally:
+    (running.cluster_candidates, running.load_genre_vocabulary,
+     running.mb_genre_recordings) = saved
+garage = next(s for s in sels if s["label"] == "speed garage")
+new = [t for t in garage["tracks"] if t["slot"] == "discovery"]
+check("the loop admits only what the gate passes, and B4 on a fetched length",
+      uris(new), ["spotify:track:ok"])
+check("the discovery row carries its credits", new[0]["credited"],
+      ["Garage Stranger", "Feat Person"])
+check("a search-supplied length costs no /tracks call; a missing one costs one",
+      loop_sp.calls, ["/search", "/tracks/nolen"])
+
 shutil.rmtree(_TMP, ignore_errors=True)
 if failures:
     print(f"{len(failures)} FAILURE(S)")

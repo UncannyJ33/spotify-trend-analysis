@@ -403,6 +403,16 @@ RUN_LIVE_TITLE_RE = (
     r"|\blive (?:at|from|in|session|version)\b|\bunplugged\b)"
 )
 
+# A DISCOVERY track may run at most 4.5 minutes; known tracks are exempt. A
+# stranger's track is heard cold, mid-run, and a long one is a long bet: the cap
+# took Bass Head (6.4 min), Dead Limit, Experience, Destiny and Where's Your
+# Head At out of the dubstep run. Deviance and Vindicate were keeps and went
+# too — that is the price. It also stands in for the release-year gate this
+# stage deliberately lacks, since Spotify's release_date is often a reissue
+# date. Known tracks stay exempt because the listener has already vouched for
+# every minute: Zomboy's "Nuclear" runs 5.3 minutes and is the model run track.
+RUN_MAX_DISCOVERY_MS = 270_000
+
 RUN_PLAYLIST_NAME_TEMPLATE = "{label} run · Claude"
 RUN_PLAYLIST_DESCRIPTION_TEMPLATE = (
     "{label} — high-intensity tracks for running, {known} from your library "

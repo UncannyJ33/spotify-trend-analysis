@@ -42,6 +42,13 @@ remix to the ORIGINAL artist, so an Ian Asher speed-garage rework of a Halsey
 song reads as pop and would be filtered out as drag. Credits are joined here
 across album artist, feature AND remixer for exactly that reason.
 
+DISCOVERY IS JUDGED PER TRACK.
+    A stranger clearing the share bar says the ARTIST belongs, not that a given
+    record by them does. Spotify's relevance page for MJ Cole led with Tion
+    Wayne's rap single, and every hit used to be relabelled as the candidate,
+    so nothing could tell. Each pick is now read against Spotify's own credit
+    list first — gate_discovery has the rules and the cases behind each.
+
 Outputs: two playlists, data/running_state.json, rows in data/playlists.parquet
 """
 
@@ -53,25 +60,27 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from datetime import date
 
 import duckdb
 
 import config
 from consolidate import gentle_token
+from credits import REMIX_CREDIT_RE, REMIX_FORMAT_STOPLIST, REMIX_NON_NAME_RE
 from enrich import MB_MIN_INTERVAL, Throttled, load_genre_vocabulary, normalise
 from playlists import (
-    ARTIST_TRACKS_CACHE,
     FORBIDDEN_NOTE,
     GENRE_RECORDINGS_CACHE,
     SP_API,
+    SP_SEARCH_LIMIT,
     Spotify,
+    _artist_match,
     _title_key,
     choose_tracks,
     ensure_playlist,
     mb_genre_recordings,
     playlist_items,
-    sp_artist_tracks,
     write_archive,
 )
 from recommend import (
@@ -91,6 +100,15 @@ SCOPES_WRITE = SCOPES_READ + " playlist-modify-private playlist-modify-public"
 # only discovery tracks cost a request, and batch /tracks answers 403 so they
 # cost one each.
 DURATION_CACHE = config.CACHE_DIR / "track_durations.jsonl"
+
+# Discovery searches, with WHO IS ON each track. Stage 8's
+# spotify_artist_tracks.jsonl keeps a name and a URI per hit, and every hit was
+# then labelled as the candidate — so Tion Wayne's rap single went out as MJ
+# Cole garage, and Skrillex appeared seven times in the dubstep run under other
+# artists' names. This keeps Spotify's own credit list (name AND id) and the
+# duration search already carries. A new file, not a rewrite: the old one is
+# Stage 8's, and an append-only cache is never rebuilt.
+SP_TRACKS_CREDITED_CACHE = config.CACHE_DIR / "spotify_artist_tracks_credited.jsonl"
 
 # The two clusters. `key` names the weight column; `label` names the playlist.
 CLUSTERS = (
@@ -556,13 +574,196 @@ def resolve_pins(con: duckdb.DuckDBPyConnection, pins: list[dict],
 
 
 # --------------------------------------------------------------------------
+# Discovery tracks — judged per TRACK, not per artist
+# --------------------------------------------------------------------------
+
+
+def sp_artist_tracks_credited(sp, artist: str, cache: dict) -> list[dict]:
+    """This artist's tracks in Spotify's relevance order, with who is on each.
+
+    The same /search Stage 8 makes — one page of SP_SEARCH_LIMIT, hits kept only
+    where the artist is really credited — keeping what Stage 8 throws away:
+    every credited artist as {name, id}, in Spotify's order, and `duration_ms`,
+    which search returns for free. So the length cap and the time budget cost
+    no /tracks request unless a hit arrives without one.
+
+    Only an ANSWER is cached. A 200 with no usable hit is a fact ("Spotify does
+    not carry them") and is asked once. A 429, an error envelope or no response
+    at all is a missing answer, and caching it would freeze a transient failure
+    into "this artist has no tracks" for good.
+
+    Keyed on normalise(artist), like Stage 8's, so 'DEM2' and 'Dem 2' share a
+    key. The record holds every credited id, and pin_artist_id separates the
+    two on read; a namesake is a read-time filter, not a cache repair.
+    """
+    key = normalise(artist)
+    if key in cache:
+        return [dict(t, artist_name=artist) for t in cache[key]["tracks"]]
+    resp = sp.get("/search", params={
+        "q": f'artist:"{artist.replace(chr(34), "")}"',
+        "type": "track", "limit": SP_SEARCH_LIMIT,
+    })
+    if not isinstance(resp, dict) or "_status" in resp:
+        return []
+    tracks = [
+        {"track_name": it.get("name"), "spotify_track_uri": it.get("uri"),
+         "duration_ms": it.get("duration_ms"),
+         # A LIST of credits, never a joined string: every printable separator
+         # eventually collides with a real name ("Tyler, The Creator").
+         "artists": [{"name": a.get("name"), "id": a.get("id")}
+                     for a in it.get("artists", [])]}
+        for it in (resp.get("tracks") or {}).get("items", [])
+        if it.get("uri") and _artist_match(it, artist)
+    ]
+    rec = {"key": key, "artist": artist, "status": 200, "tracks": tracks}
+    append_jsonl(SP_TRACKS_CREDITED_CACHE, rec)
+    cache[key] = rec
+    return [dict(t, artist_name=artist) for t in tracks]
+
+
+def pin_artist_id(tracks: list[dict],
+                  artist: str) -> tuple[str | None, list[dict]]:
+    """The candidate's own Spotify artist id, and only the tracks crediting it.
+
+    normalise() is a comparison key, not an identity. 'DEM2' and 'Dem 2' both
+    fold to `dem2`, and the Dem 2 search duly returned DEM2's "Discoteca" — a
+    different act — which went out as Dem 2 discovery.
+
+    Among the ids whose name folds to the candidate, the one whose Spotify name
+    IS the candidate's (after NFKD, case and all) wins; failing that, the id on
+    the most tracks; failing that, whichever relevance put first. Exact name
+    first is what makes it deterministic: "most tracks" alone would hand a
+    search for one act to its namesake whenever the namesake had the bigger page.
+    """
+    want_key = normalise(artist)
+    want_exact = unicodedata.normalize("NFKD", artist)
+    exact: dict[str, bool] = {}
+    on_tracks: dict[str, set[int]] = {}
+    first_seen: dict[str, int] = {}
+    for i, t in enumerate(tracks):
+        for a in t.get("artists") or []:
+            aid, name = a.get("id"), a.get("name") or ""
+            if not aid or normalise(name) != want_key:
+                continue
+            first_seen.setdefault(aid, i)
+            on_tracks.setdefault(aid, set()).add(i)
+            exact[aid] = (exact.get(aid, False)
+                          or unicodedata.normalize("NFKD", name) == want_exact)
+    if not first_seen:
+        return None, []
+    pinned = min(first_seen, key=lambda aid: (
+        not exact[aid], -len(on_tracks[aid]), first_seen[aid]))
+    return pinned, [t for t in tracks
+                    if any(a.get("id") == pinned for a in t.get("artists") or [])]
+
+
+def drag_artists(con: duckdb.DuckDBPyConnection) -> set[str]:
+    """Normalised names of library artists whose drag weight OUTWEIGHS both
+    cluster weights — the pop, rap and melodic acts a discovery track must not
+    be led or remixed by. Level is not enough: an artist the library cannot
+    call either way is not evidence against a track."""
+    return {normalise(r[0]) for r in con.execute(
+        "SELECT artist_name FROM artist_clusters "
+        "WHERE drag_w > greatest(garage_w, bass_w)").fetchall()}
+
+
+def remix_credit(title: str) -> str | None:
+    """The remixer a title names, by Stage 1b's own rule.
+
+    credits.REMIX_CREDIT_RE and its two guards are imported, not copied, so a
+    title parses the same way here as it does in track_credits: "Bounce - Radio
+    Edit" names a format rather than a person, and "Song - 2019 Remix" names a
+    year. The pattern sits inside what both RE2 and Python accept.
+    """
+    m = re.search(REMIX_CREDIT_RE, title or "", re.IGNORECASE)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    if (not name or name.lower() in REMIX_FORMAT_STOPLIST
+            or re.match(REMIX_NON_NAME_RE, name) or " - " in name):
+        return None
+    return name
+
+
+def gate_discovery(tracks: list[dict], cand: dict, pinned_id: str | None,
+                   on_genre: set[str], drag: set[str], vetoes: set[tuple],
+                   is_fresh, k: int = config.RUN_DISCOVERY_TRACKS_PER_ARTIST,
+                   ) -> list[dict]:
+    """Every discovery pick passes as a TRACK before choose_tracks sees it, so
+    each of the k picks it returns is usable rather than a slot wasted on a
+    track the loop then refuses.
+
+    The artist-level gate (classify_tags) says a candidate belongs; it cannot
+    say a given record by them does. Spotify's relevance page for MJ Cole led
+    with Tion Wayne's rap single "Crazy Love" — MJ Cole is its third credit, and
+    a title collision with his 2000 record flagged it as garage.
+
+    1. Live, or longer than RUN_MAX_DISCOVERY_MS: refused.
+    2. A vetoed credit — ANY credit, features included, artist-wide or as
+       (name, title) — or a track already placed: refused.
+    3. A drag LEAD, or a drag remixer Spotify credits on the record: refused.
+       Featured credits are not drag-tested. Every drag co-credit the
+       evaluation found was the lead (Tion Wayne, Bieber on the Wideboys mix,
+       Rihanna), while Inéz carries melodic dubstep by hand and sings on three
+       records SJ keeps. Library-artist discovery passes through here too, and
+       an unplayed Subtronics track must not be refused for its singer.
+    4. genre_matched needs the title in `on_genre` AND the record to be the
+       candidate's own: led by the pinned id with no other remixer named, or
+       naming the candidate as remixer. "Everyday - Netsky Remix" sat in
+       Rusko's list and inherited his `everyday` recording.
+    5. With recording tags, only matched tracks survive. Without any (Y U QT,
+       Dustycloud: keeps with nothing tagged in MusicBrainz), relevance stands.
+       Deliberately NOT added: "the lead must be the candidate or a cluster
+       artist" — Spotify bills a stranger's remix to the pop original first,
+       so that rule would refuse nearly every remix.
+    6. choose_tracks, for its stable sort and same-song dedupe. Its own flag
+       agrees with step 4 by construction: after step 5, either every row is
+       matched and in `on_genre`, or `on_genre` is empty and none is.
+    """
+    name = cand["artist_name"]
+    want = normalise(name)
+    eligible: list[dict] = []
+    for t in tracks:
+        title = t.get("track_name") or ""
+        artists = t.get("artists") or []
+        credited = [a.get("name") for a in artists if a.get("name")]
+        dur = t.get("duration_ms")
+        if is_live(title) or (dur and dur > config.RUN_MAX_DISCOVERY_MS):
+            continue
+
+        row = dict(t, artist_name=name, credited=credited)
+        if (any(vetoed({"artist_name": n, "track_name": title}, vetoes)
+                for n in [name, *credited]) or not is_fresh(row)):
+            continue
+
+        rc = remix_credit(title)
+        credited_keys = {normalise(n) for n in credited}
+        remixer = normalise(rc) if rc and normalise(rc) in credited_keys else None
+        lead = artists[0] if artists else {}
+        if normalise(lead.get("name") or "") in drag or (remixer and remixer in drag):
+            continue
+
+        names_cand = rc is not None and normalise(rc) == want
+        own_lead = pinned_id is not None and lead.get("id") == pinned_id
+        row["genre_matched"] = (_title_key(title) in on_genre
+                                and (own_lead or names_cand)
+                                and (rc is None or names_cand))
+        eligible.append(row)
+
+    if on_genre:
+        eligible = [r for r in eligible if r["genre_matched"]]
+    return choose_tracks(eligible, on_genre, k)
+
+
+# --------------------------------------------------------------------------
 # Duration — fill to time, not to a track count
 # --------------------------------------------------------------------------
 
 
 def track_duration(sp, uri: str, cache: dict) -> int | None:
-    """Duration for a track with no listening history. One request each:
-    the batch /tracks form answers 403 like every other batch endpoint."""
+    """Duration for a discovery track whose search hit carried none — search
+    usually does, so this is the fallback. One request each: the batch /tracks
+    form answers 403 like every other batch endpoint."""
     tid = (uri or "").rsplit(":", 1)[-1]
     if not tid:
         return None
@@ -655,10 +856,11 @@ def build_selections(con, http, sp) -> list[dict]:
     previews exactly what a live run would do."""
     tag_cache = load_jsonl(config.CACHE_DIR / "candidate_tags.jsonl", "mbid")
     genre_rec_cache = load_jsonl(GENRE_RECORDINGS_CACHE, "key")
-    artist_tracks_cache = load_jsonl(ARTIST_TRACKS_CACHE, "key")
+    credited_cache = load_jsonl(SP_TRACKS_CREDITED_CACHE, "key")
     duration_cache = load_jsonl(DURATION_CACHE, "key")
     sim_cache = load_jsonl(SIMILAR_CACHE, "seed_mbid")
     vocab = load_genre_vocabulary(http)
+    drag = drag_artists(con)
 
     pins, vetoes = load_overrides()
     target_ms = config.RUN_TARGET_MINUTES * 60_000
@@ -737,16 +939,24 @@ def build_selections(con, http, sp) -> list[dict]:
                 break
             if normalise(cand["artist_name"]) in used_discovery_artists:
                 continue
-            tracks = sp_artist_tracks(sp, cand["artist_name"], artist_tracks_cache)
+            # Only the candidate's own Spotify id survives, so a namesake's
+            # records never reach the gate under their name.
+            pinned_id, tracks = pin_artist_id(
+                sp_artist_tracks_credited(sp, cand["artist_name"], credited_cache),
+                cand["artist_name"])
             if not tracks:
                 continue
             on_genre = mb_genre_recordings(http, cand["mbid"], tags, genre_rec_cache)
-            for chosen in choose_tracks(tracks, on_genre,
-                                        config.RUN_DISCOVERY_TRACKS_PER_ARTIST):
-                if (not fresh(chosen) or vetoed(chosen, vetoes)
-                        or is_live(chosen.get("track_name", ""))):
+            for chosen in gate_discovery(tracks, cand, pinned_id, on_genre,
+                                         drag, vetoes, fresh):
+                # Search carries the length; /tracks is only the fallback for a
+                # hit without one, and what it returns gets the same cap the
+                # gate applied to everything else.
+                dur = (chosen.get("duration_ms")
+                       or track_duration(sp, chosen["spotify_track_uri"],
+                                         duration_cache))
+                if dur and dur > config.RUN_MAX_DISCOVERY_MS:
                     continue
-                dur = track_duration(sp, chosen["spotify_track_uri"], duration_cache)
                 if got_ms + (dur or 0) > budget_ms:
                     continue
                 place(chosen)
