@@ -336,6 +336,97 @@ check("row removed: the cached match shows again",
       (cache["PlatLike"]["status"], cache["PlatLike"]["mbid"]), ("resolved", WRONG))
 check("row removed: costs no request", sum(http.calls.values()), 0)
 
+# --------------------------------------------------------------------------
+# A tags-only row for a name the cache has NEVER seen. main() left every
+# overridden name out of the search, tags-only rows included, so the name was
+# never searched, never got a record, and apply_override_tags — which walks the
+# cache — had nothing to hang the genres on. The row vanished without a warning.
+# `¥$` (11 h) is that case: credits.py dropped it until Stage 1b learned to keep
+# non-ASCII album artists, so it has never been cached. Blank mbid means
+# "resolution runs; genres supplied", so the name must be searched like any
+# other; only a row that ANSWERS the name (MBID, IGNORE, NONE) skips the search.
+#
+# Through main() itself, since the bug lived in main's todo list. Every path is
+# a temp file and Throttled is a fake that refuses anything unexpected.
+# --------------------------------------------------------------------------
+e2e = d / "e2e"
+enrich.config.DATA_DIR = e2e / "data"
+enrich.config.CACHE_DIR = e2e / "cache"
+enrich.config.OUTPUT_DIR = e2e / "output"
+enrich.config.ensure_dirs()
+enrich.CACHE_FILE = e2e / "cache" / "artist_resolution.jsonl"
+enrich.GENRE_VOCAB_FILE = e2e / "cache" / "vocab.txt"
+enrich.GENRE_VOCAB_FILE.write_text("\n".join(sorted(VOCAB)) + "\n", encoding="utf-8")
+enrich.REVIEW_PARQUET = e2e / "artist_review.parquet"
+enrich.RESOLUTION_PARQUET = e2e / "artist_resolution.parquet"
+enrich.config.ARTIST_TAGS_PARQUET = e2e / "artist_tags.parquet"
+enrich.config.ARTIST_OVERRIDES_CSV = e2e / "overrides.csv"
+
+duckdb.sql(f"""COPY (SELECT * FROM (VALUES
+        ('Tiny Act', 7200.0), ('Known', 3600.0), ('Pinned', 1800.0),
+        ('Never Seen None', 900.0), ('Various Artists', 600.0)
+    ) t(artist_name, played_seconds)) TO '{enrich.config.DATA_DIR / "track_credits.parquet"}'
+    (FORMAT PARQUET)""")
+enrich.config.ARTIST_OVERRIDES_CSV.write_text(
+    "artist_name,mbid,note,tags\n"
+    "Tiny Act,,no MB entry,pop rap\n"
+    f"Pinned,{PIN},right artist,\n"
+    "Never Seen None,NONE,real artist; MusicBrainz has nothing,indie pop\n"
+    "Various Artists,IGNORE,not an artist,\n", encoding="utf-8")
+enrich.append_cache({"artist_name": "Known", "source": "musicbrainz",
+                     "status": "resolved", "mbid": ORGANIC, "score": 100,
+                     "matched_name": "Known", "n_candidates": 1,
+                     "tags": [{"tag": "pop", "count": 3}]})
+
+
+class SearchHttp(FakeHttp):
+    """FakeHttp plus the name search, answering 'no such artist' for everyone."""
+    def __init__(self):
+        super().__init__()
+        self.searched = []
+    def get(self, url, **kw):
+        if url == enrich.MB_SEARCH_URL:
+            self.calls["search"] += 1
+            self.searched.append(kw["params"]["query"])
+            return FakeResponse({"artists": []})
+        return super().get(url, **kw)
+
+
+def run_main():
+    http = SearchHttp()
+    real_throttled, real_argv = enrich.Throttled, sys.argv
+    enrich.Throttled = lambda interval: http
+    sys.argv = ["enrich.py"]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            enrich.main()
+    finally:
+        enrich.Throttled, sys.argv = real_throttled, real_argv
+    tags = duckdb.sql(
+        f"SELECT artist_name, tag, source FROM '{enrich.config.ARTIST_TAGS_PARQUET}' "
+        "ORDER BY ALL").fetchall()
+    status = dict(duckdb.sql(
+        f"SELECT artist_name, status FROM '{enrich.RESOLUTION_PARQUET}'").fetchall())
+    return http, tags, status
+
+
+http, tags, status = run_main()
+check("uncached tags-only name: searched, and nothing else is",
+      http.searched, ['artist:"Tiny Act" OR alias:"Tiny Act"'])
+check("uncached tags-only name: the search's answer is its resolution",
+      status.get("Tiny Act"), "not_found")
+check("uncached tags-only name: its hand tags reach artist_tags",
+      [t for t in tags if t[0] == "Tiny Act"], [("Tiny Act", "pop rap", "override")])
+check("MBID, NONE and IGNORE rows still answer the name without a search",
+      (http.calls["lookup"], status.get("Pinned"), status.get("Never Seen None"),
+       status.get("Various Artists")), (1, "resolved", "no_entry", "ignored"))
+
+http, tags, status = run_main()
+check("second run: the tags-only name is cached, so zero requests",
+      sum(http.calls.values()), 0)
+check("second run: its hand tags are still applied",
+      [t for t in tags if t[0] == "Tiny Act"], [("Tiny Act", "pop rap", "override")])
+
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)
 print("all assertions passed")

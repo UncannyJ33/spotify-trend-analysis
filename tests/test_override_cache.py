@@ -155,6 +155,104 @@ cache, *_ = run(http)
 check("legacy: and then never again", sum(http.calls.values()), 0)
 check("legacy: now carries override provenance", cache["REAPER"]["source"], "override")
 
+# --------------------------------------------------------------------------
+# A failed backfill is not an answer, so it is not cached. The backfill used to
+# write `backfilled: True, tags: []` whatever came back, and `backfilled` is
+# what stops a record ever being tried again — so one outage made "untagged"
+# permanent. The legacy re-fetch above is exactly where that bites: the fresh
+# untagged pin replaces the legacy record that still held REAPER's tags, and a
+# 503 through all four Throttled attempts on that one backfill call would have
+# left him genreless for good.
+# --------------------------------------------------------------------------
+class FailedResponse:
+    status_code = 500
+
+
+class DownHttp(FakeHttp):
+    """The artist lookup answers; the release-group browse does not.
+
+    `release_group` picks the failure: None is what Throttled.get returns after
+    four throttled attempts, a 500 is what it hands back for the caller to judge.
+    """
+    def __init__(self, release_group):
+        super().__init__()
+        self.release_group = release_group
+    def get(self, url, **kw):
+        if url == enrich.MB_RELEASE_GROUP_URL:
+            self.calls["release-group"] += 1
+            return self.release_group
+        return super().get(url, **kw)
+
+
+def cached_lines():
+    return enrich.CACHE_FILE.read_text(encoding="utf-8").splitlines()
+
+
+enrich.CACHE_FILE.unlink()
+enrich.append_cache({"artist_name": "REAPER", "source": "musicbrainz-release-group",
+                     "status": "resolved", "mbid": PIN, "score": 100,
+                     "matched_name": "REAPER", "n_candidates": 1,
+                     "tags": RG_TAGS, "backfilled": True})
+enrich.append_cache({"artist_name": "Tion Wayne", "source": "musicbrainz",
+                     "status": "resolved", "mbid": ORGANIC, "score": 100,
+                     "matched_name": "Tion Wayne", "n_candidates": 1, "tags": []})
+write_overrides(f"REAPER,{PIN},the dubstep producer")
+
+for label, failure in (("no response", None), ("HTTP 500", FailedResponse())):
+    n_before = len(cached_lines())
+    http = DownHttp(failure)
+    cache, stats, recovered, _ = run(http)
+    appended = [json.loads(l) for l in cached_lines()[n_before:]]
+    check(f"backfill {label}: both gaps were tried", http.calls["release-group"], 2)
+    check(f"backfill {label}: nothing recovered", recovered, 0)
+    check(f"backfill {label}: no backfill record is cached",
+          [r["artist_name"] for r in appended if r.get("backfilled")], [])
+    check(f"backfill {label}: neither record is marked attempted",
+          [n for n in ("REAPER", "Tion Wayne") if cache[n].get("backfilled")], [])
+
+# The legacy pin was re-fetched once during the first outage run (the fresh,
+# untagged record IS a real answer and was cached); the second outage run found
+# it satisfied. So the only thing still owed is the backfill itself.
+check("after the outage: the pin is cached untagged, not given up on",
+      (cache["REAPER"]["source"], cache["REAPER"]["tags"],
+       cache["REAPER"].get("backfilled")), ("override", [], None))
+
+http = FakeHttp()
+cache, stats, recovered, _ = run(http)
+check("MusicBrainz back: the backfill is retried, and nothing else is spent",
+      dict(http.calls), {"release-group": 2})
+check("MusicBrainz back: the pin gets its genres", cache["REAPER"]["tags"], RG_TAGS)
+check("MusicBrainz back: organic record recovers too",
+      (cache["Tion Wayne"]["source"], cache["Tion Wayne"]["tags"]),
+      ("musicbrainz-release-group", RG_TAGS))
+http = FakeHttp()
+run(http)
+check("MusicBrainz back: and then it is final", sum(http.calls.values()), 0)
+
+
+# An EMPTY 200 is a real answer — the artist's releases are untagged too — so it
+# is cached and final. That is what `backfilled` exists to remember.
+class EmptyHttp(FakeHttp):
+    def get(self, url, **kw):
+        if url == enrich.MB_RELEASE_GROUP_URL:
+            self.calls["release-group"] += 1
+            return FakeResponse({"release-groups": [{"tags": []}]})
+        return super().get(url, **kw)
+
+
+enrich.CACHE_FILE.unlink()
+enrich.append_cache({"artist_name": "Tion Wayne", "source": "musicbrainz",
+                     "status": "resolved", "mbid": ORGANIC, "score": 100,
+                     "matched_name": "Tion Wayne", "n_candidates": 1, "tags": []})
+write_overrides()
+http = EmptyHttp()
+cache, *_ = run(http)
+check("empty 200: asked once", http.calls["release-group"], 1)
+check("empty 200: cached as attempted", cache["Tion Wayne"].get("backfilled"), True)
+http = EmptyHttp()
+run(http)
+check("empty 200: never asked again", sum(http.calls.values()), 0)
+
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)
 print("all assertions passed")

@@ -51,12 +51,16 @@ artist_name,mbid,note,tags
 # Some Small Act,00000000-0000-0000-0000-000000000000,MB has them untagged,folk pop|pop rap
 #
 # --- genres with NO mbid: MusicBrainz has no entry for them at all ---
-#     Leave the mbid blank. Resolution still runs and still fails; only the
-#     genres are supplied. This is common — the acts MusicBrainz serves worst
-#     are the same ones it cannot resolve.
-#     A blank mbid does NOT undo a match already made. If the name once
-#     resolved to someone else, that artist's MBID stays, and your genres get
-#     attached to it. Use NONE (below) for that case.
+#     Leave the mbid blank. Resolution still runs exactly as it would without
+#     the row (a name never seen before is searched once), and for a name
+#     MusicBrainz lacks it fails; only the genres are supplied. This is
+#     common — the acts MusicBrainz serves worst are the same ones it cannot
+#     resolve.
+#     A blank mbid does NOT undo a match, already made or made by that first
+#     search. If the name resolves to someone else, that artist's MBID stays,
+#     and your genres get attached to it. Use NONE (below) for that case, and
+#     for a name that folds to almost nothing ("¥$" compares as "s"), where
+#     a search would take any artist called S.
 # Some Tiny Act,,no MB entry exists,drill|uk drill
 #
 # --- both at once: the wrong artist was matched AND the right one is untagged ---

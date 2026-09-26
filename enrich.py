@@ -517,14 +517,19 @@ def resolve_via_musicbrainz(http: Throttled, name: str) -> dict:
 # hop, uk garage, drill and uk drill.
 
 
-def tags_from_release_groups(http: Throttled, mbid: str) -> list[dict]:
-    """Aggregate tag votes across everything the artist released."""
+def fetch_release_group_tags(http: Throttled, mbid: str) -> list[dict] | None:
+    """Aggregate tag votes across everything the artist released.
+
+    None when MusicBrainz gave no answer, [] when it answered and nothing was
+    tagged. The difference decides what gets cached: an empty 200 is final, a
+    failure is not an answer at all and must be asked again next run.
+    """
     r = http.get(
         MB_RELEASE_GROUP_URL,
         params={"artist": mbid, "inc": "tags", "fmt": "json", "limit": 100},
     )
     if r is None or r.status_code != 200:
-        return []
+        return None
     totals: dict[str, int] = {}
     for rg in r.json().get("release-groups", []):
         for t in rg.get("tags") or []:
@@ -533,6 +538,13 @@ def tags_from_release_groups(http: Throttled, mbid: str) -> list[dict]:
                 totals[name] = totals.get(name, 0) + (t.get("count") or 1)
     return [{"tag": k, "count": v} for k, v in
             sorted(totals.items(), key=lambda kv: -kv[1])]
+
+
+def tags_from_release_groups(http: Throttled, mbid: str) -> list[dict]:
+    """The same, with a failure folded into []. Kept for its one outside caller,
+    consolidate.resolve_missing, which takes a list — and so cannot tell an
+    outage from an untagged artist. It should move to the None-returning form."""
+    return fetch_release_group_tags(http, mbid) or []
 
 
 def recovered_by_backfill(rec: dict) -> bool:
@@ -555,6 +567,13 @@ def backfill_untagged(http: Throttled, cache: dict[str, dict]) -> int:
     again and backfilled it again: REAPER, Reaper, NOTION, Ylti, CJ, ALLEYCVT
     and Levity cost ~14 requests on every run. It also hid the record from
     `purge_stale_overrides`, so deleting the override row freed nothing.
+
+    Only an answer is cached. A failed request leaves the record exactly as it
+    was — not `backfilled`, not appended — so the next run asks again. Writing
+    `backfilled: True, tags: []` on a failure made one outage permanent, and
+    the first run after the provenance fix is where that would bite: each
+    legacy pin is re-fetched untagged, and a 503 on its one backfill call
+    would have left REAPER without genres forever.
     """
     gaps = [
         n for n, r in cache.items()
@@ -565,21 +584,24 @@ def backfill_untagged(http: Throttled, cache: dict[str, dict]) -> int:
         return 0
     print(f"\nBackfilling {len(gaps):,} untagged artists from release "
           f"groups (~{len(gaps) * MB_MIN_INTERVAL / 60:.0f} min).\n")
-    recovered = 0
+    recovered = failed = 0
     try:
         for i, name in enumerate(gaps, 1):
             rec = dict(cache[name])
-            tags = tags_from_release_groups(http, rec["mbid"])
-            rec["tags"] = tags
-            rec["backfilled"] = True
-            if tags:
-                if rec.get("source") == "override":
-                    rec["tags_from"] = "release-group"
-                else:
-                    rec["source"] = "musicbrainz-release-group"
-                recovered += 1
-            append_cache(rec)
-            cache[name] = rec
+            tags = fetch_release_group_tags(http, rec["mbid"])
+            if tags is None:
+                failed += 1
+            else:
+                rec["tags"] = tags
+                rec["backfilled"] = True
+                if tags:
+                    if rec.get("source") == "override":
+                        rec["tags_from"] = "release-group"
+                    else:
+                        rec["source"] = "musicbrainz-release-group"
+                    recovered += 1
+                append_cache(rec)
+                cache[name] = rec
             if i % 25 == 0 or i == len(gaps):
                 filled = sum(1 for r in cache.values() if recovered_by_backfill(r))
                 print(f"  [{i:>5,}/{len(gaps):,}] "
@@ -587,6 +609,9 @@ def backfill_untagged(http: Throttled, cache: dict[str, dict]) -> int:
                       flush=True)
     except KeyboardInterrupt:
         print("\nInterrupted — progress is cached, re-run to resume.\n")
+    if failed:
+        print(f"  {failed:,} release-group request(s) got no answer; "
+              f"not cached, so the next run asks again.")
     return recovered
 
 
@@ -811,10 +836,16 @@ def main() -> None:
 
     if not args.report:
         retry = {"error", "not_found"} if args.retry_errors else {"error"}
-        # An override always wins, so an overridden name is never searched —
-        # including one whose override fetch failed, which retries as an
-        # override on the next run rather than falling back to a guess.
-        overridden = set(overrides)
+        # An override always wins, so a name the file ANSWERS (MBID, IGNORE,
+        # NONE) is never searched — including one whose override fetch failed,
+        # which retries as an override on the next run rather than falling back
+        # to a guess. A tags-only row answers nothing about WHICH artist this
+        # is, so it is searched like any other name. Leaving it out too meant a
+        # never-cached name got no record at all, and apply_override_tags,
+        # which walks the cache, silently dropped its genres: `¥$` (11 h) was
+        # about to be the first, once Stage 1b stopped discarding it.
+        overridden = {k for k, ov in overrides.items()
+                      if ov["mbid"] or ov["ignore"] or ov.get("none")}
         todo = [a for a in artists
                 if normalise(a) not in overridden
                 and (a not in cache or cache[a].get("status") in retry)]
