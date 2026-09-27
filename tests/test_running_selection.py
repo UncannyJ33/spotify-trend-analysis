@@ -170,6 +170,32 @@ check("ILLENIUM is refused at the stranger bar too",
           {"tag": "melodic dubstep", "count": 3},
           {"tag": "future bass", "count": 2}], MIN_W, min_share=CAND)[0], None)
 
+# --- `happy hardcore` is not a bass-run tag (SJ, 2026-09-27) ------------
+# Stonebank reached the dubstep run as a stranger on drum and bass(1) plus
+# happy hardcore(1): the narrow tag waived the weight floor, and the record
+# was 2016 Monstercat happy hardcore with a pitched euphoric vocal, a cut.
+check("`happy hardcore` is not a bass tag",
+      "happy hardcore" in config.RUN_BASS_TAGS, False)
+stonebank = [{"tag": "drum and bass", "count": 1},
+             {"tag": "happy hardcore", "count": 1}]
+check("Stonebank no longer clears the stranger bar",
+      running.classify_tags(stonebank, MIN_W, min_share=CAND)[0], None)
+# The cost, measured before the change, is Kayzo (0.89 h): his real vector sat
+# at exactly 0.60 with the tag (3 bass against psytrance 2) and at 0.50
+# without it, so he now classifies to neither run.
+hc = duckdb.connect()
+hc.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Kayzo', 'psytrance', 2, TRUE), ('Kayzo', 'electro', 1, TRUE),
+  ('Kayzo', 'happy hardcore', 1, TRUE), ('Kayzo', 'hardstyle', 1, TRUE),
+  ('Kayzo', 'house', 1, TRUE), ('Kayzo', 'dubstep', 1, TRUE),
+  ('Kayzo', 'trap', 1, TRUE)
+) t(artist_name, tag, tag_count, is_genre)""")
+running.build_artist_clusters(hc)
+check("...and Kayzo, whom it carried to 0.60, classifies nowhere",
+      hc.execute("SELECT cluster, round(bass_share, 2) FROM artist_clusters"
+                 ).fetchone(), (None, 0.5))
+
 # --- known pool: credits, completion, and the per-artist cap ------------
 con.execute("""
 CREATE TABLE plays AS SELECT * FROM (VALUES

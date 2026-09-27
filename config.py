@@ -255,6 +255,16 @@ RUNNING_OVERRIDES_CSV = _path_from_env(
 # breakbeat|future garage|house by hand) now classifies to neither run and comes
 # back only as pins; K Theory (0.7 h), MALUGI (0.4 h) and the Chemical Brothers
 # leave too. That list is the check before the change, not after it.
+#
+# `happy hardcore` left on 2026-09-27, SJ's call. As a NARROW tag one vote
+# waived the stranger weight floor, and Stonebank got into the dubstep run on
+# drum and bass(1) + happy hardcore(1), with a 2016 Monstercat happy hardcore
+# record that was cut. Checked before the change, the cost is: Stonebank is the
+# only cached stranger it admitted. In the library, Kayzo (0.89 h) drops from
+# 0.60 to 0.50 and leaves the run, and so does his "Wait", a contested keep that
+# is in Workout (only a pin keeps it); MODULATE (0.07 h) and W&W (0.00 h in the
+# window) leave too. `gabber`, from the same family, admits nobody today: no
+# library artist and no cached candidate carries it.
 RUN_GARAGE_TAGS = (
     "speed garage", "uk garage", "bassline", "stutter house", "bass house",
     "tech house", "jackin house", "donk", "2-step", "hard house",
@@ -262,7 +272,7 @@ RUN_GARAGE_TAGS = (
 RUN_BASS_TAGS = (
     "dubstep", "brostep", "tearout", "hybrid trap", "trap edm", "drum and bass",
     "jungle", "neurofunk", "drumstep", "glitch hop", "complextro",
-    "hardstyle", "colour bass", "happy hardcore", "gabber",
+    "hardstyle", "colour bass", "gabber",
 )
 
 # Genres that are electronic but do NOT sustain a run. An include-list alone is
