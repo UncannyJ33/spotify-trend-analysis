@@ -1032,6 +1032,37 @@ check("a playlist value that is neither is warned about and skipped",
       ("Typo Pin" in {p["artist_name"] for p in ov["pins"]},
        "speed garage run · Claude" in buf.getvalue()), (False, True))
 
+# --- a decision the loader does not know is warned about, not dropped -----
+# "dubstep,pin,Kayzo,Wait," was handed to SJ as the way to bring back a keep
+# the happy hardcore removal cost. Pins are `keep` rows; `pin` matched no
+# branch and vanished without a word, so the dry run looked exactly as if the
+# row had been honoured and Kayzo simply had nothing on-genre. Same for a keep
+# with no artist: resolve_pins matches on the album artist, so it pins nothing.
+config.RUNNING_OVERRIDES_CSV.write_text(
+    "playlist,decision,artist_name,track_name,note\n"
+    "dubstep,pin,Kayzo,Wait,wrong word\n"
+    "dubstep,keep,Kayzo,Wait,right word\n"
+    "dubstep,keep,,Orphan Tune,no artist\n"
+    ",,,,\n",
+    encoding="utf-8")
+buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(buf):
+        ov = running.load_overrides()
+finally:
+    config.RUNNING_OVERRIDES_CSV.unlink()
+warnings = [l for l in buf.getvalue().splitlines() if l.startswith("  !")]
+check("a `keep` row is the pin: Kayzo's Wait loads once, for dubstep",
+      [(p["artist_name"], p["track_name"], p["playlist"]) for p in ov["pins"]],
+      [("Kayzo", "Wait", "dubstep")])
+check("an unrecognised decision is warned about, naming the row and the "
+      "decisions that exist",
+      any("'pin'" in w and "Kayzo" in w and "keep" in w for w in warnings), True)
+check("a keep row with no artist is warned about",
+      any("Orphan Tune" in w for w in warnings), True)
+check("...and those are the only warnings: an all-blank row stays quiet",
+      len(warnings), 2)
+
 # --- the known top-up stops at its floor, end to end (C12) ----------------
 # test_running_selection.py pins known_topup; this pins that build_selections
 # uses it. A 12-minute target leaves 7.2 min for known tracks, and the two

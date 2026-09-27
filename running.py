@@ -818,6 +818,13 @@ def load_overrides() -> dict:
     playlist. A value that is neither is warned about and skipped — a pin
     naming the playlist by its Spotify name would otherwise match nothing,
     silently. A drop applies everywhere whatever the column says.
+
+    Every row that is skipped says so. `dubstep,pin,Kayzo,Wait,` was once
+    handed out as the way to keep Kayzo's "Wait"; pins are `keep` rows, `pin`
+    matched no branch, and the row vanished while the dry run looked exactly
+    as if it had been honoured. A keep, drop or discover row with no artist is
+    the same trap, since each of them matches on the artist. Only a row with
+    every cell blank is passed over quietly.
     """
     out: dict = {"pins": [], "vetoes": set(), "discover": [], "prefer": []}
     labels = {c["label"] for c in CLUSTERS}
@@ -833,6 +840,8 @@ def load_overrides() -> dict:
             artist = (row.get("artist_name") or "").strip()
             track = (row.get("track_name") or "").strip()
             if raw_playlist.startswith("#") or artist.startswith("#"):
+                continue
+            if not (raw_playlist or decision or artist or track):
                 continue
             playlist = to_label.get(raw_playlist.casefold(), raw_playlist)
             entry = {"playlist": playlist, "artist_name": artist,
@@ -862,6 +871,13 @@ def load_overrides() -> dict:
                     out["pins"].append(entry)
                 else:
                     out["vetoes"].add((normalise(artist), normalise(track)))
+            elif decision in {"keep", "drop", "discover"}:
+                what = track or raw_playlist or "a blank track"
+                print(f"  ! {decision} row for {what!r} names no artist; skipped")
+            else:
+                print(f"  ! row {artist or track!r} has decision {decision!r}, "
+                      "which is not one of keep (a pin), drop, discover, "
+                      "prefer; skipped")
     return out
 
 
