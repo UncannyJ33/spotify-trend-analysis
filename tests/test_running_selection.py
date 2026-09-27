@@ -170,6 +170,32 @@ check("ILLENIUM is refused at the stranger bar too",
           {"tag": "melodic dubstep", "count": 3},
           {"tag": "future bass", "count": 2}], MIN_W, min_share=CAND)[0], None)
 
+# --- `happy hardcore` is not a bass-run tag (SJ, 2026-09-27) ------------
+# Stonebank reached the dubstep run as a stranger on drum and bass(1) plus
+# happy hardcore(1): the narrow tag waived the weight floor, and the record
+# was 2016 Monstercat happy hardcore with a pitched euphoric vocal, a cut.
+check("`happy hardcore` is not a bass tag",
+      "happy hardcore" in config.RUN_BASS_TAGS, False)
+stonebank = [{"tag": "drum and bass", "count": 1},
+             {"tag": "happy hardcore", "count": 1}]
+check("Stonebank no longer clears the stranger bar",
+      running.classify_tags(stonebank, MIN_W, min_share=CAND)[0], None)
+# The cost, measured before the change, is Kayzo (0.89 h): his real vector sat
+# at exactly 0.60 with the tag (3 bass against psytrance 2) and at 0.50
+# without it, so he now classifies to neither run.
+hc = duckdb.connect()
+hc.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Kayzo', 'psytrance', 2, TRUE), ('Kayzo', 'electro', 1, TRUE),
+  ('Kayzo', 'happy hardcore', 1, TRUE), ('Kayzo', 'hardstyle', 1, TRUE),
+  ('Kayzo', 'house', 1, TRUE), ('Kayzo', 'dubstep', 1, TRUE),
+  ('Kayzo', 'trap', 1, TRUE)
+) t(artist_name, tag, tag_count, is_genre)""")
+running.build_artist_clusters(hc)
+check("...and Kayzo, whom it carried to 0.60, classifies nowhere",
+      hc.execute("SELECT cluster, round(bass_share, 2) FROM artist_clusters"
+                 ).fetchone(), (None, 0.5))
+
 # --- known pool: credits, completion, and the per-artist cap ------------
 con.execute("""
 CREATE TABLE plays AS SELECT * FROM (VALUES
@@ -831,6 +857,59 @@ check("an overlong track is skipped, not fatal",
 unknown = [{"spotify_track_uri": "x", "duration_ms": None}] * 40
 check("unknown durations cannot blow the budget",
       len(running.fill_to_target(unknown, 10 * 60_000)) <= 4, True)
+
+# --- the known fill may take ONE track past its budget -------------------
+# The 09-26 dubstep run came in at a known share of 0.597. fill_to_target
+# stopped 0.93 min under its 144-min budget because nothing eligible was that
+# short, and discovery took the rest. fill_known takes one more track, the next
+# in rank order that fits the whole target, and discovery gets what is left.
+MIN = 60_000
+BUDGET, TARGET = int(240 * MIN * config.RUN_KNOWN_FRACTION), 240 * MIN
+ranked = ([{"spotify_track_uri": f"k{i}", "score": 1.0 - i / 100,
+            "duration_ms": 210_000} for i in range(40)]            # 140 min
+          + [{"spotify_track_uri": "k40", "score": 0.55, "duration_ms": 184_200},
+             {"spotify_track_uri": "next", "score": 0.50, "duration_ms": 192_000},
+             {"spotify_track_uri": "short", "score": 0.30, "duration_ms": 118_800}])
+ids = lambda rs: [r["spotify_track_uri"] for r in rs]
+mins = lambda rs: sum(r["duration_ms"] for r in rs) / MIN
+old = running.fill_to_target(ranked, BUDGET)
+check("fill_to_target alone stops at 143.07 min, a 0.596 share",
+      (round(mins(old), 2), round(mins(old) / 240, 3)), (143.07, 0.596))
+new = running.fill_known(ranked, BUDGET, TARGET)
+check("fill_known reaches the 0.60 known share",
+      mins(new) / 240 >= config.RUN_KNOWN_FRACTION, True)
+check("...with exactly one track more", ids(new), ids(old) + ["next"])
+check("...the next ranked one (3.2 min), not the smallest overshoot (1.98)",
+      "short" in ids(new), False)
+check("...and the playlist can still close at the target: discovery gets "
+      "the 93.73 min left", round(240 - mins(new), 2), 93.73)
+
+# It takes time past the known budget, as the top-up does, so the top-up's
+# rules hold: the floor on the track's own score, and no unknown lengths.
+floored = [dict(r, score=0.15) if r["spotify_track_uri"] == "next" else r
+           for r in ranked]
+check("a next track under the top-up floor is passed over for the one behind it",
+      ids(running.fill_known(floored, BUDGET, TARGET))[-1], "short")
+unsized = [dict(r, duration_ms=None) if r["spotify_track_uri"] == "next" else r
+           for r in ranked]
+check("...and so is one with no known length",
+      ids(running.fill_known(unsized, BUDGET, TARGET))[-1], "short")
+tight = running.fill_known(ranked, BUDGET, int(145.5 * MIN))
+check("it must fit the WHOLE target: at 145.5 min only the 1.98 fits",
+      (ids(tight)[-1], mins(tight) <= 145.5), ("short", True))
+check("...and at 145 min nothing does",
+      ids(running.fill_known(ranked, BUDGET, 145 * MIN)), ids(old))
+
+# No overshoot once the budget is met, or when the pool has nothing left.
+exact = [{"spotify_track_uri": f"e{i}", "score": 1.0, "duration_ms": 180_000}
+         for i in range(49)]                                     # 48 x 3 = 144
+check("at exactly the fraction nothing more is taken",
+      ids(running.fill_known(exact, BUDGET, TARGET)),
+      ids(running.fill_to_target(exact, BUDGET)))
+check("...which is 144 min", mins(running.fill_known(exact, BUDGET, TARGET)), 144.0)
+few = ranked[:10]
+check("a pool used up under the budget takes nothing extra",
+      ids(running.fill_known(few, BUDGET, TARGET)), ids(few))
 
 # --- live recordings are refused however on-genre they are --------------
 # Crowd noise and a tempo chosen on the night break a run, and none of that is
