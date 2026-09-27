@@ -453,18 +453,25 @@ config are tracked. Before changing anything here, understand why it is the way 
   the top. The token now holds `playlist-read-private playlist-read-collaborative user-library-read
   user-library-modify playlist-modify-private playlist-modify-public user-read-recently-played`;
   `user-library-modify` is Step 0's and no stage requests it.
-- **Liked Songs' dates are not save history for 422 tracks.** Step 0's one-off backfill (2026-09-27,
-  a scratchpad script outside the repo; plan `2026-09-25-driving-dump-playlist.md`) saved the 422
-  Driving #2 tracks not already liked, oldest-first, one per request. "Recently added" order is
-  therefore Driving #2's order, but every one of them is dated 2026-09-27. So is "My Home", which the
-  no-op probe re-stamped that day, and so is any genuine heart from that date: `capture.py --source
-  liked` reports a largest same-day stamp of 2026-09-27 × **at least 423** (its report prints that
-  figure for this reason), and 423 is not a wrong backfill count. To verify the 422, count the
-  Driving #2 URIs stamped that day, not every stamp. A union with the playlist source keeps the
-  NEWEST `added_at` per URI — so each backfilled track takes the 2026-09-27 stamp over its real
-  playlist date, while a track liked before the backfill keeps an older date and ranks below all
-  422 (bar "My Home", now on the same day), however recently it joined the playlist. Until genuine
-  hearts fill the newest 100, render from the playlist source alone.
+- **Liked Songs' dates are not save history for the backfilled tracks.** Step 0's one-off backfill
+  (a scratchpad script outside the repo; plan `2026-09-25-driving-dump-playlist.md`) saves the 422
+  Driving #2 tracks that were not already liked, oldest-first, one per request, so "Recently added"
+  order is Driving #2's order. 367 were saved on 2026-09-27 before the quota lockout below; the other
+  55 wait for it to lift, so they carry the later date. None of them carries its playlist date, and
+  neither does "My Home", which the no-op probe re-stamped on 2026-09-27. So `capture.py --source
+  liked` reports a large same-day stamp, and that is the backfill, not a wrong count: to verify it,
+  count the Driving #2 URIs per stamp date, not every stamp. A union with the playlist source keeps
+  the NEWEST `added_at` per URI — so each backfilled track takes its save date over its real playlist
+  date, while a track liked before the backfill keeps an older date and ranks below all of them (bar
+  "My Home"), however recently it joined the playlist. Until genuine hearts fill the newest 100,
+  render from the playlist source alone.
+- **The developer app has a daily request quota, and exhausting it locks every Spotify stage out for
+  about a day.** On 2026-09-27 the Step 0 backfill hit `429 {"reason": "QUOTA_EXCEEDED"}` with
+  `Retry-After: 85859` (≈ 24 h) after roughly 800 requests that day — a `contains` check before each
+  of 367 saves doubled the count. It is not the ordinary rate limit: `Spotify._req`'s capped 30 s
+  retry cannot outwait it, and every stage that touches Spotify (6, 8, 9, 10, 11) fails until it
+  lifts. Budget bulk writes: use one read of the whole set instead of per-item checks, and never
+  schedule the poller or a refresh to run beside a bulk job.
 - **ListenBrainz's Popularity API is disabled server-side** (`500: "Popularity API currently disabled
   due to high load"` on `top-recordings-for-artist` and `top-release-groups-for-artist`; the batch
   `popularity/recording` route answers 200 with `total_listen_count: null` for everything). That is
