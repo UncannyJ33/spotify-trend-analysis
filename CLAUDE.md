@@ -67,7 +67,8 @@ fail silently — no listening time created or lost, no double-counted performer
 `report()`. Stages import each other only to reuse, never to copy: `recommend` ← `enrich`;
 `forecast` ← `analyze`; `playlists` ← `enrich`, `recommend`, `report`, `poll`; `consolidate` ←
 `enrich`, `playlists`, `poll`; `running` ← `consolidate`, `credits` (the remix regex and its guards),
-`enrich`, `playlists`, `recommend`, `report`; `app` ← `recommend` (the λ dial). A second copy is how
+`enrich`, `playlists`, `recommend`, `report`; `capture` ← `consolidate` (`read_playlist`, whose
+`duration_ms` key Stage 11 depends on), `playlists`, `poll`; `app` ← `recommend` (the λ dial). A second copy is how
 two definitions of one idea drift apart — `running.register_song_key` registers
 `playlists._title_key` itself as a DuckDB function rather than re-spelling it in SQL.
 
@@ -404,7 +405,10 @@ correct.
   it, and that is intended. The append-only rule protects answers that cost MusicBrainz requests;
   these dates live on Spotify and a re-read costs one request per 100 tracks (50 for Liked Songs).
   What was rendered survives as `fresh_selection` rows in `playlists.parquet`, and what was
-  overwritten as `fresh_pre_replace_snapshot`, archived BEFORE the PUT rather than after it.
+  overwritten as `fresh_pre_replace_snapshot`, archived BEFORE the PUT rather than after it. That
+  snapshot is read with `consolidate.read_playlist`, not `playlists.playlist_items`: the latter
+  returns `[]` or the pages it got when a read fails, and the PUT would then overwrite what was
+  never recorded. A failed snapshot read refuses the replace.
 
 ## Privacy constraints
 
@@ -452,12 +456,15 @@ config are tracked. Before changing anything here, understand why it is the way 
 - **Liked Songs' dates are not save history for 422 tracks.** Step 0's one-off backfill (2026-09-27,
   a scratchpad script outside the repo; plan `2026-09-25-driving-dump-playlist.md`) saved the 422
   Driving #2 tracks not already liked, oldest-first, one per request. "Recently added" order is
-  therefore Driving #2's order, but every one of them is dated 2026-09-27. `capture.py --source liked`
-  sees 422 adds that day (its report prints the largest same-day stamp for this reason), and a union
-  with the playlist source keeps the NEWEST `added_at` per URI — so each backfilled track takes the
-  2026-09-27 stamp over its real playlist date, while a track liked before the backfill keeps an
-  older date and ranks below all 422, however recently it joined the playlist. Until genuine hearts
-  fill the newest 100, render from the playlist source alone.
+  therefore Driving #2's order, but every one of them is dated 2026-09-27. So is "My Home", which the
+  no-op probe re-stamped that day, and so is any genuine heart from that date: `capture.py --source
+  liked` reports a largest same-day stamp of 2026-09-27 × **at least 423** (its report prints that
+  figure for this reason), and 423 is not a wrong backfill count. To verify the 422, count the
+  Driving #2 URIs stamped that day, not every stamp. A union with the playlist source keeps the
+  NEWEST `added_at` per URI — so each backfilled track takes the 2026-09-27 stamp over its real
+  playlist date, while a track liked before the backfill keeps an older date and ranks below all
+  422 (bar "My Home", now on the same day), however recently it joined the playlist. Until genuine
+  hearts fill the newest 100, render from the playlist source alone.
 - **ListenBrainz's Popularity API is disabled server-side** (`500: "Popularity API currently disabled
   due to high load"` on `top-recordings-for-artist` and `top-release-groups-for-artist`; the batch
   `popularity/recording` route answers 200 with `total_listen_count: null` for everything). That is

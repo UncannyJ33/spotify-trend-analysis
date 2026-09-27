@@ -234,6 +234,21 @@ raises("a Liked Songs read failing part-way refuses rather than going short",
        lambda: capture.read_liked(FailingSp(liked=liked)), "failed part-way")
 
 
+class SilentSp(FakeSp):
+    """Page two of Liked Songs never arrives: Spotify.get returns None on a
+    network error, which is no envelope at all. Read as the end of the
+    library, it snapshots the first 50 hearts as the whole of Liked Songs."""
+    def get(self, path, params=None):
+        if "offset=50" in path:
+            self.verbs.append(("GET", path))
+            return None
+        return super().get(path, params)
+
+
+raises("a Liked Songs read that stops answering part-way refuses, not short",
+       lambda: capture.read_liked(SilentSp(liked=liked)), "failed part-way")
+
+
 # --------------------------------------------------------------------------
 # read_source: one row shape for both kinds; source_rank 0 = newest.
 # --------------------------------------------------------------------------
@@ -476,6 +491,40 @@ check("...with no PUT or POST targeting it",
 check("...and nothing archived or stored",
       (config.PLAYLISTS_PARQUET.exists(), config.CAPTURE_STATE_JSON.exists()),
       (False, False))
+
+# The pre-replace snapshot must fail loudly. playlists.playlist_items answers
+# [] or a partial list when a page errors, and a PUT after that overwrites a
+# hand-added track that was never recorded. The target exists, holds one track
+# SJ added by hand, and its /items read fails: nothing may be PUT.
+class SnapshotFails(FakeSp):
+    def __init__(self, answer, on, **kw):
+        super().__init__(**kw)
+        self.answer, self.on = answer, on
+
+    def get(self, path, params=None):
+        if path.startswith("/playlists/F/items") and self.on in path:
+            self.verbs.append(("GET", path))
+            return self.answer
+        return super().get(path, params)
+
+
+hand = [pl_item("spotify:track:hand-added", "2026-09-20T00:00:00Z")]
+for label, answer, on, target in (
+        ("a 502 on the snapshot read", {"_status": 502, "_body": "bad"}, "", hand),
+        ("no response to the snapshot read", None, "", hand),
+        # 150 tracks, page two lost: a short snapshot is as bad as none.
+        ("the snapshot's second page lost", None, "offset=100",
+         [pl_item(f"spotify:track:f{i}", ts(i)) for i in range(150)])):
+    reset_files()
+    config.CAPTURE_STATE_JSON.write_text(json.dumps(
+        {"fresh": {"id": "F", "name": config.FRESH_PLAYLIST_NAME}}), encoding="utf-8")
+    sp = SnapshotFails(answer, on, playlists_=[SRC],
+                       items={SRC["id"]: dump, "F": target})
+    raises(f"{label} refuses the replace",
+           lambda: capture.run(sp, duckdb.connect(), [SRC["name"]], 100, True),
+           "snapshot")
+    check("...with no PUT or POST issued at all", sp.writes(), [])
+    check("...and nothing archived", config.PLAYLISTS_PARQUET.exists(), False)
 
 # An empty read must not blank the target.
 reset_files()

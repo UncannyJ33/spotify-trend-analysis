@@ -65,7 +65,6 @@ from playlists import (
     SP_API,
     Spotify,
     ensure_playlist,
-    playlist_items,
     write_archive,
 )
 from poll import ARTIST_SEP
@@ -359,7 +358,7 @@ def save_state(d: dict) -> None:
 
 
 def _artists(track_artists: str | None) -> str:
-    """Display form for the archive, like playlist_items' snapshot rows. The
+    """Display form for the archive, like Stage 8's snapshot rows. The
     0x1f list stays in capture.parquet; this column is never split."""
     return ", ".join((track_artists or "").split(ARTIST_SEP))
 
@@ -384,13 +383,23 @@ def publish(sp, con, meta: list[dict], tracks: list[dict]) -> str:
         raise SystemExit(f"The Fresh playlist resolved to the source "
                          f"{hit['name']!r} ({pid}). Refusing to write it.")
 
+    # read_playlist, not playlists.playlist_items: that one ends its loop on
+    # an error envelope or a None response and hands back [] or the pages it
+    # got. An empty snapshot archives nothing and the PUT still runs, so a
+    # track SJ added to Fresh by hand would be overwritten unrecorded. This
+    # read raises instead, and the playlist is left as it is.
+    try:
+        old = read_playlist(sp, pid)
+    except SystemExit as e:
+        raise SystemExit(f"Could not snapshot {name!r} before replacing it, so "
+                         f"it was not replaced: {e}") from None
     run_date = date.today().isoformat()
     write_archive(con, [{
         "run_date": run_date, "kind": "fresh_pre_replace_snapshot",
         "gap_tag": "fresh", "playlist_id": pid, "position": i, "slot": None,
-        "artist_name": old["artist_name"], "track_name": old["track_name"],
-        "spotify_track_uri": old["uri"], "source": "spotify",
-    } for i, old in enumerate(playlist_items(sp, pid))])
+        "artist_name": ", ".join(o["artists"]), "track_name": o["track_name"],
+        "spotify_track_uri": o["spotify_track_uri"], "source": "spotify",
+    } for i, o in enumerate(old)])
 
     uris = [t["spotify_track_uri"] for t in tracks]
     if len(uris) > SP_PUT_MAX_URIS:

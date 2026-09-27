@@ -94,7 +94,7 @@ Net: capturing works. What's missing is a **bounded, newest-first way to play wh
 
 - [x] **Step 1: SJ consents.** Only after he says so. Run the probes above with the read scope first, then the one-track write probe.
 - [x] **Step 2: Backfill**, additive, backdated where honoured. (Not honoured: saved oldest-first instead.)
-- [ ] **Step 3: Read back and compare.** For each Driving #2 URI, check it is present and that the liked `added_at` equals the playlist `added_at` to the second. Record the token's `scope` field only, never the tokens. (Pending: the orchestrator verifies the 422.)
+- [ ] **Step 3: Read back and compare.** For each Driving #2 URI, check it is present and that the liked `added_at` equals the playlist `added_at` to the second. Record the token's `scope` field only, never the tokens. (Pending: the orchestrator verifies the 422 by counting Driving #2 URIs dated 2026-09-27 — not every stamp that day, which includes the re-stamped "My Home".)
 - [x] **Step 4: Record the result**
 
 ```
@@ -119,7 +119,7 @@ LIKED SONGS BACKFILL (Step 0) — verified 2026-09-27
                                         2026-09-27 — re-saving an already-liked track restamps it
 ```
 
-**`added_at` was not preserved** (all 422 stamped 2026-09-27). Saving oldest-first kept "Recently added" in Driving #2's order, so playing Liked Songs newest-first still works; the dates themselves are the backfill's. `capture.py --source liked` therefore sees 422 adds on one day, and in a union with `--source "Driving #2"` the newest-`added_at` rule gives every backfilled track that date over its real one, so anything liked before the backfill ranks below all 422. Render from the playlist source alone until genuine hearts fill the newest 100 (recorded in `CLAUDE.md` Gotchas). Re-saving **does** restamp an existing heart (the "My Home" probe), and the save takes no timestamp, so remove-and-re-save cannot restore history dates either (see Q8).
+**`added_at` was not preserved** (all 422 stamped 2026-09-27). Saving oldest-first kept "Recently added" in Driving #2's order, so playing Liked Songs newest-first still works; the dates themselves are the backfill's. 2026-09-27 also carries "My Home", which the no-op probe re-stamped, and any genuine heart from that day, so `capture.py --source liked` reports a largest same-day stamp of **at least 423** on 2026-09-27; that is not a wrong backfill count. The Step 3 read-back counts Driving #2 URIs stamped that day, not every stamp. In a union with `--source "Driving #2"` the newest-`added_at` rule gives every backfilled track that date over its real one, so anything liked before the backfill ranks below all 422 — except "My Home", now dated the same day. Render from the playlist source alone until genuine hearts fill the newest 100 (recorded in `CLAUDE.md` Gotchas). Re-saving **does** restamp an existing heart (the "My Home" probe), and the save takes no timestamp, so remove-and-re-save cannot restore history dates either (see Q8).
 
 **Side effect SJ accepts by consenting:** Liked Songs feeds Spotify's generated mixes, and those mixes supplied 33 of the last 50 plays. 475 new hearts, most of them a year or more old, will steer the mixes toward the whole dump rather than its newest quarter. If the mixes drift, Step 0 is the first suspect. This is a reason to decide Q1 before Step 0, not after.
 
@@ -252,7 +252,7 @@ Phase 2 is the one build that fixes the shuffle case. When SJ plays in order it 
 - `select_fresh(con, n) -> list[dict]`: `ORDER BY added_at DESC, source_rank, spotify_track_uri LIMIT n`, a total order (the bulk stamps tie on `added_at`; `source_rank` breaks them).
 - `publish(sp, con, meta, tracks)`: modelled on `running.publish` for one playlist.
   - `playlists.ensure_playlist(sp, "fresh", config.FRESH_PLAYLIST_NAME, state)`, **then refuse if `pid` is any source ID**. Also refuse up front if `FRESH_PLAYLIST_NAME` equals any source name.
-  - `playlists.playlist_items` goes to archive rows `kind='fresh_pre_replace_snapshot'`, then one `PUT /playlists/{id}/items`, then the description `PUT`. Archive rows `kind='fresh_selection'`, `gap_tag='fresh'`, via `playlists.write_archive`.
+  - `consolidate.read_playlist` of the target goes to archive rows `kind='fresh_pre_replace_snapshot'` (not `playlists.playlist_items`, which returns `[]` or a partial list on a failed read, so the PUT would overwrite unrecorded tracks; a failed snapshot read refuses the replace), then one `PUT /playlists/{id}/items`, then the description `PUT`. Archive rows `kind='fresh_selection'`, `gap_tag='fresh'`, via `playlists.write_archive`.
   - It saves `{"fresh": {...}, "sources": [{kind, id, name}, ...]}` to `CAPTURE_STATE_JSON`, so the poller's `--status` can label both.
 - Scopes, through `consolidate.gentle_token`:
   - Read: `playlist-read-private playlist-read-collaborative`, plus `user-library-read` **only when a source is `liked`**. A run on a named playlist must never prompt.
