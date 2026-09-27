@@ -72,7 +72,7 @@ Net: capturing works. What's missing is a **bounded, newest-first way to play wh
 
 ### Step 0 (DONE 2026-09-27): Liked Songs backfill — nothing else waits on it
 
-**Status 2026-09-27: done, dates not preserved.** SJ consented and the backfill ran. The save endpoint takes no timestamp, so the fallback below applied: 422 tracks saved oldest-first, one per request, every one stamped 2026-09-27. The result block has the details; the final count awaits a read-back.
+**Status 2026-09-27: 367 of 422 saved, dates not preserved; 55 pending.** SJ consented and the backfill ran. The save endpoint takes no timestamp, so the fallback below applied: oldest-first, one per request. After 367 saves Spotify answered `429 QUOTA_EXCEEDED` with `Retry-After` ≈ 24 h (the per-track `contains` check doubled the request count — see CLAUDE.md Gotchas); the remaining 55 resume when the lockout lifts, without per-track checks, and carry that later date. The final count awaits the read-back.
 
 *History:* on 2026-09-26 the consent prompt (`poll.authorize` waits 180 s for the redirect) timed out before SJ approved it, and nothing was written that day.
 
@@ -106,20 +106,20 @@ LIKED SONGS BACKFILL (Step 0) — verified 2026-09-27
   save path / timestamps honoured     : PUT /me/library?uris= (max 40) -> 200, empty body
                                         (PUT /me/tracks -> 403, dead) / NOT honoured
   Liked Songs before                  : 2,745   range 2019-07-31 -> 2026-05-20
-  Driving #2 URIs present after       : 53 already liked + 422 saved (verify by read-back) / 475
-  added_at preserved (to the s)       : 0 of the 422 — all stamped 2026-09-27
+  Driving #2 URIs present after       : 53 already liked + 367 saved 2026-09-27 + 55 pending (verify by read-back) / 475
+  added_at preserved (to the s)       : 0 — the 367 are stamped 2026-09-27; the 55 will carry their save date
   token scopes now                    : playlist-read-private playlist-read-collaborative
                                         user-library-read user-library-modify
                                         playlist-modify-private playlist-modify-public
                                         user-read-recently-played
-  decision                            : fallback — 422 saved oldest-first in playlist added_at
+  decision                            : fallback — saved oldest-first in playlist added_at; stopped at 367 by QUOTA_EXCEEDED
                                         order, one per request, so "Recently added" order =
                                         Driving #2 order; the dates are the backfill's, not history
   side effect                         : the one-track no-op probe RE-STAMPED "My Home" to
                                         2026-09-27 — re-saving an already-liked track restamps it
 ```
 
-**`added_at` was not preserved** (all 422 stamped 2026-09-27). Saving oldest-first kept "Recently added" in Driving #2's order, so playing Liked Songs newest-first still works; the dates themselves are the backfill's. 2026-09-27 also carries "My Home", which the no-op probe re-stamped, and any genuine heart from that day, so `capture.py --source liked` reports a largest same-day stamp of **at least 423** on 2026-09-27; that is not a wrong backfill count. The Step 3 read-back counts Driving #2 URIs stamped that day, not every stamp. In a union with `--source "Driving #2"` the newest-`added_at` rule gives every backfilled track that date over its real one, so anything liked before the backfill ranks below all 422 — except "My Home", now dated the same day. Render from the playlist source alone until genuine hearts fill the newest 100 (recorded in `CLAUDE.md` Gotchas). Re-saving **does** restamp an existing heart (the "My Home" probe), and the save takes no timestamp, so remove-and-re-save cannot restore history dates either (see Q8).
+**`added_at` was not preserved** (the 367 saved so far are stamped 2026-09-27). Saving oldest-first kept "Recently added" in Driving #2's order, so playing Liked Songs newest-first still works; the dates themselves are the backfill's. 2026-09-27 also carries "My Home", which the no-op probe re-stamped, and any genuine heart from that day, so `capture.py --source liked` reports a largest same-day stamp of **at least 423** on 2026-09-27; that is not a wrong backfill count. The Step 3 read-back counts Driving #2 URIs stamped that day, not every stamp. In a union with `--source "Driving #2"` the newest-`added_at` rule gives every backfilled track that date over its real one, so anything liked before the backfill ranks below all 422 — except "My Home", now dated the same day. Render from the playlist source alone until genuine hearts fill the newest 100 (recorded in `CLAUDE.md` Gotchas). Re-saving **does** restamp an existing heart (the "My Home" probe), and the save takes no timestamp, so remove-and-re-save cannot restore history dates either (see Q8).
 
 **Side effect SJ accepts by consenting:** Liked Songs feeds Spotify's generated mixes, and those mixes supplied 33 of the last 50 plays. 475 new hearts, most of them a year or more old, will steer the mixes toward the whole dump rather than its newest quarter. If the mixes drift, Step 0 is the first suspect. This is a reason to decide Q1 before Step 0, not after.
 
