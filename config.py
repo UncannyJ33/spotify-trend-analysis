@@ -496,6 +496,19 @@ RUN_PLAYLIST_DESCRIPTION_TEMPLATE = (
 # --write, in place: same ID, same URL, same followers.
 RUN_PLAYLIST_LEGACY_NAMES = {"speed garage": ("speed garage run · Claude",)}
 
+# --- Stage 11: capture — the dump, read-only ---------------------------------
+# Whatever SJ saves into (a playlist named on the command line, or Liked
+# Songs) is READ here and never written. Fresh · Claude is the pipeline-owned
+# rendering. The source is a CLI flag, not a constant, for Stage 9's reason:
+# personal playlist names stay out of tracked config.
+CAPTURE_PARQUET = DATA_DIR / "capture.parquet"
+CAPTURE_STATE_JSON = DATA_DIR / "capture_state.json"   # "fresh" -> id; sources
+FRESH_SIZE = 100           # one PUT; the newest 100 held 57% of the dump's 2026 plays
+FRESH_PLAYLIST_NAME = "Fresh · Claude"
+FRESH_PLAYLIST_DESCRIPTION_TEMPLATE = (
+    "The {n} newest tracks you saved, newest first ({hours:.1f} h). "
+    "Built by spotify-trend-analysis · refreshed {date}")
+
 # Fields that must never reach a derived artifact.
 DROPPED_FIELDS = ("ip_addr",)
 
