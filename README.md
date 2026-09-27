@@ -142,8 +142,9 @@ operation.
 | 8. Playlists | `python playlists.py` (`--dry-run`) | 4 Spotify playlists + `data/playlists.parquet` |
 | 9. Consolidate | `python consolidate.py --keep-whole N --filter N` (`--write`) | one new Spotify playlist + `data/consolidate_review.csv` |
 | 10. Running | `python running.py` (`--write`) | 2 Spotify playlists + `data/running_state.json` |
+| 11. Capture | `python capture.py --source N` (`--source liked`, `--size N`, `--write`) | `data/capture.parquet`; with `--write`, Fresh · Claude + `data/capture_state.json` |
 
-All prefixed with `.venv/bin/`. Stages 2, 5, 6, 8, 9 and 10 use the network; the rest are local.
+All prefixed with `.venv/bin/`. Stages 2, 5, 6, 8, 9, 10 and 11 use the network; the rest are local.
 
 **Bind the dashboard to localhost.** Streamlit listens on every interface by
 default and prints an external URL on your public IP. This page renders your
@@ -749,6 +750,38 @@ only to IDs in `data/running_state.json` or an exact name match (the current
 name, or failing that an exact former one from `RUN_PLAYLIST_LEGACY_NAMES`), and
 snapshots whatever it overwrites into `data/playlists.parquet` first.
 
+### Stage 11 — Capture: Fresh · Claude
+
+```bash
+python capture.py --source "Saved"                   # dry run: writes data/capture.parquet, prints the playlist
+python capture.py --source "Saved" --source liked    # union with Liked Songs
+python capture.py --source "Saved" --write           # refresh Fresh · Claude
+```
+
+Save music into one ever-growing playlist and it becomes a capture log rather than
+something you play. In order it opens on your oldest saves; on shuffle the newest
+are a small slice of the picks. On the author's dump the newest 100 tracks held
+57% of its 2026 plays but would get 21% of shuffle picks. Stage 11 reads that
+playlist, and/or Liked Songs (`--source liked`), and renders its newest 100
+(`FRESH_SIZE`), newest first, into **Fresh · Claude**.
+
+- **Your playlist is only ever read.** No reorder, prune or rename — a rewrite
+  would also restamp every track's "date added", the one thing this orders on. A
+  `· Claude` source is refused, and so is any run where the target could turn out
+  to be a source. A test asserts that no write call carries a source's ID.
+- **Liked Songs is read-only too.** Only `user-library-read` is requested, and
+  only when `liked` is a source. Spotify's save call takes no date, and re-saving
+  a track you already like moves it to the top, so nothing here ever saves.
+- **Dry run by default**, as Stage 9. `--size` stops at 100, because one call
+  replaces the whole playlist.
+- **`data/capture.parquet` is a full snapshot** of the sources each run, not a
+  cache: a track you remove from the source disappears from it.
+
+Every Stage 8 rule applies to the one playlist it writes: stored ID, then exact
+name, a snapshot before each replace, never a delete. It needs no other stage;
+`plays.parquet`, if present, only adds a count of how many selected tracks you
+have played.
+
 ### The tests
 
 The analysis pipeline, Stages 1–7, is verified mainly by its reports — every
@@ -759,13 +792,13 @@ genuinely cannot catch the failures that matter: a filter that drops the right
 are the few pipeline invariants a report cannot see, such as time lost evenly,
 which moves no share.
 
-`tests/` pins that logic instead, in 17 files — Stage 8's selection and
+`tests/` pins that logic instead, in 18 files — Stage 8's selection and
 within-artist track choice, Stage 9's scoring (above all Daft Punk and Kendrick
 Lamar, the two real artists that break the naive genre rules), Stage 10's
 intensity classification (ILLENIUM, who an include-list admits and a share test
 refuses), its remixer parsing (`Radio Edit` must never become an artist called
-"Radio"), its discovery seeds, track gate and supply order, the never-delete
-guarantee and the rename alias, each of the override files, and the scope
+"Radio"), its discovery seeds, track gate and supply order, Stage 11's rule that its
+source is only ever read, the never-delete guarantee and the rename alias, each of the override files, and the scope
 arithmetic on the shared Spotify token. On the pipeline side:
 `test_credit_names.py` (names Stage 1b must not cut), `test_override_cache.py`
 (a pinned override costs requests once), `test_trend_horizon.py` (Stage 3 stops
@@ -805,6 +838,7 @@ what it is. The ones worth touching:
 | `RUN_LIBRARY_DISCOVERY_FRACTION` | 0.25 | Discovery budget your own artists take before strangers |
 | `RUN_TOPUP_MIN_SCORE` | 0.20 | Floor for known tracks filling a discovery shortfall |
 | `RUN_PREFER_MARGIN` | 0.25 | Boost for members of a `prefer` playlist |
+| `FRESH_SIZE` | 100 | Tracks in Fresh · Claude (at most 100) |
 
 Change one and re-run the stage it belongs to (`analyze.py` then `report.py` for
 the trends, `running.py` for the `RUN_*` ones). Stage 2's cache is untouched by

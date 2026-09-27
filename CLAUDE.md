@@ -32,13 +32,17 @@ python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python consolidate.py --keep-whole "A" --filter "B" --write   # Stage 9 → new playlist
 .venv/bin/python running.py                # Stage 10 dry run (default)
 .venv/bin/python running.py --write        # Stage 10 → 2 playlists + data/running_state.json
+.venv/bin/python capture.py --source "NAME"          # Stage 11 dry run → data/capture.parquet
+.venv/bin/python capture.py --source "NAME" --write  # Stage 11 → Fresh · Claude + data/capture_state.json
 ```
 
 Run 1 → 1b → 2 → 3 in order; 4–8 consume Stage 3's output (Stage 8 also needs
 Stage 5's and Stage 7's). Stage 9 is independent of the gap analysis — it reads
 playlists a person built and needs only Stage 2's tags. Stage 10 needs 1b and 2 (plus `plays_raw`,
 so a 20-second skip counts as heard) and is likewise independent of the gap analysis — it no longer
-reads Stage 5 at all. Stages 2, 5, 6, 8, 9, 10 touch the network; the rest are local and cheap to re-run.
+reads Stage 5 at all. Stage 11 needs no earlier stage: it reads Spotify, and `plays.parquet` only
+for one line of its report. Stages 2, 5, 6, 8, 9, 10, 11 touch the network; the rest are local and
+cheap to re-run.
 
 Verification is split. Stages 1–7 are verified mainly by their `report()`, which prints counts,
 coverage and sanity checks to stdout; read it before claiming a stage worked. Tests exist where a
@@ -383,6 +387,24 @@ correct.
   keeps its remix out of dubstep — and the known pool sums pressings into one row ("tell you
   straight" was two half-counted rows on 70 and 44 plays). The pattern runs in RE2 and Python alike,
   so it avoids lookaround, backreferences and `\d`/`\s`; a test holds the two to the same answers.
+- **Stage 11 never writes its source.** `capture.py` reads the playlist SJ saves into (or Liked
+  Songs) and writes only `Fresh · Claude`. A write to the dump would destroy what this stage orders
+  on: a `uris` replace restamps `added_at` on every track. It refuses a `" · Claude"` source — the
+  pipeline's own output read back as taste is circular — and refuses whenever the target could be a
+  source: by name before anything is read, by the ID in `capture_state.json` once the sources are
+  known, and by the ID `ensure_playlist` resolves, since a stale state file or a source renamed to
+  the target's name mid-run would otherwise land the PUT on it. `tests/test_capture.py` asserts that
+  no PUT or POST carries a source ID on any of those paths.
+- **Liked Songs is read-only to the pipeline.** Only `user-library-read` is ever requested, and only
+  when a source is `liked`, so a run on a named playlist never prompts. Do not add a save, not even a
+  "no-op" one: the save endpoint takes no timestamp and re-saving a liked track re-stamps it to now,
+  rewriting the date Fresh sorts on. The only write ever made to it was Step 0's backfill, outside
+  the repo.
+- **`capture.parquet` is a full snapshot, not an append-only cache.** A removed save disappears from
+  it, and that is intended. The append-only rule protects answers that cost MusicBrainz requests;
+  these dates live on Spotify and a re-read costs one request per 100 tracks (50 for Liked Songs).
+  What was rendered survives as `fresh_selection` rows in `playlists.parquet`, and what was
+  overwritten as `fresh_pre_replace_snapshot`, archived BEFORE the PUT rather than after it.
 
 ## Privacy constraints
 
@@ -404,8 +426,8 @@ config are tracked. Before changing anything here, understand why it is the way 
 
 ## Gotchas
 
-- `SPOTIFY_CLIENT_ID` in `.env` is needed by `poll.py`, `playlists.py`, `consolidate.py` and
-  `running.py`, which share one developer app (Authorization Code + PKCE, no client secret, redirect URI exactly `http://127.0.0.1:3000`).
+- `SPOTIFY_CLIENT_ID` in `.env` is needed by `poll.py`, `playlists.py`, `consolidate.py`,
+  `running.py` and `capture.py`, which share one developer app (Authorization Code + PKCE, no client secret, redirect URI exactly `http://127.0.0.1:3000`).
   Every other stage runs with no `.env` at all. `SPOTIFY_CLIENT_SECRET` is read by nothing — do not
   add a flow that wants one.
 - **Spotify's February 2026 rename is why a 403 here may mean a dead endpoint, not a denied one.**
@@ -417,6 +439,25 @@ config are tracked. Before changing anything here, understand why it is the way 
   matrix at `FORBIDDEN_NOTE`; do not "restore" the old ones. From the same release: search `limit`
   maxes at 10 (hence `SP_SEARCH_LIMIT = 10`, not the once-documented 50) and tracks no longer carry
   `popularity` — which is why Stage 8 ranks on search relevance rather than that field.
+- **Liked Songs kept its read path through the rename and lost its write paths.** Verified live
+  2026-09-27: read is `GET /me/tracks?limit=50`, paged via `next` (`limit=51` → `400 "Invalid
+  limit"`), and each row nests the track under **`track`**, not `item`, beside its `added_at`.
+  `GET /me/tracks/contains` → 403 (dead); `GET /me/library/contains?uris=<comma list>` → 200, a list
+  of booleans. Save is `PUT /me/library?uris=<comma list, max 40>` → 200 with an empty body;
+  `PUT /me/tracks` → 403 (dead). The save takes **no timestamp**, and re-saving a track that is
+  already liked **re-stamps** its `added_at` to now — the one-track no-op probe moved "My Home" to
+  the top. The token now holds `playlist-read-private playlist-read-collaborative user-library-read
+  user-library-modify playlist-modify-private playlist-modify-public user-read-recently-played`;
+  `user-library-modify` is Step 0's and no stage requests it.
+- **Liked Songs' dates are not save history for 422 tracks.** Step 0's one-off backfill (2026-09-27,
+  a scratchpad script outside the repo; plan `2026-09-25-driving-dump-playlist.md`) saved the 422
+  Driving #2 tracks not already liked, oldest-first, one per request. "Recently added" order is
+  therefore Driving #2's order, but every one of them is dated 2026-09-27. `capture.py --source liked`
+  sees 422 adds that day (its report prints the largest same-day stamp for this reason), and a union
+  with the playlist source keeps the NEWEST `added_at` per URI — so each backfilled track takes the
+  2026-09-27 stamp over its real playlist date, while a track liked before the backfill keeps an
+  older date and ranks below all 422, however recently it joined the playlist. Until genuine hearts
+  fill the newest 100, render from the playlist source alone.
 - **ListenBrainz's Popularity API is disabled server-side** (`500: "Popularity API currently disabled
   due to high load"` on `top-recordings-for-artist` and `top-release-groups-for-artist`; the batch
   `popularity/recording` route answers 200 with `total_listen_count: null` for everything). That is
