@@ -330,6 +330,9 @@ RUN_BORDERLINE_BAND = 0.15
 # genre filter — 220 dubstep and 181 garage tracks qualify from the history
 # alone, 11.8 h and 9.2 h uncapped — so length costs variety, not precision.
 RUN_TARGET_MINUTES = 240
+# A floor, not a cap. When the budget alone stops short (dubstep, 09-26: 0.597),
+# the known fill takes one more track and discovery gets what is left
+# (running.fill_known).
 RUN_KNOWN_FRACTION = 0.6      # rest is discovery; more new music, by request
 RUN_TRACKS_PER_ARTIST = 3     # one act must not own a playlist
 # A `prefer` row in running_overrides.csv names a playlist the listener built

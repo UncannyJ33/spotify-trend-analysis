@@ -1336,6 +1336,47 @@ def below_topup_floor(row: dict) -> bool:
     return row.get("base_score", row["score"]) < config.RUN_TOPUP_MIN_SCORE
 
 
+def fill_known(rows: list[dict], budget_ms: int, ceiling_ms: int) -> list[dict]:
+    """The known side: fill_to_target over its budget, then at most ONE more.
+
+    fill_to_target never overshoots, so the known side can fall short of
+    RUN_KNOWN_FRACTION on track lengths alone. The 09-26 dubstep run stopped at
+    143.07 of its 144 minutes because nothing eligible was under 0.93 min.
+    Discovery took the rest, and the known share was 0.597. So while the known
+    minutes are under the budget, one more track goes in if it fits
+    `ceiling_ms`, the whole target. Discovery's budget is whatever is left,
+    so the playlist still never runs past RUN_TARGET_MINUTES. At or over the
+    budget, nothing changes.
+
+    WHICH track: the next one in rank order that fits, not the one that
+    overshoots least. Smallest-overshoot picks by length, and at the short end
+    of this pool length and quality go together. Four of the six dubstep known
+    tracks under 2.5 minutes on 09-26 were weak ("Would You" at 1.98, RATATA,
+    real 4 me, stranger), against 9 of 44 overall. Every other known slot is
+    filled in rank order too. The price is at most one track's length of
+    discovery time.
+
+    The extra track takes time past the known budget, as the top-up does, so
+    the top-up's rules apply. It must clear RUN_TOPUP_MIN_SCORE on its own
+    score. A track with no known length is passed over, because the median
+    fill_to_target charges could push the playlist past the target. Pins are
+    untouched: they come first, count against the budget as before, and their
+    infinite score always clears the floor.
+    """
+    out = fill_to_target(rows, budget_ms)
+    used = sum(r["duration_ms"] for r in out)
+    if used >= budget_ms:
+        return out
+    kept = {r["spotify_track_uri"] for r in out}
+    for r in rows:
+        dur = r.get("duration_ms")
+        if (r["spotify_track_uri"] in kept or below_topup_floor(r)
+                or not dur or used + dur > ceiling_ms):
+            continue
+        return out + [dict(r, duration_ms=dur)]
+    return out
+
+
 def known_topup(rows: list[dict], kept: set[str], spare_ms: int,
                 place) -> list[dict]:
     """Known tracks for the time discovery could not fill, best first.
@@ -1542,16 +1583,22 @@ def build_selections(con, http, sp) -> list[dict]:
         # was placed.
         picked = [place(r) for r in eligible_known(known_rows, vetoes, fresh,
                                                    pinned)]
-        known = fill_to_target(pinned + picked, known_ms)
+        # One track past the budget when the budget alone would leave the
+        # known share under RUN_KNOWN_FRACTION; fill_known has the rule.
+        known = fill_known(pinned + picked, known_ms, target_ms)
         # Anything the duration fill rejected must not stay claimed, or it
         # cannot be offered to the other playlist.
         kept = {k["spotify_track_uri"] for k in known}
         for r in pinned + picked:
             if r["spotify_track_uri"] not in kept:
                 placed.release(r)
+        known_got = sum(k["duration_ms"] for k in known)
         print(f"  {len(known)} known tracks "
               f"({sum(1 for k in known if k.get('pinned'))} pinned), "
-              f"{sum(k['duration_ms'] for k in known)/60000:.0f} min")
+              f"{known_got/60000:.0f} min"
+              + (f", one past the {known_ms/60000:.0f}-min budget to reach "
+                 f"the {config.RUN_KNOWN_FRACTION:.2f} known share"
+                 if known_got > known_ms else ""))
 
         # DISCOVERY, in supply order within one budget. SJ's call (2026-09-26):
         # when new music runs short, fill with more of his OWN, and never keep

@@ -1034,9 +1034,11 @@ check("a playlist value that is neither is warned about and skipped",
 
 # --- the known top-up stops at its floor, end to end (C12) ----------------
 # test_running_selection.py pins known_topup; this pins that build_selections
-# uses it. A 12-minute target leaves 7.2 min for known tracks (two fit), and
-# with no discovery at all the other 6 min go to the top-up: the 0.25 row
-# goes in, and the 0.186 row stays out although it would fit.
+# uses it. A 12-minute target leaves 7.2 min for known tracks, and the two
+# 3.6-minute tracks fill it exactly. At the fraction, the known fill takes
+# nothing past its budget. With no discovery at all, the other 4.8 min go to
+# the top-up: the 0.25 row goes in, and the 0.186 row stays out although it
+# would fit.
 tcon = duckdb.connect()
 tcon.execute("""
 CREATE TABLE artist_tags AS SELECT * FROM (VALUES
@@ -1045,10 +1047,10 @@ CREATE TABLE artist_tags AS SELECT * FROM (VALUES
 running.build_artist_clusters(tcon)
 tcon.execute("""
 CREATE TABLE known_pool AS SELECT * FROM (VALUES
-  ('uri:t1', 'Top',    'Act A', 'dubstep', 180000.0::DOUBLE, 0.5::DOUBLE, 1.0::DOUBLE, 9::BIGINT, 1.0::DOUBLE,   ['uri:t1']),
-  ('uri:t2', 'Second', 'Act B', 'dubstep', 180000.0, 0.5, 1.0, 9, 0.5,   ['uri:t2']),
+  ('uri:t1', 'Top',    'Act A', 'dubstep', 216000.0::DOUBLE, 0.5::DOUBLE, 1.0::DOUBLE, 9::BIGINT, 1.0::DOUBLE,   ['uri:t1']),
+  ('uri:t2', 'Second', 'Act B', 'dubstep', 216000.0, 0.5, 1.0, 9, 0.5,   ['uri:t2']),
   ('uri:t3', 'Third',  'Act C', 'dubstep', 180000.0, 0.5, 1.0, 9, 0.25,  ['uri:t3']),
-  ('uri:t4', 'Filler', 'Act D', 'dubstep', 180000.0, 0.5, 1.0, 9, 0.186, ['uri:t4'])
+  ('uri:t4', 'Filler', 'Act D', 'dubstep',  90000.0, 0.5, 1.0, 9, 0.186, ['uri:t4'])
 ) t(spotify_track_uri, track_name, album_artist, cluster, duration_ms, hours,
     done_rate, n_plays, score, uris)""")
 tcon.execute("""
@@ -1079,7 +1081,71 @@ check("build_selections tops up only above the floor",
       ["uri:t1", "uri:t2", "uri:t3"])
 check("...and reports the shortfall rather than padding it",
       (dub["n_topup"], round(dub["short_min"]),
-       "3 min short of the 12-min target" in buf.getvalue()), (1, 3, True))
+       "2 min short of the 12-min target" in buf.getvalue()), (1, 2, True))
+
+# --- the known side reaches its fraction, end to end ----------------------
+# The 09-26 dubstep shape at toy scale. A 12-minute target gives known tracks
+# 7.2 min. Two 3-minute tracks fit (6 min) and the third does not, and two
+# strangers could fill all 6 min left. Before, discovery took all of it and the
+# known share was 0.50. Now the known fill takes the third track (9 min),
+# discovery gets the 3 min left, and the playlist still closes at 12.
+ocon = duckdb.connect()
+ocon.execute("""
+CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Act A', CAST(NULL AS VARCHAR), 'dubstep', 3, TRUE)
+) t(artist_name, mbid, tag, tag_count, is_genre)""")
+running.build_artist_clusters(ocon)
+ocon.execute("""
+CREATE TABLE known_pool AS SELECT * FROM (VALUES
+  ('uri:o1', 'One',   'Act A', 'dubstep', 180000.0::DOUBLE, 0.5::DOUBLE, 1.0::DOUBLE, 9::BIGINT, 1.0::DOUBLE, ['uri:o1']),
+  ('uri:o2', 'Two',   'Act B', 'dubstep', 180000.0, 0.5, 1.0, 9, 0.9, ['uri:o2']),
+  ('uri:o3', 'Three', 'Act C', 'dubstep', 180000.0, 0.5, 1.0, 9, 0.8, ['uri:o3'])
+) t(spotify_track_uri, track_name, album_artist, cluster, duration_ms, hours,
+    done_rate, n_plays, score, uris)""")
+ocon.execute("""
+CREATE TABLE track_credits AS
+SELECT spotify_track_uri, album_artist AS artist_name, 'album_artist' AS credit_type,
+       'export' AS credit_source FROM known_pool""")
+ocon.execute("""
+CREATE TABLE plays (spotify_track_uri VARCHAR, track_name VARCHAR,
+    artist_name VARCHAR, played_seconds DOUBLE, reason_end VARCHAR, month DATE,
+    ms_played BIGINT, ms_played_estimated BOOLEAN)""")
+ocon.execute("CREATE TABLE plays_raw AS SELECT *, 'music' AS content_type FROM plays")
+M15 = 90_000
+bass_pages = {
+    "Bass One": [item("u:b1a", "B1 A", M15, ("Bass One", "sp-b1")),
+                 item("u:b1b", "B1 B", M15, ("Bass One", "sp-b1"))],
+    "Bass Two": [item("u:b2a", "B2 A", M15, ("Bass Two", "sp-b2")),
+                 item("u:b2b", "B2 B", M15, ("Bass Two", "sp-b2"))],
+}
+saved = (running.cluster_seed_artists, running.cluster_candidates,
+         running.load_genre_vocabulary, running.mb_genre_recordings,
+         config.RUN_TARGET_MINUTES)
+running.cluster_seed_artists = lambda *a, **k: []
+running.cluster_candidates = lambda con, http, label, *a: (
+    [{"artist_name": "Bass One", "mbid": "m-b1", "score": 1.0, "share": 1.0},
+     {"artist_name": "Bass Two", "mbid": "m-b2", "score": 0.9, "share": 1.0}]
+    if label == "dubstep" else [])
+running.load_genre_vocabulary = lambda http: set()
+running.mb_genre_recordings = lambda http, mbid, tags, cache: set()
+config.RUN_TARGET_MINUTES = 12
+try:
+    sels = running.build_selections(ocon, NoNetwork(), SearchSp(bass_pages))
+finally:
+    (running.cluster_seed_artists, running.cluster_candidates,
+     running.load_genre_vocabulary, running.mb_genre_recordings,
+     config.RUN_TARGET_MINUTES) = saved
+dub = next(s for s in sels if s["label"] == "dubstep")
+known_ms = sum(t["duration_ms"] for t in dub["tracks"] if t["slot"] == "anchor")
+total_ms = sum(t["duration_ms"] for t in dub["tracks"])
+check("the known side reaches the 0.60 share of the finished playlist",
+      known_ms / total_ms >= config.RUN_KNOWN_FRACTION, True)
+check("...through the known fill's one extra track, not the top-up",
+      (sorted(t["spotify_track_uri"] for t in dub["tracks"]
+              if t["slot"] == "anchor"), dub["n_topup"]),
+      (["uri:o1", "uri:o2", "uri:o3"], 0))
+check("discovery takes what is left, and the playlist never passes the target",
+      (dub["n_new"], total_ms <= 12 * 60_000), (2, True))
 
 shutil.rmtree(_TMP, ignore_errors=True)
 if failures:
