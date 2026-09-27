@@ -30,7 +30,7 @@ Net: capturing works. What's missing is a **bounded, newest-first way to play wh
 **Architecture:** Driving #2 is read-only to the pipeline, permanently.
 - **Stage 6** starts recording which playlist each play came from.
 - **Stage 11 (`capture.py`)** is a small new stage. It reads the capture source — an exact-named playlist, and later Liked Songs — into `data/capture.parquet`. With `--write` it refreshes one pipeline-owned playlist, `Fresh · Claude`, through Stage 8's lifecycle, unchanged.
-- **Liked Songs** may later become the archive and the capture point (Step 0, pending SJ's consent). Nothing in Phases 1–2 depends on it.
+- **Liked Songs** may later become the archive and the capture point. Step 0's backfill ran on 2026-09-27, but the save endpoint takes no timestamp, so the backfilled hearts carry that day's date, not their history. Nothing in Phases 1–2 depends on it.
 - **Stage 10** later reads `capture.parquet` as an optional input, on the discovery side only — specified in the Stage 10 fixes plan, not here.
 
 **Tech Stack:** Python 3.12 in `.venv`, DuckDB over Parquet, the shared PKCE token via `consolidate.gentle_token`, and `playlists.Spotify`, which has no delete verb. No new dependencies.
@@ -50,7 +50,7 @@ Net: capturing works. What's missing is a **bounded, newest-first way to play wh
 - **Never delete or unfollow.** `Fresh · Claude` is written only by state-file ID or exact-name match, and is snapshotted into `data/playlists.parquet` before every replace. `capture.py` refuses to run if its write target could be its source.
 - **Liked Songs is read-only to the pipeline.** The only write to it is Step 0, a one-off scratchpad script outside the repo, run once with SJ present and never built into a stage.
 - Scopes only widen, through `poll.access_token`'s union. Library scopes are requested only by the code paths that need them: a `capture.py` run on a named playlist must never prompt for `user-library-read`.
-- Use Spotify's post-Feb-2026 paths (`/me/playlists`, `/playlists/{id}/items`, `item` not `track`). The Liked Songs path and nesting are whatever Step 0 verifies. **Do not assume `/me/tracks` survived the rename:** a dead path answers 403, not 404.
+- Use Spotify's post-Feb-2026 paths (`/me/playlists`, `/playlists/{id}/items`, `item` not `track`). Liked Songs, verified by Step 0 on 2026-09-27: read `GET /me/tracks?limit=50`, nesting **`track`** (not `item`); save `PUT /me/library?uris=` (max 40). `GET /me/tracks/contains` and `PUT /me/tracks` answer 403: a dead path answers 403, not 404.
 - `public: false` doesn't stick, so descriptions must not call anything private.
 - No playlist IDs in tracked files. `data/*.json` state files are already gitignored by the `*.json` blanket.
 - Branch: `driving-dump` for Phases 1–2. Phase 3 belongs to the Stage 10 fixes plan and its branch. PRs need SJ's approval; plain merges don't.
@@ -60,7 +60,7 @@ Net: capturing works. What's missing is a **bounded, newest-first way to play wh
 
 | Step | Reads Driving #2 | Writes Driving #2 | Other writes |
 |---|---|---|---|
-| 0. Liked Songs backfill (**pending**, needs consent) | yes | **no** | Liked Songs: additive, backdated saves — scratchpad script, SJ present |
+| 0. Liked Songs backfill (**done 2026-09-27**) | yes | **no** | Liked Songs: additive saves, oldest-first (timestamps not honoured) — scratchpad script, SJ present |
 | 1.1–1.2 habits | n/a | no | SJ's own hearts, if he chooses them |
 | 1.3 poller context | no | no | `data/polled_plays.parquet` |
 | 1.4 Stage 10 pins | no | no | `running_overrides.csv` (local) |
@@ -70,9 +70,11 @@ Net: capturing works. What's missing is a **bounded, newest-first way to play wh
 
 ---
 
-### Step 0 (PENDING): Liked Songs backfill — waits on SJ's consent, and nothing else waits on it
+### Step 0 (DONE 2026-09-27): Liked Songs backfill — nothing else waits on it
 
-**Status 2026-09-26: not done.** The consent prompt for `user-library-read user-library-modify` (`poll.authorize` waits 180 s for the redirect) timed out before SJ approved it. No token carries a library scope and **nothing has been written to Liked Songs.** SJ has deferred everything that needs consent. Do not re-run the consent prompt until he says so.
+**Status 2026-09-27: done, dates not preserved.** SJ consented and the backfill ran. The save endpoint takes no timestamp, so the fallback below applied: 422 tracks saved oldest-first, one per request, every one stamped 2026-09-27. The result block has the details; the final count awaits a read-back.
+
+*History:* on 2026-09-26 the consent prompt (`poll.authorize` waits 180 s for the redirect) timed out before SJ approved it, and nothing was written that day.
 
 **What it will do, when SJ says go.** A throwaway scratchpad script, outside the repo, with SJ present:
 1. Widen the token by the union rule (`poll.access_token(client_id, "user-library-read user-library-modify")`). The playlist and recently-played scopes stay.
@@ -90,24 +92,34 @@ Net: capturing works. What's missing is a **bounded, newest-first way to play wh
 - Modify: this plan file (fill in the result block)
 - Modify: `CLAUDE.md` Gotchas: the verified Liked Songs paths, page size and nesting key, and the scopes the token now holds
 
-- [ ] **Step 1: SJ consents.** Only after he says so. Run the probes above with the read scope first, then the one-track write probe.
-- [ ] **Step 2: Backfill**, additive, backdated where honoured.
-- [ ] **Step 3: Read back and compare.** For each Driving #2 URI, check it is present and that the liked `added_at` equals the playlist `added_at` to the second. Record the token's `scope` field only, never the tokens.
-- [ ] **Step 4: Record the result**
+- [x] **Step 1: SJ consents.** Only after he says so. Run the probes above with the read scope first, then the one-track write probe.
+- [x] **Step 2: Backfill**, additive, backdated where honoured. (Not honoured: saved oldest-first instead.)
+- [ ] **Step 3: Read back and compare.** For each Driving #2 URI, check it is present and that the liked `added_at` equals the playlist `added_at` to the second. Record the token's `scope` field only, never the tokens. (Pending: the orchestrator verifies the 422.)
+- [x] **Step 4: Record the result**
 
 ```
-LIKED SONGS BACKFILL (Step 0) — verified ____
+LIKED SONGS BACKFILL (Step 0) — verified 2026-09-27
 
-  read path / page size / nesting key : ____ / ____ / ____
-  save path / timestamps honoured     : ____ / ____
-  Liked Songs before                  : ___   range ____ -> ____
-  Driving #2 URIs present after       : ___ / 475
-  added_at preserved (to the s)       : ___ / 475
-  token scopes now                    : ____
-  decision                            : ____
+  read path / page size / nesting key : GET /me/tracks / 50 (51 -> 400 "Invalid limit") / 'track'
+  contains                            : GET /me/library/contains?uris= -> 200 [bool]
+                                        (GET /me/tracks/contains -> 403, dead)
+  save path / timestamps honoured     : PUT /me/library?uris= (max 40) -> 200, empty body
+                                        (PUT /me/tracks -> 403, dead) / NOT honoured
+  Liked Songs before                  : 2,745   range 2019-07-31 -> 2026-05-20
+  Driving #2 URIs present after       : 53 already liked + 422 saved (verify by read-back) / 475
+  added_at preserved (to the s)       : 0 of the 422 — all stamped 2026-09-27
+  token scopes now                    : playlist-read-private playlist-read-collaborative
+                                        user-library-read user-library-modify
+                                        playlist-modify-private playlist-modify-public
+                                        user-read-recently-played
+  decision                            : fallback — 422 saved oldest-first in playlist added_at
+                                        order, one per request, so "Recently added" order =
+                                        Driving #2 order; the dates are the backfill's, not history
+  side effect                         : the one-track no-op probe RE-STAMPED "My Home" to
+                                        2026-09-27 — re-saving an already-liked track restamps it
 ```
 
-**If `added_at` was not preserved** (everything stamped today), Liked Songs' "Recently added" order is scrambled and `capture.py --source liked` orders on the wrong dates. Re-saving may not restamp an existing heart. The repair would be to remove and re-save the hearts, which removes items from SJ's library. That is SJ's call (Q8), done outside the pipeline, which has no delete verb and keeps it that way.
+**`added_at` was not preserved** (all 422 stamped 2026-09-27). Saving oldest-first kept "Recently added" in Driving #2's order, so playing Liked Songs newest-first still works; the dates themselves are the backfill's. `capture.py --source liked` therefore sees 422 adds on one day, and in a union with `--source "Driving #2"` the newest-`added_at` rule gives every backfilled track that date over its real one, so anything liked before the backfill ranks below all 422. Render from the playlist source alone until genuine hearts fill the newest 100 (recorded in `CLAUDE.md` Gotchas). Re-saving **does** restamp an existing heart (the "My Home" probe), and the save takes no timestamp, so remove-and-re-save cannot restore history dates either (see Q8).
 
 **Side effect SJ accepts by consenting:** Liked Songs feeds Spotify's generated mixes, and those mixes supplied 33 of the last 50 plays. 475 new hearts, most of them a year or more old, will steer the mixes toward the whole dump rather than its newest quarter. If the mixes drift, Step 0 is the first suspect. This is a reason to decide Q1 before Step 0, not after.
 
@@ -124,7 +136,7 @@ LIKED SONGS BACKFILL (Step 0) — verified ____
 Two workable answers. Both keep the pipeline out of Driving #2.
 
 - **Keep adding to Driving #2** (recommended *for now*). Needs no consent, no backfill; Phase 2 reads it by name. Its cost is the one SJ already pays: an ever-longer playlist. Freezing it later costs nothing, as Driving #1 showed.
-- **Switch to the heart.** One tap, lands at the top of Liked Songs, never forces a "Driving #3". But without Step 0 it starves `Fresh · Claude`: at 6 adds a month, Liked Songs alone takes about 16 months to reach 100 tracks. So the heart implies Step 0, which implies consent SJ has deferred. `--source` is repeatable precisely so a later switch works without a backfill: `--source "Driving #2" --source liked` unions the two and dedupes by URI on the newest `added_at`.
+- **Switch to the heart.** One tap, lands at the top of Liked Songs, never forces a "Driving #3". But without Step 0 it starves `Fresh · Claude`: at 6 adds a month, Liked Songs alone takes about 16 months to reach 100 tracks. So the heart implies Step 0 (which has now run, 2026-09-27, without preserving dates). `--source` is repeatable precisely so a later switch works without a backfill: `--source "Driving #2" --source liked` unions the two and dedupes by URI on the newest `added_at`.
 
 ### Task 1.2: Listen newest-first without building anything (no code)
 
@@ -201,7 +213,7 @@ speed garage,keep,Łaszewo,headrush,AVELLO co-credit missing from the export; sa
 
 ---
 
-## Phase 2 — `Fresh · Claude`: the bounded newest-first pool (gate: SJ says yes to Q2)
+## Phase 2 — `Fresh · Claude`: the bounded newest-first pool (gate: SJ says yes to Q2 — met 2026-09-27)
 
 Phase 2 is the one build that fixes the shuffle case. When SJ plays in order it gives the same result as Task 1.2, and it's playable anywhere a playlist is. It reads Driving #2 by name and needs no consent SJ has not already given.
 
@@ -231,7 +243,7 @@ Phase 2 is the one build that fixes the shuffle case. When SJ plays in order it 
 **Interfaces:**
 - `read_source(sp, source: str) -> tuple[dict, list[dict]]`:
   - Anything other than `liked` goes through `consolidate.find_playlist`, which requires an exact name and errors on a missing or duplicated one, then `consolidate.read_playlist`.
-  - `liked` calls `read_liked(sp)`, which pages Liked Songs using the path and nesting key Step 0 verified. **Until Step 0 has run, `liked` exits with "Liked Songs path not verified; see Step 0"** rather than guessing a path that may answer 403.
+  - `liked` calls `read_liked(sp)`, which pages Liked Songs using the path and nesting key Step 0 verified on 2026-09-27: `GET /me/tracks?limit=50` via `next`, each row under `track`. It refuses (rather than reading an empty library) when a page's rows carry no `track` key, and when a page fails part-way.
   - It refuses a source whose name ends in `" · Claude"`, because reading the pipeline's own output as capture is circular.
   - Row shape: `spotify_track_uri, track_name, track_artists` (joined on `poll.ARTIST_SEP`), `duration_ms, added_at, source, source_rank` (0 = newest in source order).
   - It skips rows without a URI (local and unavailable tracks) and non-track items.
@@ -250,7 +262,7 @@ Phase 2 is the one build that fixes the shuffle case. When SJ plays in order it 
   - `--size` is capped at 100 and refused above it: one `PUT` replaces the whole playlist and nothing here needs the chunked `POST` path.
   - `--write` refreshes the playlist.
 
-- [ ] **Step 1: Write the failing test** (`tests/test_capture.py`). It uses a fake modelled on `tests/test_playlist_lifecycle.py`'s `FakeSp` that records every verb. It checks:
+- [x] **Step 1: Write the failing test** (`tests/test_capture.py`). It uses a fake modelled on `tests/test_playlist_lifecycle.py`'s `FakeSp` that records every verb. It checks:
   1. newest-first order with the `source_rank` tie-break, and the `FRESH_SIZE` cap;
   2. `consolidate.read_playlist` returns `duration_ms`, follows pagination, and skips a null `item`;
   3. two sources dedupe by URI on the newest `added_at`, and the row shape is identical across sources;
@@ -259,9 +271,9 @@ Phase 2 is the one build that fixes the shuffle case. When SJ plays in order it 
   6. a `" · Claude"` source is refused, and `--size 101` is refused;
   7. the snapshot GET of the target precedes its PUT;
   8. `hasattr(playlists.Spotify, "delete")` is `False`.
-- [ ] **Step 2: Run it and confirm it fails** (`ModuleNotFoundError: capture`).
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Verify offline.** The full suite passes.
+- [x] **Step 2: Run it and confirm it fails** (`ModuleNotFoundError: capture`).
+- [x] **Step 3: Implement.** Branch `capture`, 2026-09-27. Beyond the spec: `consolidate.read_playlist` also refuses a page that never answers (it used to return the pages before it as the whole playlist); the pre-replace snapshot is archived before the PUT, not after; a `--write` re-reads every source afterwards and prints whether its URIs and `added_at` are unchanged (Step 6's check); an empty selection never blanks the target.
+- [x] **Step 4: Verify offline.** The full suite passes (18 files).
 - [ ] **Step 5: Dry run against the real source.** `report()` must show:
   - each source's kind, name and row count;
   - the `added_at` range, and adds per month for the last 6 months;
@@ -272,7 +284,7 @@ Phase 2 is the one build that fixes the shuffle case. When SJ plays in order it 
   - `capture.py --source "Driving #2" --write` creates `Fresh · Claude`.
   - A second `--write` reuses the ID and adds the first `fresh_pre_replace_snapshot` rows.
   - The source's track count and `added_at` values are unchanged, which the report prints.
-- [ ] **Step 7: Docs, then commit and merge** (no PR without approval).
+- [ ] **Step 7: Docs, then commit and merge** (no PR without approval). Docs and commits done on `capture`; merge pending.
 
 **Invariants to add to CLAUDE.md:**
 - **Stage 11 never writes its source.** It refuses when its target ID or exact name could be a source, and a test asserts that.
@@ -356,13 +368,13 @@ The evaluation found garage discovery nearly empty (**RC3**): 14 of 20 seeds hav
 ## Open questions for SJ
 
 1. **From now on, keep adding to Driving #2, or heart?** *Recommend Driving #2 for now.* It needs no consent and Phase 2 reads it directly. The heart is the better long-term capture point but only once Step 0 has run, and Step 0 waits on consent you have deferred. `--source` is repeatable so the switch costs nothing later.
-2. **When you put the dump on, is it in order or shuffle, and would you reach for a 100-track newest-first playlist?** The data says both: about 60% shuffle in 2025 dump sessions, a quarter to 40% in 2026 (on few plays). *Recommend building Phase 2 at 100 tracks* (5.0 h, 57% of the dump's 2026 plays). 75 tracks (3.8 h, 47%) is the tighter alternative. If the answer is "I'd just use Sort → Recently added", Phase 2 is not worth building.
+2. **(Answered 2026-09-27: yes — build Phase 2.)** **When you put the dump on, is it in order or shuffle, and would you reach for a 100-track newest-first playlist?** The data says both: about 60% shuffle in 2025 dump sessions, a quarter to 40% in 2026 (on few plays). *Recommend building Phase 2 at 100 tracks* (5.0 h, 57% of the dump's 2026 plays). 75 tracks (3.8 h, 47%) is the tighter alternative. If the answer is "I'd just use Sort → Recently added", Phase 2 is not worth building.
 3. **Can `poll.py` run on launchd every 3 h while you're awake, and later refresh `Fresh · Claude` in the same job?** *Recommend yes to the poll now, and to the refresh after two clean manual runs.* Without a schedule, no gate in this plan can be judged.
 4. **Pin hot saves onto the runs?** *Recommend pinning `headrush` to the garage run now.* The four John Summit tracks are your call: D2 is decided in their favour, but pinning all four puts 9 of his tracks in one playlist.
-5. **When you're ready, consent to `user-library-read` (and `user-library-modify` if Step 0 goes ahead)?** Nothing in Phases 1–2 needs it. It unlocks `--source liked` and the backfill. The backfill will steer Spotify's mixes toward the whole dump; decide Q1 first.
+5. **(Answered 2026-09-27: consented; Step 0 ran.)** **When you're ready, consent to `user-library-read` (and `user-library-modify` if Step 0 goes ahead)?** Nothing in Phases 1–2 needs it. It unlocks `--source liked` and the backfill. The backfill will steer Spotify's mixes toward the whole dump; decide Q1 first.
 6. **Heart the 291 Driving #1 tracks you still played in 2026 (45.8 h)?** *Recommend no.* Driving #1 already is that archive, and hearting rap-era tracks may steer the mixes, which deliver most of your listening, back toward rap.
 7. **Should the pipeline ever reorder Driving #2 in place?** *Recommend no.* See "Not being built" for the only form it could take.
-8. **Only if Step 0 finds dates were not preserved:** remove and re-save the 475 hearts to restore dates? *Recommend yes, but done by you or by hand, outside the pipeline.* It removes items from your library, and the pipeline has no delete verb.
+8. **Only if Step 0 finds dates were not preserved:** remove and re-save the 475 hearts to restore dates? *Recommend yes, but done by you or by hand, outside the pipeline.* It removes items from your library, and the pipeline has no delete verb. **Update 2026-09-27: dates were not preserved, and this repair cannot work** — the save takes no timestamp, so a re-save stamps the day it runs again. The oldest-first order is the most the API allows.
 
 (Recent saves feeding Stage 10 discovery — the former Q5 — is now a question for the Stage 10 fixes plan.)
 
@@ -375,4 +387,4 @@ The evaluation found garage discovery nearly empty (**RC3**): 14 of 20 seeds hav
   - *Taste signal:* kept discovery-side-only Stage 10 use and its evidence against a known-side boost, the usage report, and the Stage 5 bug, which went to "found along the way". Dropped `adds.py`, `playlist_modes.csv`, the Stage 3/7/8 consumers and the Stage 5 blend. The credit third source was deferred to its own plan.
 - **Numbers re-derived for this plan** (synthesis, 2026-09-25): position buckets, newest-N shares, 2026 hours share, bulk stamps and inversions; shuffle rates and dump sessions; John Summit and `headrush` play counts; plays per day and Driving #1's 2026 hours; the `build_seeds` bug. Lane consistency, the Stage 10 supply estimate, the rediscover pool and the dubstep 3/0/2 split come from the planners' scratch work and weren't re-run.
 - **Fable review, 2026-09-26** (read-only, against `scratchpad/driving/*`, `data/*.parquet` and the code): every number above re-derived; all matched except as now stated in the text (monthly hours 7–12 not 8–12; dump-session counts and the 2026 shuffle share are heuristic-dependent; Electric workout 15 not 16; the credit-source count ~890 not 860; unresolved saved artists 23%). Step 0 corrected from "done" to pending. `merge_polled`'s named-column insert and the Task 1.3 DuckDB statements verified offline. The claim that `test_consolidate.py` guards `read_playlist` was false and is replaced by a test. Phase 3 handed to the Stage 10 fixes plan.
-- **Hand-made playlist check:** no step writes Driving #1 or #2. The only write to SJ's library is Step 0's additive backfill, which has not run and waits on his consent.
+- **Hand-made playlist check:** no step writes Driving #1 or #2. The only write to SJ's library is Step 0's additive backfill, run once on 2026-09-27, outside the repo.
