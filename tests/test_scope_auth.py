@@ -20,6 +20,14 @@ check("partial token misses the difference",
       {"playlist-modify-private"})
 check("order and duplicates are irrelevant",
       poll.missing_scopes({"scope": "b a"}, "a a b"), set())
+# Stage 11 adds user-library-read only when Liked Songs is a source. On a token
+# holding the poller's scope and a playlist one, it is the ONLY thing missing,
+# so the re-consent it triggers asks for nothing else.
+check("adding user-library-read misses only user-library-read",
+      poll.missing_scopes({"scope": "user-read-recently-played playlist-modify-private"},
+                          "user-read-recently-played playlist-modify-private "
+                          "user-library-read"),
+      {"user-library-read"})
 
 # --------------------------------------------------------------------------
 # Scopes must only ever WIDEN. Stage 8 and Stage 6 share one token, so any path
@@ -38,6 +46,17 @@ check("widening re-consents with the union",
       set(granted[0].split()),
       {"user-read-recently-played", "playlist-modify-private",
        "playlist-read-private"})
+
+# 1b. Widening for Liked Songs keeps the poller's and the playlist scopes
+granted.clear()
+poll.load_tokens = lambda: {
+    "refresh_token": "r",
+    "scope": "user-read-recently-played playlist-modify-private"}
+poll.access_token("cid", "playlist-read-private user-library-read")
+check("widening for Liked Songs re-consents with the union",
+      set(granted[0].split()),
+      {"user-read-recently-played", "playlist-modify-private",
+       "playlist-read-private", "user-library-read"})
 
 # 2. A failed refresh must not quietly drop back to the default scope
 granted.clear()

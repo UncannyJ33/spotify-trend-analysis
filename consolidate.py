@@ -341,16 +341,22 @@ def find_playlist(sp, name: str) -> dict:
 
 
 def read_playlist(sp, pid: str) -> list[dict]:
-    """Every track with its added_at and its full credit list.
+    """Every track with its added_at, duration and full credit list.
 
     Not playlists.playlist_items: that flattens the artists into one string for
     the archive snapshot, and the scoring here needs them as a list to weight
     features separately. `/items` and the `item` key, not `/tracks`/`track` —
     renamed in Spotify's February 2026 release.
+
+    `duration_ms` is for Stage 11, which reports the hours it renders and hands
+    the durations on to Stage 10 so no per-track /tracks request is spent on
+    them. Stage 9 ignores it. It has to be named in `fields`: the filter drops
+    anything it does not list, so leaving it out returns no duration at all
+    rather than an error.
     """
     out: list[dict] = []
     resp = sp.get(f"/playlists/{pid}/items"
-                  "?fields=items(added_at,item(uri,name,artists(name))),next"
+                  "?fields=items(added_at,item(uri,name,duration_ms,artists(name))),next"
                   "&limit=100", params=None)
     while isinstance(resp, dict) and "_status" not in resp:
         for it in resp.get("items", []):
@@ -362,12 +368,17 @@ def read_playlist(sp, pid: str) -> list[dict]:
                 "track_name": t.get("name") or "",
                 "artists": [a.get("name", "") for a in t.get("artists", [])],
                 "added_at": it.get("added_at") or "",
+                "duration_ms": t.get("duration_ms"),
             })
         nxt = resp.get("next")
         if not nxt:
             break
         resp = sp.get(nxt.removeprefix(SP_API), params=None)
-    if isinstance(resp, dict) and "_status" in resp:
+    # No response at all (Spotify.get returns None on a network error) is a
+    # failure too, not the end of the playlist. Treating it as the end handed
+    # back the first page alone, and Stage 11 would snapshot that as the whole
+    # source.
+    if not isinstance(resp, dict) or "_status" in resp:
         raise SystemExit(f"Playlist read failed part-way: {resp}")
     return out
 
