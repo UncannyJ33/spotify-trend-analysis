@@ -30,7 +30,7 @@ Net: capturing works. What's missing is a **bounded, newest-first way to play wh
 **Architecture:** Driving #2 is read-only to the pipeline, permanently.
 - **Stage 6** starts recording which playlist each play came from.
 - **Stage 11 (`capture.py`)** is a small new stage. It reads the capture source — an exact-named playlist, and later Liked Songs — into `data/capture.parquet`. With `--write` it refreshes one pipeline-owned playlist, `Fresh · Claude`, through Stage 8's lifecycle, unchanged.
-- **Liked Songs** may later become the archive and the capture point. Step 0's backfill ran on 2026-09-27, but the save endpoint takes no timestamp, so the backfilled hearts carry that day's date, not their history. Nothing in Phases 1–2 depends on it.
+- **Liked Songs** may later become the archive and the capture point. Step 0's backfill ran on 2026-09-27 and finished on 2026-09-28, but the save endpoint takes no timestamp, so the backfilled hearts carry those days' dates, not their history. Nothing in Phases 1–2 depends on it.
 - **Stage 10** later reads `capture.parquet` as an optional input, on the discovery side only — specified in the Stage 10 fixes plan, not here.
 
 **Tech Stack:** Python 3.12 in `.venv`, DuckDB over Parquet, the shared PKCE token via `consolidate.gentle_token`, and `playlists.Spotify`, which has no delete verb. No new dependencies.
@@ -60,7 +60,7 @@ Net: capturing works. What's missing is a **bounded, newest-first way to play wh
 
 | Step | Reads Driving #2 | Writes Driving #2 | Other writes |
 |---|---|---|---|
-| 0. Liked Songs backfill (**done 2026-09-27**) | yes | **no** | Liked Songs: additive saves, oldest-first (timestamps not honoured) — scratchpad script, SJ present |
+| 0. Liked Songs backfill (**done 2026-09-27/28**) | yes | **no** | Liked Songs: additive saves, oldest-first (timestamps not honoured) — scratchpad script, SJ present |
 | 1.1–1.2 habits | n/a | no | SJ's own hearts, if he chooses them |
 | 1.3 poller context | no | no | `data/polled_plays.parquet` |
 | 1.4 Stage 10 pins | no | no | `running_overrides.csv` (local) |
@@ -70,9 +70,9 @@ Net: capturing works. What's missing is a **bounded, newest-first way to play wh
 
 ---
 
-### Step 0 (DONE 2026-09-27): Liked Songs backfill — nothing else waits on it
+### Step 0 (DONE 2026-09-28): Liked Songs backfill — nothing else waits on it
 
-**Status 2026-09-27: 367 of 422 saved, dates not preserved; 55 pending.** SJ consented and the backfill ran. The save endpoint takes no timestamp, so the fallback below applied: oldest-first, one per request. After 367 saves Spotify answered `429 QUOTA_EXCEEDED` with `Retry-After` ≈ 24 h (the per-track `contains` check doubled the request count — see CLAUDE.md Gotchas); the remaining 55 resume when the lockout lifts, without per-track checks, and carry that later date. The final count awaits the read-back.
+**Status 2026-09-28: complete — 422 of 422 saved, dates not preserved; all 475 Driving #2 tracks are in Liked Songs.** SJ consented and the backfill ran. The save endpoint takes no timestamp, so the fallback below applied: oldest-first, one per request. After 367 saves on 2026-09-27 Spotify answered `429 QUOTA_EXCEEDED` with `Retry-After` ≈ 24 h (the per-track `contains` check doubled the request count — see CLAUDE.md Gotchas). The remaining 55 were saved on 2026-09-28 after the lockout lifted: one full read of Liked Songs first (it showed exactly those 55 missing), then one save per request about 1 s apart with no `contains` check, then a second full read that found all 475 present.
 
 *History:* on 2026-09-26 the consent prompt (`poll.authorize` waits 180 s for the redirect) timed out before SJ approved it, and nothing was written that day.
 
@@ -94,11 +94,11 @@ Net: capturing works. What's missing is a **bounded, newest-first way to play wh
 
 - [x] **Step 1: SJ consents.** Only after he says so. Run the probes above with the read scope first, then the one-track write probe.
 - [x] **Step 2: Backfill**, additive, backdated where honoured. (Not honoured: saved oldest-first instead.)
-- [ ] **Step 3: Read back and compare.** For each Driving #2 URI, check it is present and that the liked `added_at` equals the playlist `added_at` to the second. Record the token's `scope` field only, never the tokens. (Pending: the orchestrator verifies the 422 by counting Driving #2 URIs dated 2026-09-27 — not every stamp that day, which includes the re-stamped "My Home".)
+- [x] **Step 3: Read back and compare.** For each Driving #2 URI, check it is present and that the liked `added_at` equals the playlist `added_at` to the second. Record the token's `scope` field only, never the tokens. (Done 2026-09-28: 475 of 475 present. Counted by Driving #2 URIs per stamp date, not every stamp: 368 on 2026-09-27 are the 367 saves plus the re-stamped "My Home", 55 are on 2026-09-28, and 52 keep their pre-backfill dates. No `added_at` matches the playlist's.)
 - [x] **Step 4: Record the result**
 
 ```
-LIKED SONGS BACKFILL (Step 0) — verified 2026-09-27
+LIKED SONGS BACKFILL (Step 0) — verified 2026-09-27, completed and read back 2026-09-28
 
   read path / page size / nesting key : GET /me/tracks / 50 (51 -> 400 "Invalid limit") / 'track'
   contains                            : GET /me/library/contains?uris= -> 200 [bool]
@@ -106,20 +106,25 @@ LIKED SONGS BACKFILL (Step 0) — verified 2026-09-27
   save path / timestamps honoured     : PUT /me/library?uris= (max 40) -> 200, empty body
                                         (PUT /me/tracks -> 403, dead) / NOT honoured
   Liked Songs before                  : 2,745   range 2019-07-31 -> 2026-05-20
-  Driving #2 URIs present after       : 53 already liked + 367 saved 2026-09-27 + 55 pending (verify by read-back) / 475
-  added_at preserved (to the s)       : 0 — the 367 are stamped 2026-09-27; the 55 will carry their save date
+  Liked Songs after                   : 3,167   (3,112 after 2026-09-27's saves, + 55 on 2026-09-28)
+  Driving #2 URIs present after       : 475 / 475 = 53 already liked + 367 saved 2026-09-27 + 55 saved 2026-09-28
+  Driving #2 URIs per liked date      : 2026-09-27 x 368 (367 saves + "My Home"), 2026-09-28 x 55,
+                                        52 on 16 pre-backfill dates (2025-01-23 x 24 the largest)
+  added_at preserved (to the s)       : 0 — the 367 are stamped 2026-09-27 and the 55 are stamped 2026-09-28
   token scopes now                    : playlist-read-private playlist-read-collaborative
                                         user-library-read user-library-modify
                                         playlist-modify-private playlist-modify-public
                                         user-read-recently-played
-  decision                            : fallback — saved oldest-first in playlist added_at; stopped at 367 by QUOTA_EXCEEDED
+  decision                            : fallback — saved oldest-first in playlist added_at
                                         order, one per request, so "Recently added" order =
-                                        Driving #2 order; the dates are the backfill's, not history
+                                        Driving #2 order (0 inversions on read-back); the dates
+                                        are the backfill's, not history. 367 on 2026-09-27, then
+                                        QUOTA_EXCEEDED; the last 55 on 2026-09-28, no contains check
   side effect                         : the one-track no-op probe RE-STAMPED "My Home" to
                                         2026-09-27 — re-saving an already-liked track restamps it
 ```
 
-**`added_at` was not preserved** (the 367 saved so far are stamped 2026-09-27). Saving oldest-first kept "Recently added" in Driving #2's order, so playing Liked Songs newest-first still works; the dates themselves are the backfill's. 2026-09-27 also carries "My Home", which the no-op probe re-stamped, and any genuine heart from that day, so `capture.py --source liked` reports a largest same-day stamp of **at least 423** on 2026-09-27; that is not a wrong backfill count. The Step 3 read-back counts Driving #2 URIs stamped that day, not every stamp. In a union with `--source "Driving #2"` the newest-`added_at` rule gives every backfilled track that date over its real one, so anything liked before the backfill ranks below all 422 — except "My Home", now dated the same day. Render from the playlist source alone until genuine hearts fill the newest 100 (recorded in `CLAUDE.md` Gotchas). Re-saving **does** restamp an existing heart (the "My Home" probe), and the save takes no timestamp, so remove-and-re-save cannot restore history dates either (see Q8).
+**`added_at` was not preserved** (367 are stamped 2026-09-27 and 55 are stamped 2026-09-28). Saving oldest-first kept "Recently added" in Driving #2's order across both days, so playing Liked Songs newest-first still works; the dates themselves are the backfill's. 2026-09-27 also carries "My Home", which the no-op probe re-stamped. There was no genuine heart on either day, so `capture.py --source liked` reports a largest same-day stamp of **368** on 2026-09-27, with 55 on 2026-09-28. That is the backfill, not a wrong count. The Step 3 read-back counts Driving #2 URIs per stamp date, not every stamp. In a union with `--source "Driving #2"` the newest-`added_at` rule gives every backfilled track its save date over its real one. So anything liked before the backfill ranks below all 422, except "My Home", which is now dated 2026-09-27. Render from the playlist source alone until genuine hearts fill the newest 100 (recorded in `CLAUDE.md` Gotchas). Re-saving **does** restamp an existing heart (the "My Home" probe), and the save takes no timestamp, so remove-and-re-save cannot restore history dates either (see Q8).
 
 **Side effect SJ accepts by consenting:** Liked Songs feeds Spotify's generated mixes, and those mixes supplied 33 of the last 50 plays. 475 new hearts, most of them a year or more old, will steer the mixes toward the whole dump rather than its newest quarter. If the mixes drift, Step 0 is the first suspect. This is a reason to decide Q1 before Step 0, not after.
 
@@ -387,4 +392,4 @@ The evaluation found garage discovery nearly empty (**RC3**): 14 of 20 seeds hav
   - *Taste signal:* kept discovery-side-only Stage 10 use and its evidence against a known-side boost, the usage report, and the Stage 5 bug, which went to "found along the way". Dropped `adds.py`, `playlist_modes.csv`, the Stage 3/7/8 consumers and the Stage 5 blend. The credit third source was deferred to its own plan.
 - **Numbers re-derived for this plan** (synthesis, 2026-09-25): position buckets, newest-N shares, 2026 hours share, bulk stamps and inversions; shuffle rates and dump sessions; John Summit and `headrush` play counts; plays per day and Driving #1's 2026 hours; the `build_seeds` bug. Lane consistency, the Stage 10 supply estimate, the rediscover pool and the dubstep 3/0/2 split come from the planners' scratch work and weren't re-run.
 - **Fable review, 2026-09-26** (read-only, against `scratchpad/driving/*`, `data/*.parquet` and the code): every number above re-derived; all matched except as now stated in the text (monthly hours 7–12 not 8–12; dump-session counts and the 2026 shuffle share are heuristic-dependent; Electric workout 15 not 16; the credit-source count ~890 not 860; unresolved saved artists 23%). Step 0 corrected from "done" to pending. `merge_polled`'s named-column insert and the Task 1.3 DuckDB statements verified offline. The claim that `test_consolidate.py` guards `read_playlist` was false and is replaced by a test. Phase 3 handed to the Stage 10 fixes plan.
-- **Hand-made playlist check:** no step writes Driving #1 or #2. The only write to SJ's library is Step 0's additive backfill, run once on 2026-09-27, outside the repo.
+- **Hand-made playlist check:** no step writes Driving #1 or #2. The only write to SJ's library is Step 0's additive backfill, run on 2026-09-27 and finished on 2026-09-28, outside the repo.

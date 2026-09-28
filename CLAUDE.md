@@ -454,15 +454,16 @@ config are tracked. Before changing anything here, understand why it is the way 
   user-library-modify playlist-modify-private playlist-modify-public user-read-recently-played`;
   `user-library-modify` is Step 0's and no stage requests it.
 - **Liked Songs' dates are not save history for the backfilled tracks.** Step 0's one-off backfill
-  (a scratchpad script outside the repo; plan `2026-09-25-driving-dump-playlist.md`) saves the 422
+  (a scratchpad script outside the repo; plan `2026-09-25-driving-dump-playlist.md`) saved the 422
   Driving #2 tracks that were not already liked, oldest-first, one per request, so "Recently added"
-  order is Driving #2's order. 367 were saved on 2026-09-27 before the quota lockout below; the other
-  55 wait for it to lift, so they carry the later date. None of them carries its playlist date, and
-  neither does "My Home", which the no-op probe re-stamped on 2026-09-27. So `capture.py --source
-  liked` reports a large same-day stamp, and that is the backfill, not a wrong count: to verify it,
-  count the Driving #2 URIs per stamp date, not every stamp. A union with the playlist source keeps
-  the NEWEST `added_at` per URI — so each backfilled track takes its save date over its real playlist
-  date, while a track liked before the backfill keeps an older date and ranks below all of them (bar
+  order is Driving #2's order. 367 were saved on 2026-09-27 before the quota lockout below, and the
+  other 55 on 2026-09-28 after it lifted. The read-back found all 475 Driving #2 tracks liked (Liked
+  Songs 3,167). None of the 422 carries its playlist date, and neither does "My Home", which the
+  no-op probe re-stamped on 2026-09-27. So `capture.py --source liked` reports large same-day stamps
+  (368 on 2026-09-27, 55 on 2026-09-28), and that is the backfill, not a wrong count: to verify it,
+  count the Driving #2 URIs per stamp date, not every stamp. The other 52 keep their older dates.
+  A union with the playlist source keeps the NEWEST `added_at` per URI — so each backfilled track
+  takes its save date over its real playlist date, while a track liked before the backfill keeps an older date and ranks below all of them (bar
   "My Home"), however recently it joined the playlist. Until genuine hearts fill the newest 100,
   render from the playlist source alone.
 - **The developer app has a daily request quota, and exhausting it locks every Spotify stage out for
