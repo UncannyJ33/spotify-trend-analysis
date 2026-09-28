@@ -130,9 +130,10 @@ PLAYLIST_OVERRIDES_CSV = _path_from_env(
 )
 
 # An anchor artist must carry the genre with at least this much community
-# support. MusicBrainz tag counts go negative on downvotes and Stage 2 clamps
-# them at 0, so a 0 means "nobody stands behind this tag" — REAPER carries
-# `heavy metal` at 0 and anchored a metal playlist on the strength of it.
+# support. MusicBrainz tag counts go negative on downvotes and artist_tags keeps
+# them (Stage 3 clamps its own copy), so 0 or below means "nobody stands behind
+# this tag" — REAPER carries `heavy metal` at 0 and anchored a metal playlist on
+# the strength of it.
 # Discovery candidates face the same floor: a stranger must clear at least what
 # a library anchor clears (playlists.serving_sql holds both).
 MIN_TAG_COUNT_FOR_ANCHOR = 1
@@ -157,9 +158,16 @@ MIN_TAG_COUNT_FOR_ANCHOR = 1
 #
 # The same bar applies to Stage 8's discovery candidates. It costs the
 # garage and heavy metal playlists most of their stranger pool (18 candidates
-# to 5, 28 to 5) — which is the point: the 13 and 23 it drops include
-# Röyksopp, Pendulum, Papa Roach and Deftones, none of them the genre on the
-# label. A short playlist beats a wrong one, as `assemble` already says.
+# to 5, 28 to 5). Most of what it drops is off-label — Röyksopp, Pendulum,
+# Papa Roach, Deftones — but not all: Megadeth (heavy metal 18 of 77, 0.23,
+# outvoted by thrash metal), Pantera (0.21, by groove metal) and Rainbow (0.19)
+# go too, the same sibling split Metallica survives at 0.26. The answer to
+# that is a wider spec (heavy metal|thrash metal|speed metal|groove metal
+# brings Megadeth, Pantera and Slayer back), not a lower bar. Nor can the bar
+# repair a spec that lists an adjacent tag: with electro house in the garage
+# spec, four of its five strangers (Boys Noize among them) and The Chainsmokers'
+# anchors qualify on electro or tech house alone. A short playlist beats a
+# wrong one, as `assemble` already says.
 ANCHOR_MIN_TAG_SHARE = 0.25
 
 # The title marker is for the user's eyes in their own library: anything

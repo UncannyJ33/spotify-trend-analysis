@@ -508,8 +508,8 @@ export, so no lookup is needed. Three rules decide which:
 - **Serving a genre is a share, not a tag.** The playlist's tags must hold at
   least `ANCHOR_MIN_TAG_SHARE` (a quarter) of the artist's whole MusicBrainz
   genre weight, and one of them must reach `MIN_TAG_COUNT_FOR_ANCHOR` — counts
-  go negative on downvotes and Stage 2 clamps them to zero, so a zero means
-  nobody stands behind that tag. The share exists because "carries any of the
+  go negative on downvotes, so zero or below means nobody stands behind that
+  tag, and negative counts are clamped to zero before the share is taken. The share exists because "carries any of the
   tags" let Halsey (indie pop 3 of 32 votes) and Ellie Goulding (5 of 31) — pop
   by any ear, and heavily played — take four of six indie anchors. A quarter is
   read off the author's library: it keeps Metallica, whose heavy metal (42) is
@@ -529,9 +529,15 @@ export, so no lookup is needed. Three rules decide which:
 The rest are strangers, drawn from Stage 5's candidates, and a stranger must
 clear the same share and floor as an anchor — never less. That cost the
 author's garage and heavy metal playlists most of their stranger pool (18
-candidates down to 5, and 28 down to 5), because what it removed was Röyksopp,
-Pendulum, Papa Roach and Deftones: a playlist that runs short is better than
-one that is wrong. The anchors are spread at even intervals rather than stacked
+candidates down to 5, and 28 down to 5). Most of what it removed was off the
+label — Röyksopp, Pendulum, Papa Roach, Deftones — but not all of it: Megadeth,
+Pantera and Rainbow went too, because MusicBrainz files them first as thrash,
+groove metal and hard rock, the same split Metallica survives by a hair. The
+remedy is a wider spec (`heavy metal|thrash metal|speed metal|groove metal`),
+not a lower bar. The bar also judges against the spec as written: list an
+adjacent tag and it admits that genre faithfully — with `electro house` in a
+garage spec, Boys Noize and three other electro acts qualify as strangers. A
+playlist that runs short is better than one that is wrong. The anchors are spread at even intervals rather than stacked
 at the front: six songs you know followed by nineteen you don't reads as two
 playlists stapled together.
 

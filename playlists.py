@@ -125,8 +125,12 @@ def serving_sql(tags_rel: str, key: str, n_tags: int) -> str:
     when the spec's tags hold at least ANCHOR_MIN_TAG_SHARE of their whole
     genre weight — Halsey's is 0.09, Ellie Goulding's 0.16 — AND one of those
     tags clears MIN_TAG_COUNT_FOR_ANCHOR, the floor that says somebody stands
-    behind it. Counts are clamped at 0 once more, as Stage 2 and the candidate
-    cache already do, so no negative count can shrink the denominator.
+    behind it. The greatest(tag_count, 0) clamps are load-bearing, not a
+    repeat: artist_tags keeps MusicBrainz's negative counts (163 genre rows,
+    down to -6; only Stage 3 and the candidate cache clamp their own copies).
+    Unclamped, a downvote elsewhere shrinks the denominator — spec 1 beside
+    5 and -2 reads 0.25 instead of 0.17 — and a downvoted spec tag cancels a
+    real one. Do not delete them as redundant.
 
     ONE definition for both sides — library anchors over artist_tags and
     strangers over the candidate tag cache — so a stranger can never clear

@@ -50,7 +50,10 @@ CREATE TABLE plays AS SELECT * FROM (VALUES
   -- the polled pressing: Spotify's artists array makes Bass Guy a feature
   ('Dream Band', 'Black Out Days - Bass Guy Remix', 'uri:bod',  2800.0),
   -- a remixer nobody has tagged: the album artist is indie, the record is not
-  ('Folk Act',   'Sweet Song - Nobody Known Remix', 'uri:nk',   2900.0)
+  ('Folk Act',   'Sweet Song - Nobody Known Remix', 'uri:nk',   2900.0),
+  -- artist_tags keeps MusicBrainz's negative counts (163 genre rows, to -6)
+  ('Downvoted Elsewhere', 'Minus Two',          'uri:dvx',   2700.0),
+  ('Downvoted Spec',      'Cancelled Out',      'uri:dvs',   2600.0)
 ) t(artist_name, track_name, spotify_track_uri, played_seconds)""")
 con.execute("ALTER TABLE plays ADD COLUMN month DATE DEFAULT DATE '2026-06-01'")
 con.execute("ALTER TABLE plays ADD COLUMN ms_played_estimated BOOLEAN DEFAULT FALSE")
@@ -80,7 +83,15 @@ CREATE TABLE artist_tags AS SELECT * FROM (VALUES
   ('Metal Band', 'heavy metal', 42), ('Metal Band', 'thrash metal', 67),
   ('Metal Band', 'speed metal', 30), ('Metal Band', 'hard rock', 25),
   ('Dream Band', 'indie pop', 5), ('Dream Band', 'dream pop', 3),
-  ('Bass Guy', 'dubstep', 5), ('Bass Guy', 'riddim', 2)
+  ('Bass Guy', 'dubstep', 5), ('Bass Guy', 'riddim', 2),
+  -- indie pop 1 beside 5 and -2: clamped 1 of 6 = 0.17 (refused); unclamped
+  -- the -2 shrinks the denominator to 4 and reads exactly 0.25 (admitted)
+  ('Downvoted Elsewhere', 'indie pop', 1), ('Downvoted Elsewhere', 'pop', 5),
+  ('Downvoted Elsewhere', 'electropop', -2),
+  -- indie pop 2 and indie folk -3 beside pop 4: clamped 2 of 6 = 0.33
+  -- (admitted); unclamped the downvoted spec tag cancels the real one, -1 of 3
+  ('Downvoted Spec', 'indie pop', 2), ('Downvoted Spec', 'indie folk', -3),
+  ('Downvoted Spec', 'pop', 4)
 ) t(artist_name, tag, tag_count)""")
 con.execute("ALTER TABLE artist_tags ADD COLUMN is_genre BOOLEAN DEFAULT TRUE")
 # Stage 8 reads the title, never credit_type — but the table is here so a
@@ -108,6 +119,10 @@ check("Ellie-shaped artist (indie 0.16) no longer anchors indie",
 check("a genuinely indie artist still does", "uri:half" in uris(indie), True)
 check("Metallica-shaped (heavy metal 0.26) still anchors heavy metal",
       "uri:sandman" in uris(metal), True)
+check("a negative count off the spec does not shrink the denominator "
+      "(1 of 6 = 0.17, not 1 of 4 = 0.25)", "uri:dvx" in uris(indie), False)
+check("a downvoted spec tag counts 0, not against the real one "
+      "(2 of 6 = 0.33, not -1 of 3)", "uri:dvs" in uris(indie), True)
 
 # --- the judge -----------------------------------------------------------
 check("a garage remix of a pop artist anchors garage...",
