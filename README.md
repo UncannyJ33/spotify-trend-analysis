@@ -563,6 +563,20 @@ One song gets one slot. Spotify presses the album cut, the single and the
 remaster as three distinct URIs, so dedupe is on the folded title — otherwise an
 artist's two slots both go to "Last Resort".
 
+**A stranger's track has to be their own record.** Spotify's search for an
+artist returns everything they are credited on, features included, and this
+stage used to offer all of it under the candidate's name — RUNN's results
+carried "Free Fall", an ILLENIUM record RUNN sings on, and it put ILLENIUM in
+the indie playlist. A track is now offered only when the candidate leads it
+(Spotify's first credit is the candidate's own artist id, so a namesake like
+DEM2 never stands in for Dem 2) or the title names them as remixer, since
+Spotify bills a remix to the original artist. Live recordings, and remixes
+someone else made of the candidate's songs, are refused too. Search results are
+cached with every credit in `.cache/spotify_artist_tracks_credited.jsonl`,
+which Stage 10 shares; the older `spotify_artist_tracks.jsonl` held no credits
+and is no longer read, so an artist only it had answered costs one fresh search
+on the next run.
+
 **The playlist is a rendering, not the record.** Every run archives its
 selections to `data/playlists.parquet`, along with a snapshot of whatever it is
 about to overwrite, so Spotify never holds the only copy of anything. Identity
@@ -820,9 +834,10 @@ genuinely cannot catch the failures that matter: a filter that drops the right
 are the few pipeline invariants a report cannot see, such as time lost evenly,
 which moves no share.
 
-`tests/` pins that logic instead, in 19 files — Stage 8's selection,
+`tests/` pins that logic instead, in 20 files — Stage 8's selection,
 within-artist track choice and anchor judge (Halsey and Ellie Goulding must not
-anchor indie, and a remix is judged on its remixer), Stage 9's scoring (above all Daft Punk and Kendrick
+anchor indie, and a remix is judged on its remixer) and its discovery rule (a
+record RUNN only features on is not RUNN's to offer), Stage 9's scoring (above all Daft Punk and Kendrick
 Lamar, the two real artists that break the naive genre rules), Stage 10's
 intensity classification (ILLENIUM, who an include-list admits and a share test
 refuses), its remixer parsing (`Radio Edit` must never become an artist called

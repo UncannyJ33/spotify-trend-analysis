@@ -31,6 +31,7 @@ os.environ["SPOTIFY_RUNNING_OVERRIDES"] = str(_TMP / "running_overrides.csv")
 
 import duckdb
 import config
+import playlists
 import running
 
 failures = []
@@ -490,9 +491,17 @@ def cache_lines():
     return p.read_text(encoding="utf-8").splitlines() if p.exists() else []
 
 
-check("the credited cache is a new file, not Stage 8's",
+# The search moved to playlists.py so Stage 8 reads the same credits; running
+# imports it back, and these checks go through running's names on purpose.
+check("the credited cache is its own file, not the retired one",
       running.SP_TRACKS_CREDITED_CACHE.name,
       "spotify_artist_tracks_credited.jsonl")
+check("...and one definition, shared with Stage 8",
+      (running.sp_artist_tracks_credited, running.pin_artist_id,
+       running.SP_TRACKS_CREDITED_CACHE),
+      (playlists.sp_artist_tracks_credited,
+       playlists.pin_artist_id,
+       playlists.SP_TRACKS_CREDITED_CACHE))
 cc = {}
 check("a 429 returns nothing",
       running.sp_artist_tracks_credited(
@@ -522,7 +531,7 @@ sp = FakeSp({"tracks": {"items": [
 live = running.sp_artist_tracks_credited(sp, "Dem 2", cc)
 check("search is scoped to the artist, one page of SP_SEARCH_LIMIT",
       (sp.calls[0][0], sp.calls[0][1]["q"], sp.calls[0][1]["limit"]),
-      ("/search", 'artist:"Dem 2"', running.SP_SEARCH_LIMIT))
+      ("/search", 'artist:"Dem 2"', playlists.SP_SEARCH_LIMIT))
 check("wrong-artist and URI-less hits dropped, relevance order kept",
       uris(live), ["spotify:track:d4", "spotify:track:d1"])
 check("every credit kept as {name, id}, in Spotify's order",

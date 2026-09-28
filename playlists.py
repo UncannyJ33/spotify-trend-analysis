@@ -6,9 +6,10 @@
 One playlist per under-explored rising genre (Stage 7's gap analysis), capped
 at N_PLAYLISTS. Each mixes ANCHOR_TRACKS familiar tracks — the listener's own
 recent plays that serve that genre, judged on the remixer where the title
-names one — with discovery tracks from Stage 5's candidate artists. Anchors and
-strangers clear the same bar: the genre's share of the artist's whole tag
-weight (serving_sql), not the mere presence of a tag.
+names one — with discovery tracks from Stage 5's candidate artists: records a
+candidate leads or remixed, never one they only feature on (candidate_led).
+Anchors and strangers clear the same bar: the genre's share of the artist's
+whole tag weight (serving_sql), not the mere presence of a tag.
 
 Two sources split the judgment. Spotify's search relevance ORDERS an artist's
 tracks — with ListenBrainz's popularity dataset disabled it is the only
@@ -35,6 +36,7 @@ import csv
 import json
 import re
 import time
+import unicodedata
 from datetime import date
 
 import duckdb
@@ -63,7 +65,16 @@ MB_RECORDING_URL = "https://musicbrainz.org/ws/2/recording"
 MB_RECORDING_LIMIT = 100    # one page is plenty; this is a filter, not a ranking
 
 GENRE_RECORDINGS_CACHE = config.CACHE_DIR / "genre_recordings.jsonl"
-ARTIST_TRACKS_CACHE = config.CACHE_DIR / "spotify_artist_tracks.jsonl"
+
+# Discovery searches with WHO IS ON each track, shared by Stages 8 and 10: every
+# hit keeps Spotify's own credit list ({name, id}, in Spotify's order) and the
+# duration search carries for free. Stage 8's first cache,
+# spotify_artist_tracks.jsonl, kept a name and a URI per hit and every hit was
+# labelled as the candidate — so Tion Wayne's rap single went out as MJ Cole
+# garage, and ILLENIUM's "Free Fall" as RUNN's indie. That file is retired, not
+# migrated: nothing reads or writes it any more, and an append-only cache is
+# never rebuilt. An artist only it answered costs one search here, once.
+SP_TRACKS_CREDITED_CACHE = config.CACHE_DIR / "spotify_artist_tracks_credited.jsonl"
 
 # Spotify renamed the playlist endpoints on 2026-02-11 and the old paths now
 # answer 403 "Forbidden" — not 404, which is why this reads as a permissions
@@ -499,6 +510,46 @@ def is_live(track_name: str) -> bool:
     return bool(re.search(config.RUN_LIVE_TITLE_RE, track_name or ""))
 
 
+def candidate_led(tracks: list[dict], artist: str,
+                  pinned_id: str | None) -> list[dict]:
+    """Only the candidate's own records: led by their pinned Spotify id, or a
+    remix whose title names them.
+
+    A search for an artist returns every record they are credited on, and a
+    FEATURE IS NOT THEIR RECORD. RUNN's results carried "Free Fall" — an
+    ILLENIUM record featuring RUNN, which Spotify credits ILLENIUM then RUNN —
+    and it went out in the indie frontier as RUNN's work, putting ILLENIUM in
+    the playlist through a featured singer. Discovery offers a track on the
+    strength of the candidate's genre, so the candidate must have made it: their
+    pinned id (pin_artist_id, so a namesake never leads for them) is the FIRST
+    credit, or credits.remix_credit names them. The second clause is what keeps
+    their remixes — Spotify bills a remix to the original artist first, and
+    "Song - RUNN Remix" is RUNN's record however it is billed. A title's
+    "feat." is not read: Spotify's lead is the credit, and it already lists the
+    featured act second.
+
+    Relevance order is kept. Runs BEFORE discovery_eligible, which then drops
+    live recordings and remixes a candidate leads but someone else made
+    ("Alive - Trivecta Remix"). Stage 10 draws its own line in
+    gate_discovery — it tests the lead only for drag, and asks for the
+    candidate's own record only for a genre match — so do not unify the two.
+    """
+    if not pinned_id:
+        return []
+    me = normalise(artist or "")
+    out = []
+    for t in tracks:
+        ids = [a.get("id") for a in t.get("artists") or []]
+        rc = remix_credit(t.get("track_name") or "")
+        # The remixer clause still wants the pinned id ON the record: the
+        # title's name folds like a namesake's ("Big Tune - DEM2 Remix" is not
+        # Dem 2's), and only the id tells them apart.
+        if (ids[:1] == [pinned_id]
+                or (rc is not None and normalise(rc) == me and pinned_id in ids)):
+            out.append(t)
+    return out
+
+
 def discovery_eligible(tracks: list[dict], artist: str) -> list[dict]:
     """A candidate's search results minus what is not really theirs to offer.
 
@@ -619,47 +670,98 @@ def _artist_match(item: dict, artist: str) -> bool:
     Searching `artist:"Virtual Riot"` is a relevance query, not a filter:
     karaoke acts, tribute covers and "in the style of" uploads all come back.
     Folding is enrich.normalise, the same one Stage 2 resolves names with, so
-    'A$AP Rocky' and 'ASAP Rocky' are one artist. A featured credit counts —
-    the artist is genuinely on the track.
+    'A$AP Rocky' and 'ASAP Rocky' are one artist. A featured credit counts
+    HERE — the artist is genuinely on the track, and the cache records the
+    fact. Whether a feature may be OFFERED is each stage's call: Stage 8's
+    candidate_led refuses it, Stage 10's gate_discovery has its own rule.
     """
     want = normalise(artist)
     return want in {normalise(a.get("name", "")) for a in item.get("artists", [])}
 
 
-def sp_artist_tracks(sp, artist: str, cache: dict) -> list[dict]:
-    """This artist's tracks in Spotify's relevance order, validated.
+def sp_artist_tracks_credited(sp, artist: str, cache: dict) -> list[dict]:
+    """This artist's tracks in Spotify's relevance order, with who is on each.
 
-    Relevance order is the whole point: with ListenBrainz popularity down it is
-    the only popularity signal left, so the list comes back in exactly the
-    order Spotify gave it and nothing here re-sorts it. `artist_name` is set to
-    the name we asked for rather than the credit string on the result, so the
+    One /search, one page of SP_SEARCH_LIMIT, hits kept only where the artist
+    is really credited (_artist_match). Relevance order is the whole point:
+    with ListenBrainz popularity down it is the only popularity signal left,
+    so nothing here re-sorts it. Each hit keeps every credited artist as
+    {name, id}, in Spotify's order — the lead is artists[0], which is how
+    Stage 8's candidate_led tells a candidate's record from a feature — and
+    `duration_ms`, which search returns for free, so Stage 10's length cap and
+    time budget cost no /tracks request unless a hit arrives without one.
+    `artist_name` is the name asked for, not the credit string, so the
     per-artist cap downstream stays keyed on one spelling.
 
-    An empty answer caches like any other: an artist Spotify does not carry is
-    asked once, not once per run. A FAILED request is not an answer — a 429,
-    an error envelope or no response at all used to be written as "no tracks",
-    and an append-only cache never asked again. Records now carry the status;
-    an empty one from before that may have been a failure, so it is asked once
-    more and the new record wins.
+    Only an ANSWER is cached. A 200 with no usable hit is a fact ("Spotify does
+    not carry them") and is asked once. A 429, an error envelope or no response
+    at all is a missing answer, and caching it would freeze a transient failure
+    into "this artist has no tracks" for good.
+
+    Keyed on normalise(artist), so 'DEM2' and 'Dem 2' share a key. The record
+    holds every credited id, and pin_artist_id separates the two on read; a
+    namesake is a read-time filter, not a cache repair. Stages 8 and 10 share
+    the file, so an artist either stage has searched costs the other nothing.
     """
     key = normalise(artist)
-    hit = cache.get(key)
-    if hit and ("status" in hit or hit["tracks"]):
-        return [dict(t, artist_name=artist) for t in hit["tracks"]]
+    if key in cache:
+        return [dict(t, artist_name=artist) for t in cache[key]["tracks"]]
     resp = sp.get("/search", params={
         "q": f'artist:"{artist.replace(chr(34), "")}"',
         "type": "track", "limit": SP_SEARCH_LIMIT,
     })
     if not isinstance(resp, dict) or "_status" in resp:
         return []
-    items = (resp.get("tracks") or {}).get("items", [])
-    tracks = [{"track_name": it.get("name"), "spotify_track_uri": it.get("uri")}
-              for it in items
-              if it.get("uri") and _artist_match(it, artist)]
+    tracks = [
+        {"track_name": it.get("name"), "spotify_track_uri": it.get("uri"),
+         "duration_ms": it.get("duration_ms"),
+         # A LIST of credits, never a joined string: every printable separator
+         # eventually collides with a real name ("Tyler, The Creator").
+         "artists": [{"name": a.get("name"), "id": a.get("id")}
+                     for a in it.get("artists", [])]}
+        for it in (resp.get("tracks") or {}).get("items", [])
+        if it.get("uri") and _artist_match(it, artist)
+    ]
     rec = {"key": key, "artist": artist, "status": 200, "tracks": tracks}
-    append_jsonl(ARTIST_TRACKS_CACHE, rec)
+    append_jsonl(SP_TRACKS_CREDITED_CACHE, rec)
     cache[key] = rec
     return [dict(t, artist_name=artist) for t in tracks]
+
+
+def pin_artist_id(tracks: list[dict],
+                  artist: str) -> tuple[str | None, list[dict]]:
+    """The candidate's own Spotify artist id, and only the tracks crediting it.
+
+    normalise() is a comparison key, not an identity. 'DEM2' and 'Dem 2' both
+    fold to `dem2`, and the Dem 2 search duly returned DEM2's "Discoteca" — a
+    different act — which went out as Dem 2 discovery.
+
+    Among the ids whose name folds to the candidate, the one whose Spotify name
+    IS the candidate's (after NFKD, case and all) wins; failing that, the id on
+    the most tracks; failing that, whichever relevance put first. Exact name
+    first is what makes it deterministic: "most tracks" alone would hand a
+    search for one act to its namesake whenever the namesake had the bigger page.
+    """
+    want_key = normalise(artist)
+    want_exact = unicodedata.normalize("NFKD", artist)
+    exact: dict[str, bool] = {}
+    on_tracks: dict[str, set[int]] = {}
+    first_seen: dict[str, int] = {}
+    for i, t in enumerate(tracks):
+        for a in t.get("artists") or []:
+            aid, name = a.get("id"), a.get("name") or ""
+            if not aid or normalise(name) != want_key:
+                continue
+            first_seen.setdefault(aid, i)
+            on_tracks.setdefault(aid, set()).add(i)
+            exact[aid] = (exact.get(aid, False)
+                          or unicodedata.normalize("NFKD", name) == want_exact)
+    if not first_seen:
+        return None, []
+    pinned = min(first_seen, key=lambda aid: (
+        not exact[aid], -len(on_tracks[aid]), first_seen[aid]))
+    return pinned, [t for t in tracks
+                    if any(a.get("id") == pinned for a in t.get("artists") or [])]
 
 
 # --------------------------------------------------------------------------
@@ -814,13 +916,20 @@ def build_selections(con, http, sp) -> list[dict]:
     modes so --dry-run previews exactly what a live run would do.
 
     Per candidate artist this spends one Spotify search (relevance order, the
-    surviving popularity signal) and one MusicBrainz search (which of their
-    recordings carry the gap genre). Both are cached append-only, so a re-run
-    inside the same quarter spends nothing.
+    surviving popularity signal, and who is credited on each hit) and, only if
+    one of the candidate's own records survives, one MusicBrainz search (which
+    of their recordings carry the gap genre). Both are cached append-only, and
+    the Spotify cache is shared with Stage 10, so a re-run inside the same
+    quarter spends nothing.
+
+    Per candidate: pin their Spotify id (a namesake is not them), keep what
+    they lead or remixed (candidate_led — a feature is not their record), drop
+    live recordings and other people's remixes (discovery_eligible), then
+    choose_tracks. Every filter keeps relevance order.
     """
     tag_cache = load_jsonl(config.CACHE_DIR / "candidate_tags.jsonl", "mbid")
     genre_rec_cache = load_jsonl(GENRE_RECORDINGS_CACHE, "key")
-    artist_tracks_cache = load_jsonl(ARTIST_TRACKS_CACHE, "key")
+    credited_cache = load_jsonl(SP_TRACKS_CREDITED_CACHE, "key")
 
     out = []
     specs = load_playlist_specs(con)
@@ -839,11 +948,14 @@ def build_selections(con, http, sp) -> list[dict]:
         for cand in candidates:
             if len(discovery) >= config.PLAYLIST_SIZE:   # enough material
                 break
-            tracks = sp_artist_tracks(sp, cand["artist_name"], artist_tracks_cache)
+            name = cand["artist_name"]
+            pinned_id, tracks = pin_artist_id(
+                sp_artist_tracks_credited(sp, name, credited_cache), name)
+            tracks = discovery_eligible(candidate_led(tracks, name, pinned_id),
+                                        name)
             if not tracks:
                 continue
             on_genre = mb_genre_recordings(http, cand["mbid"], tags, genre_rec_cache)
-            tracks = discovery_eligible(tracks, cand["artist_name"])
             for chosen in choose_tracks(tracks, on_genre, config.TRACKS_PER_ARTIST):
                 if chosen["spotify_track_uri"] in seen_uris:
                     continue

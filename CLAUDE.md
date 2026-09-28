@@ -67,7 +67,9 @@ fail silently — no listening time created or lost, no double-counted performer
 `report()`. Stages import each other only to reuse, never to copy: `recommend` ← `enrich`;
 `forecast` ← `analyze`; `playlists` ← `credits` (`remix_credit`), `enrich`, `recommend`, `report`,
 `poll`; `consolidate` ← `enrich`, `playlists`, `poll`; `running` ← `consolidate`, `credits` (the
-remix regex and `remix_credit`), `enrich`, `playlists`, `recommend`, `report`; `capture` ←
+remix regex and `remix_credit`), `enrich`, `playlists` (among others the credited Spotify search
+`sp_artist_tracks_credited`, its `SP_TRACKS_CREDITED_CACHE` and `pin_artist_id`, which live in
+`playlists` because Stage 8 filters on the same credits), `recommend`, `report`; `capture` ←
 `consolidate` (`read_playlist`, whose `duration_ms` key Stage 11 depends on), `playlists`, `poll`;
 `app` ← `recommend` (the λ dial). A second copy is how two definitions of one idea drift apart —
 `playlists.register_song_key` registers `playlists._title_key` itself as a DuckDB function rather
@@ -288,6 +290,20 @@ correct.
   (judge, `song_key`) forward and the first playlist in build order keeps the song; "cowboy killers"
   otherwise anchors indie AND indie rock. The judge is in the cross-playlist key so a remix anchoring
   garage does not keep its original out of indie — the line Stage 10's `Placements` draws.
+- **A Stage 8 discovery track must be the candidate's own record: they LEAD it or remixed it.**
+  `playlists.candidate_led` keeps a search hit only when the candidate's pinned Spotify id
+  (`pin_artist_id`, so DEM2 never stands in for Dem 2) is the FIRST credit, or the title names them
+  as remixer (`credits.remix_credit`) with that id on the record — Spotify bills a remix to the
+  original artist, so the second clause is what keeps their remixes. A feature is not their record:
+  RUNN's search returned "Free Fall", an ILLENIUM record featuring RUNN (credits ILLENIUM, RUNN), and
+  it put ILLENIUM in the indie frontier under RUNN's name. `discovery_eligible` then drops live
+  recordings and remixes a candidate leads but someone else made ("Alive - Trivecta Remix"). The
+  lead can only be read from Spotify's credit list, which is why Stage 8 now searches through
+  `sp_artist_tracks_credited` — **one search and one cache (`spotify_artist_tracks_credited.jsonl`)
+  shared by Stages 8 and 10**, defined in `playlists.py`. Stage 8's first cache,
+  `spotify_artist_tracks.jsonl`, kept only name and URI; it is retired, not migrated — nothing reads
+  or writes it, and it must not be rebuilt. Stage 10's `gate_discovery` draws its own line (a drag
+  lead refused, the candidate's own record required only for a genre match); do not unify the two.
 - **A playlist spec's `tags` is a list, and every consumer must treat it as one.** `serving_sql` sums
   the spec's tags per artist, so an artist carrying three of them stays one artist rather than three
   copies of its listening time; `mb_genre_recordings` sends one Lucene `OR` rather than one request per
@@ -321,13 +337,13 @@ correct.
 - **Stage 10 judges discovery per TRACK, on Spotify's own credits.** An artist clearing the bar says
   nothing about a given record: MJ Cole's relevance page led with Tion Wayne's rap single, and every
   hit used to be relabelled as the candidate. `gate_discovery` reads each pick against the credited
-  cache (`spotify_artist_tracks_credited.jsonl`, pinned to the candidate's own Spotify id, since
-  `DEM2` and `Dem 2` fold alike) and refuses live tracks, anything over `RUN_MAX_DISCOVERY_MS`
-  (4.5 min; known tracks exempt), a vetoed credit, anything already started (`plays_raw`, so a
-  20-second skip counts), and a drag LEAD or drag remixer. The drag test must stay on the lead and
-  the named remixer only: a featured vocalist can carry drag by hand (Inéz, `melodic dubstep`), and
-  library-artist supply passes through this gate — an unplayed Subtronics track must not be refused
-  for its singer.
+  cache (`spotify_artist_tracks_credited.jsonl`, shared with Stage 8, pinned to the candidate's own
+  Spotify id, since `DEM2` and `Dem 2` fold alike) and refuses live tracks, anything over
+  `RUN_MAX_DISCOVERY_MS` (4.5 min; known tracks exempt), a vetoed credit, anything already started
+  (`plays_raw`, so a 20-second skip counts), and a drag LEAD or drag remixer. The drag test must
+  stay on the lead and the named remixer only: a featured vocalist can carry drag by hand (Inéz,
+  `melodic dubstep`), and library-artist supply passes through this gate — an unplayed Subtronics
+  track must not be refused for its singer.
 - **A merely adjacent tag poisons discovery far beyond the tracks it admits.** `electro house` was
   in `RUN_GARAGE_TAGS` and let in 43 artists (MSTRKRFT, Benny Benassi, Justice, Digitalism). Because
   Stage 10 seeds ListenBrainz on the cluster's *own top artists*, seeding on Justice and Tiësto

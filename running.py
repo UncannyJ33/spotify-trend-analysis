@@ -67,7 +67,6 @@ import json
 import os
 import re
 import sys
-import unicodedata
 from datetime import date
 from functools import partial
 
@@ -81,16 +80,17 @@ from playlists import (
     FORBIDDEN_NOTE,
     GENRE_RECORDINGS_CACHE,
     SP_API,
-    SP_SEARCH_LIMIT,
+    SP_TRACKS_CREDITED_CACHE,
     Spotify,
-    _artist_match,
     _title_key,
     choose_tracks,
     ensure_playlist,
     is_live,
     mb_genre_recordings,
+    pin_artist_id,
     playlist_items,
     register_song_key,
+    sp_artist_tracks_credited,
     write_archive,
 )
 from recommend import (
@@ -110,15 +110,6 @@ SCOPES_WRITE = SCOPES_READ + " playlist-modify-private playlist-modify-public"
 # only discovery tracks cost a request, and batch /tracks answers 403 so they
 # cost one each.
 DURATION_CACHE = config.CACHE_DIR / "track_durations.jsonl"
-
-# Discovery searches, with WHO IS ON each track. Stage 8's
-# spotify_artist_tracks.jsonl keeps a name and a URI per hit, and every hit was
-# then labelled as the candidate — so Tion Wayne's rap single went out as MJ
-# Cole garage, and Skrillex appeared seven times in the dubstep run under other
-# artists' names. This keeps Spotify's own credit list (name AND id) and the
-# duration search already carries. A new file, not a rewrite: the old one is
-# Stage 8's, and an append-only cache is never rebuilt.
-SP_TRACKS_CREDITED_CACHE = config.CACHE_DIR / "spotify_artist_tracks_credited.jsonl"
 
 # The two clusters. `key` names the weight column.
 #
@@ -988,84 +979,9 @@ def resolve_pins(con: duckdb.DuckDBPyConnection, pins: list[dict],
 # Discovery tracks — judged per TRACK, not per artist
 # --------------------------------------------------------------------------
 
-
-def sp_artist_tracks_credited(sp, artist: str, cache: dict) -> list[dict]:
-    """This artist's tracks in Spotify's relevance order, with who is on each.
-
-    The same /search Stage 8 makes — one page of SP_SEARCH_LIMIT, hits kept only
-    where the artist is really credited — keeping what Stage 8 throws away:
-    every credited artist as {name, id}, in Spotify's order, and `duration_ms`,
-    which search returns for free. So the length cap and the time budget cost
-    no /tracks request unless a hit arrives without one.
-
-    Only an ANSWER is cached. A 200 with no usable hit is a fact ("Spotify does
-    not carry them") and is asked once. A 429, an error envelope or no response
-    at all is a missing answer, and caching it would freeze a transient failure
-    into "this artist has no tracks" for good.
-
-    Keyed on normalise(artist), like Stage 8's, so 'DEM2' and 'Dem 2' share a
-    key. The record holds every credited id, and pin_artist_id separates the
-    two on read; a namesake is a read-time filter, not a cache repair.
-    """
-    key = normalise(artist)
-    if key in cache:
-        return [dict(t, artist_name=artist) for t in cache[key]["tracks"]]
-    resp = sp.get("/search", params={
-        "q": f'artist:"{artist.replace(chr(34), "")}"',
-        "type": "track", "limit": SP_SEARCH_LIMIT,
-    })
-    if not isinstance(resp, dict) or "_status" in resp:
-        return []
-    tracks = [
-        {"track_name": it.get("name"), "spotify_track_uri": it.get("uri"),
-         "duration_ms": it.get("duration_ms"),
-         # A LIST of credits, never a joined string: every printable separator
-         # eventually collides with a real name ("Tyler, The Creator").
-         "artists": [{"name": a.get("name"), "id": a.get("id")}
-                     for a in it.get("artists", [])]}
-        for it in (resp.get("tracks") or {}).get("items", [])
-        if it.get("uri") and _artist_match(it, artist)
-    ]
-    rec = {"key": key, "artist": artist, "status": 200, "tracks": tracks}
-    append_jsonl(SP_TRACKS_CREDITED_CACHE, rec)
-    cache[key] = rec
-    return [dict(t, artist_name=artist) for t in tracks]
-
-
-def pin_artist_id(tracks: list[dict],
-                  artist: str) -> tuple[str | None, list[dict]]:
-    """The candidate's own Spotify artist id, and only the tracks crediting it.
-
-    normalise() is a comparison key, not an identity. 'DEM2' and 'Dem 2' both
-    fold to `dem2`, and the Dem 2 search duly returned DEM2's "Discoteca" — a
-    different act — which went out as Dem 2 discovery.
-
-    Among the ids whose name folds to the candidate, the one whose Spotify name
-    IS the candidate's (after NFKD, case and all) wins; failing that, the id on
-    the most tracks; failing that, whichever relevance put first. Exact name
-    first is what makes it deterministic: "most tracks" alone would hand a
-    search for one act to its namesake whenever the namesake had the bigger page.
-    """
-    want_key = normalise(artist)
-    want_exact = unicodedata.normalize("NFKD", artist)
-    exact: dict[str, bool] = {}
-    on_tracks: dict[str, set[int]] = {}
-    first_seen: dict[str, int] = {}
-    for i, t in enumerate(tracks):
-        for a in t.get("artists") or []:
-            aid, name = a.get("id"), a.get("name") or ""
-            if not aid or normalise(name) != want_key:
-                continue
-            first_seen.setdefault(aid, i)
-            on_tracks.setdefault(aid, set()).add(i)
-            exact[aid] = (exact.get(aid, False)
-                          or unicodedata.normalize("NFKD", name) == want_exact)
-    if not first_seen:
-        return None, []
-    pinned = min(first_seen, key=lambda aid: (
-        not exact[aid], -len(on_tracks[aid]), first_seen[aid]))
-    return pinned, [t for t in tracks
-                    if any(a.get("id") == pinned for a in t.get("artists") or [])]
+# The search itself (sp_artist_tracks_credited, its cache and pin_artist_id)
+# lives in playlists.py: Stage 8 reads the same credits to require that a
+# candidate LEADS a track. Imported, not copied.
 
 
 def drag_artists(con: duckdb.DuckDBPyConnection) -> set[str]:

@@ -1,4 +1,9 @@
-"""tests/test_uri_resolver.py — search result validation, not vibes."""
+"""tests/test_uri_resolver.py — search result validation, not vibes.
+
+The search is playlists.sp_artist_tracks_credited, shared by Stages 8 and 10.
+What it keeps is a fact about the track; whether a stage may OFFER a hit is
+tested with that stage (Stage 8: test_discovery_lead.py).
+"""
 import sys
 sys.path.insert(0, ".")
 import playlists
@@ -22,19 +27,25 @@ class FakeSp:
 
 
 def item(uri, name, *artists):
-    return {"uri": uri, "name": name, "artists": [{"name": a} for a in artists]}
+    return {"uri": uri, "name": name, "duration_ms": 200_000,
+            "artists": [{"name": a, "id": f"id:{a}"} for a in artists]}
 
 
-playlists.append_jsonl = lambda path, rec: None      # keep the test off disk
+def uris(tracks):
+    return [t["spotify_track_uri"] for t in tracks]
+
+
+search = playlists.sp_artist_tracks_credited
+appended = []
+playlists.append_jsonl = lambda path, rec: appended.append((path.name, rec))
 
 # Relevance order is preserved exactly as Spotify returned it — with
 # ListenBrainz popularity dead this ordering IS the popularity signal.
 sp = FakeSp([item("spotify:track:1", "Energy Drink", "Virtual Riot"),
              item("spotify:track:2", "Idols",        "Virtual Riot")])
 cache = {}
-got = playlists.sp_artist_tracks(sp, "Virtual Riot", cache)
-check("relevance order preserved",
-      [t["spotify_track_uri"] for t in got], ["spotify:track:1", "spotify:track:2"])
+got = search(sp, "Virtual Riot", cache)
+check("relevance order preserved", uris(got), ["spotify:track:1", "spotify:track:2"])
 check("track names carried", [t["track_name"] for t in got],
       ["Energy Drink", "Idols"])
 check("artist is the one we asked for, not the credit string",
@@ -44,43 +55,43 @@ check("search is scoped to the artist", sp.last["q"], 'artist:"Virtual Riot"')
 # A search for one artist returns other people's tracks; they must be dropped.
 sp = FakeSp([item("spotify:track:bad", "Virtual Riot Tribute", "Karaoke Crew"),
              item("spotify:track:ok",  "Energy Drink",         "Virtual Riot")])
-check("wrong-artist hit dropped",
-      [t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "Virtual Riot", {})],
+check("wrong-artist hit dropped", uris(search(sp, "Virtual Riot", {})),
       ["spotify:track:ok"])
 
-# A featured credit still counts: the artist is genuinely on the track.
+# A featured credit is KEPT here, with the credit order that says it is a
+# feature: the artist is genuinely on the track. Stage 8 then refuses to offer
+# it (candidate_led); keeping it is what lets that stage tell.
 sp = FakeSp([item("spotify:track:f", "Collab", "Someone Else", "Virtual Riot")])
-check("featured credit accepted",
-      [t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "Virtual Riot", {})],
-      ["spotify:track:f"])
+got = search(sp, "Virtual Riot", {})
+check("featured credit kept by the search", uris(got), ["spotify:track:f"])
+check("...with every credit, lead first",
+      got[0]["artists"], [{"name": "Someone Else", "id": "id:Someone Else"},
+                          {"name": "Virtual Riot", "id": "id:Virtual Riot"}])
 
 # Stylisation folds the same way Stage 2 folds it: A$AP vs ASAP.
 sp = FakeSp([item("spotify:track:3", "Praise the Lord", "A$AP Rocky")])
-check("stylised artist name matches",
-      [t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "ASAP Rocky", {})],
+check("stylised artist name matches", uris(search(sp, "ASAP Rocky", {})),
       ["spotify:track:3"])
 
 # A hit with no URI is unplayable and must not reach a playlist.
 sp = FakeSp([{"uri": None, "name": "Ghost", "artists": [{"name": "Virtual Riot"}]},
              item("spotify:track:real", "Real", "Virtual Riot")])
-check("uri-less hit dropped",
-      [t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "Virtual Riot", {})],
+check("uri-less hit dropped", uris(search(sp, "Virtual Riot", {})),
       ["spotify:track:real"])
 
 # Nothing acceptable -> empty, and the miss is cached so it is asked once.
 sp = FakeSp([item("spotify:track:5", "Different Song", "Someone Else")])
 cache = {}
-check("no usable hit returns empty",
-      playlists.sp_artist_tracks(sp, "Nobody At All", cache), [])
+check("no usable hit returns empty", search(sp, "Nobody At All", cache), [])
 check("miss was cached", playlists.normalise("Nobody At All") in cache, True)
-playlists.sp_artist_tracks(sp, "Nobody At All", cache)
+search(sp, "Nobody At All", cache)
 check("cached miss not re-searched", sp.calls, 1)
 
 # A cache hit must return the same shape a live call does.
 sp = FakeSp([item("spotify:track:c", "Cached", "Virtual Riot")])
 cache = {}
-live = playlists.sp_artist_tracks(sp, "Virtual Riot", cache)
-cached = playlists.sp_artist_tracks(sp, "Virtual Riot", cache)
+live = search(sp, "Virtual Riot", cache)
+cached = search(sp, "Virtual Riot", cache)
 check("cache hit spends no request", sp.calls, 1)
 check("cache hit has the same shape as a live call", cached, live)
 
@@ -91,8 +102,7 @@ class ErrSp:
         return {"_status": 401, "_body": "expired"}
 
 
-check("error envelope yields no tracks",
-      playlists.sp_artist_tracks(ErrSp(), "Virtual Riot", {}), [])
+check("error envelope yields no tracks", search(ErrSp(), "Virtual Riot", {}), [])
 
 
 # --------------------------------------------------------------------------
@@ -100,8 +110,7 @@ check("error envelope yields no tracks",
 # as "this artist has no tracks", and an append-only cache never asks again.
 # --------------------------------------------------------------------------
 
-appended = []
-playlists.append_jsonl = lambda path, rec: appended.append(rec)
+appended.clear()
 
 
 class SeqSp:
@@ -117,49 +126,37 @@ class SeqSp:
 ok_page = {"tracks": {"items": [item("spotify:track:ok", "Energy Drink", "Virtual Riot")]}}
 cache = {}
 sp = SeqSp({"_status": 429, "_body": "slow down"}, ok_page)
-check("a 429 yields no tracks", playlists.sp_artist_tracks(sp, "Virtual Riot", cache), [])
+check("a 429 yields no tracks", search(sp, "Virtual Riot", cache), [])
 check("...and is not cached", (appended, cache), ([], {}))
 check("...so the next call re-asks, and gets the answer",
-      [t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "Virtual Riot", cache)],
-      ["spotify:track:ok"])
+      uris(search(sp, "Virtual Riot", cache)), ["spotify:track:ok"])
 check("...having asked twice", sp.calls, 2)
-check("the answer is cached with its status",
-      appended, [{"key": playlists.normalise("Virtual Riot"), "artist": "Virtual Riot",
-                  "status": 200, "tracks": [{"track_name": "Energy Drink",
-                                             "spotify_track_uri": "spotify:track:ok"}]}])
+check("the answer is cached with its status, in the credited file",
+      appended, [("spotify_artist_tracks_credited.jsonl",
+                  {"key": playlists.normalise("Virtual Riot"),
+                   "artist": "Virtual Riot", "status": 200,
+                   "tracks": [{"track_name": "Energy Drink",
+                               "spotify_track_uri": "spotify:track:ok",
+                               "duration_ms": 200_000,
+                               "artists": [{"name": "Virtual Riot",
+                                            "id": "id:Virtual Riot"}]}]})])
 
 appended.clear()
 sp = SeqSp(None)
 check("no response at all yields no tracks, and caches nothing",
-      (playlists.sp_artist_tracks(sp, "Virtual Riot", {}), appended), ([], []))
+      (search(sp, "Virtual Riot", {}), appended), ([], []))
 
 # An empty 200 is an answer: Spotify does not carry them. Asked once.
 sp = SeqSp({"tracks": {"items": []}})
 cache = {}
-playlists.sp_artist_tracks(sp, "Nobody At All", cache)
-playlists.sp_artist_tracks(sp, "Nobody At All", cache)
+search(sp, "Nobody At All", cache)
+search(sp, "Nobody At All", cache)
 check("an empty 200 is cached, with its status, and asked once",
-      (appended[-1]["status"], appended[-1]["tracks"], sp.calls), (200, [], 1))
+      (appended[-1][1]["status"], appended[-1][1]["tracks"], sp.calls), (200, [], 1))
 
-# Records from before the status existed: an empty one may have been a
-# failure, so it is re-asked ONCE and the new record wins; one with tracks is
-# a real answer and never re-asked.
-appended.clear()
-legacy = {playlists.normalise("Was Throttled"):
-              {"key": playlists.normalise("Was Throttled"), "artist": "Was Throttled",
-               "tracks": []},
-          playlists.normalise("Had Tracks"):
-              {"key": playlists.normalise("Had Tracks"), "artist": "Had Tracks",
-               "tracks": [{"track_name": "Old", "spotify_track_uri": "spotify:track:old"}]}}
-sp = SeqSp({"tracks": {"items": [item("spotify:track:wt", "Now Here", "Was Throttled")]}})
-check("a legacy empty entry is re-asked",
-      [t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "Was Throttled", legacy)],
-      ["spotify:track:wt"])
-playlists.sp_artist_tracks(sp, "Was Throttled", legacy)
-check("...once: the new record then wins", (sp.calls, len(appended)), (1, 1))
-check("a legacy entry with tracks is never re-asked",
-      ([t["spotify_track_uri"] for t in playlists.sp_artist_tracks(sp, "Had Tracks", legacy)],
-       sp.calls), (["spotify:track:old"], 1))
+# Stage 8's first cache is retired, not migrated: no search writes to it.
+check("the retired spotify_artist_tracks.jsonl is never written",
+      {name for name, _ in appended}, {"spotify_artist_tracks_credited.jsonl"})
 
 
 # --------------------------------------------------------------------------
