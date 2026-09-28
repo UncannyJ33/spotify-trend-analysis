@@ -385,7 +385,11 @@ correct.
   night break a run, and none of it is visible to a genre tag — the track is correctly classified and
   still wrong. `RUN_LIVE_TITLE_RE` anchors on where a pressing note sits (` - live`, `(live`,
   `live at/from/in`, `unplugged`); a bare `live` substring would take Zeds Dead's and Dustycloud's
-  `Alive`, both of which are in these playlists and both of which belong.
+  `Alive`, both of which are in these playlists and both of which belong. `playlists.is_live` is the
+  one definition and Stage 8 uses it too: its discovery offered Motörhead's "Bomber - … Live at The
+  Whisky" as heavy metal. Stage 8's `discovery_eligible` also refuses a remix whose title names
+  someone other than the candidate — RUNN's results carried "Alive - Trivecta Remix", a melodic
+  dubstep record, into the indie frontier as RUNN's work.
 - **A veto matches every credit — and on the known side the credits are not always what Spotify
   shows.** `running.vetoed` tests the row's artist and every name in `credited`, artist-wide and as
   (name, title). Known rows take `credited` from `track_credits` over every pressing (an artist-wide

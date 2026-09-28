@@ -180,6 +180,28 @@ check("no tags means no request",
       playlists.mb_genre_recordings(blend_http, "m", [], {}), set())
 check("no tags spends nothing", len(blend_http.calls), 1)
 
+# --- discovery picks: live recordings and other people's remixes -----------
+# The 2026-09-28 frontier dry run offered Motörhead "Bomber - Lemmy's 50th
+# Birthday, Live at The Whisky" as heavy metal discovery and RUNN "Alive -
+# Trivecta Remix" (a melodic dubstep remix) as indie: the first is a crowd
+# recording, the second is judged by an artist who did not make it.
+picks = [
+    {"spotify_track_uri": "uri:a", "track_name": "Overkill"},
+    {"spotify_track_uri": "uri:b", "track_name": "Bomber - Lemmy's 50th Birthday, Live at The Whisky"},
+    {"spotify_track_uri": "uri:c", "track_name": "Alive - Trivecta Remix"},
+    {"spotify_track_uri": "uri:d", "track_name": "Free Fall"},
+    {"spotify_track_uri": "uri:e", "track_name": "Free Fall - RUNN Remix"},
+    {"spotify_track_uri": "uri:f", "track_name": "Alive"},
+]
+kept = [t["spotify_track_uri"] for t in playlists.discovery_eligible(picks, "RUNN")]
+check("a live recording is not a discovery pick", "uri:b" in kept, False)
+check("someone else's remix is not the candidate's track", "uri:c" in kept, False)
+check("the candidate's own remix stays", "uri:e" in kept, True)
+check("plain titles stay, including 'Alive'", [u for u in kept if u in ("uri:a", "uri:d", "uri:f")],
+      ["uri:a", "uri:d", "uri:f"])
+check("relevance order survives the filter", kept, ["uri:a", "uri:d", "uri:e", "uri:f"])
+check("is_live is shared with Stage 10", playlists.is_live("Go Away - Live at iTunes Festival 2011"), True)
+
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)
 print("all assertions passed")

@@ -483,6 +483,49 @@ def mb_genre_recordings(http: Throttled, artist_mbid: str, tags: list[str],
     return titles
 
 
+def is_live(track_name: str) -> bool:
+    """A live recording, refused as a pick however on-genre it is.
+
+    Crowd noise, a spoken intro and whatever tempo the band picked on the night
+    are invisible to a genre tag: the track is correctly classified and still
+    wrong. Stage 10 found it first (Katy B's iTunes Festival "Go Away"); Stage 8
+    offered Motörhead's "Bomber - Lemmy's 50th Birthday, Live at The Whisky" as
+    heavy metal discovery. One definition, shared by both.
+
+    Matched structurally rather than as a substring (config.RUN_LIVE_TITLE_RE,
+    named for the stage that introduced it). A bare /live/ would take Zeds
+    Dead's "Alive" and Dustycloud's "Alive" — both wanted.
+    """
+    return bool(re.search(config.RUN_LIVE_TITLE_RE, track_name or ""))
+
+
+def discovery_eligible(tracks: list[dict], artist: str) -> list[dict]:
+    """A candidate's search results minus what is not really theirs to offer.
+
+    Two refusals, in relevance order so choose_tracks still sees the popularity
+    proxy intact:
+    - live recordings (is_live);
+    - a remix whose title names someone OTHER than the candidate. Spotify files
+      a remix under the original artist, so RUNN's results include "Alive -
+      Trivecta Remix" — a melodic dubstep record by Trivecta — and it reached
+      the indie frontier as RUNN's work. Anchors are judged by the remixer
+      (select_anchor_tracks); discovery has no tags for an arbitrary remixer, so
+      the honest move is not to offer the track at all. The candidate's OWN
+      remix of someone else stays.
+    """
+    me = normalise(artist or "")
+    out = []
+    for t in tracks:
+        title = t.get("track_name") or ""
+        if is_live(title):
+            continue
+        rc = remix_credit(title)
+        if rc and normalise(rc) != me:
+            continue
+        out.append(t)
+    return out
+
+
 def choose_tracks(tracks: list[dict], on_genre: set[str], k: int) -> list[dict]:
     """Prefer the artist's on-genre work; Spotify relevance does the rest.
 
@@ -800,6 +843,7 @@ def build_selections(con, http, sp) -> list[dict]:
             if not tracks:
                 continue
             on_genre = mb_genre_recordings(http, cand["mbid"], tags, genre_rec_cache)
+            tracks = discovery_eligible(tracks, cand["artist_name"])
             for chosen in choose_tracks(tracks, on_genre, config.TRACKS_PER_ARTIST):
                 if chosen["spotify_track_uri"] in seen_uris:
                     continue

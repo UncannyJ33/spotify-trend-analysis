@@ -87,6 +87,7 @@ from playlists import (
     _title_key,
     choose_tracks,
     ensure_playlist,
+    is_live,
     mb_genre_recordings,
     playlist_items,
     register_song_key,
@@ -868,20 +869,6 @@ def load_overrides() -> dict:
                       "which is not one of keep (a pin), drop, discover, "
                       "prefer; skipped")
     return out
-
-
-def is_live(track_name: str) -> bool:
-    """A live recording, which is refused however on-genre it is.
-
-    Crowd noise, a spoken intro and whatever tempo the drummer picked on the
-    night all break a run, and none of that is visible to a genre tag: the
-    track is correctly classified and still wrong.
-
-    Matched structurally rather than as a substring. A bare /live/ would take
-    Zeds Dead's "Alive" and Dustycloud's "Alive" — both in these playlists,
-    both wanted.
-    """
-    return bool(re.search(config.RUN_LIVE_TITLE_RE, track_name or ""))
 
 
 def vetoed(row: dict, vetoes: set[tuple]) -> bool:
