@@ -10,7 +10,9 @@ per (track, performer). It also parses the remixer out of a `- X Remix` suffix,
 which the export hides the same way: Spotify bills a remix to the ORIGINAL
 artist, so an Ian Asher speed-garage rework of a Halsey song reads as pop. That
 is 334 tracks and 5,810 minutes here, concentrated in dance music where remixes
-and edits are how most of the material arrives.
+and edits are how most of the material arrives. The bracketed `(X Remix)` /
+`[X Remix]` is the same credit and is read where the dash form names nobody —
+28 more tracks and 472 minutes, behind the guards at REMIX_BRACKET_RE.
 
     .venv/bin/python credits.py
 
@@ -98,44 +100,181 @@ STRAY_BRACKET_RE = r'[\(\)\[\]]'
 REMIX_TYPE_RE = r'(?:remix|edit|bootleg|flip|vip|rework|refix|mix|dub|version)'
 REMIX_CREDIT_RE = r'\s-\s(.+?)\s' + REMIX_TYPE_RE + r'$'
 
-# Words that describe a FORMAT rather than a person. "Bounce - Radio Edit"
-# matches the pattern above and yields "Radio", which is not an artist; left
-# unchecked it would invent a performer holding 352 minutes of listening.
-# 42 tracks and 883 minutes in this library are rejected here.
+# The same credit in brackets: "Falling (blackbear Remix)", "Bad Habits (feat.
+# Tion Wayne & Central Cee) [Fumez The Engineer Remix]". 28 tracks and 472
+# minutes here credited only to the original artist. The DASH rule is tried
+# first; this one is read only when the dash rule found no remixer, and it
+# reads only the LAST bracketed group, which must end the title or be followed
+# by nothing but a final " - " segment — one the dash rule has just found no
+# remixer in ("(Vintage Culture & Zerky Remix) - Radio Edit"). The group may
+# hold no bracket of its own, so a nested one is refused, never guessed at.
+REMIX_BRACKET_RE = r'[\(\[]([^\(\)\[\]]*)[\)\]](?:\s-\s[^\(\)\[\]]*)?$'
+# Inside the group: the name, then one or more type words — "David Guetta
+# Remix Edit" is David Guetta's, not "David Guetta Remix"'s. A bare "(Remix)"
+# names nobody.
+REMIX_BRACKET_NAME_RE = r'^(.+?)(?:\s+' + REMIX_TYPE_RE + r')+$'
+# A group that is a credit list is not a remix credit: in "(with David Guetta
+# & Little Mix)" the Mix is part of a name.
+REMIX_CREDIT_LIST_RE = r'^(?:feat|ft|featuring|with)(?:[\s.]|$)'
+# A possessive names its owner and then describes the record: "Tiësto's Big
+# Room Remix" is Tiësto's, "Louis The Child’s version" Louis The Child's.
+REMIX_POSSESSIVE_RE = r"^(.+?)['’]s(?:\s.*)?$"
+
+# Words that describe a FORMAT rather than a person, refused whether they are
+# the whole name or every word of it ("2017 Demo", "Live Orchestral", "Full
+# Vocal", a number counting as such a word). Applied to BOTH forms. "Bounce -
+# Radio Edit" yields "Radio", which is not an artist; left unchecked it would
+# invent a performer holding 352 minutes of listening. The bracket form brought
+# the voice, film and genre versions — "(Male Version)", "(Film Version)",
+# "(dnb edit)", "(Jersey Club Remix)" — and the same words were already
+# reaching the dash form as performers: "- Drill Remix" credited "Drill" with
+# 102 minutes, "- TikTok Version" credited "TikTok". Every word here comes from
+# a real title in this library, bar the obvious pairs (female, lo-fi) and the
+# garage and techno edits a dance library will meet; a type word alone ("VIP
+# Mix") names nobody. Not "angel": "(Angel Mix)" may be a named version, but
+# Angel is also somebody's name, and Stage 2's review list is where it goes.
 REMIX_FORMAT_STOPLIST = frozenset({
     "radio", "extended", "club", "original", "instrumental", "album", "single",
     "acoustic", "live", "dance", "main", "bonus", "deluxe", "sped up", "slowed",
     "remastered", "remaster", "mono", "stereo", "short", "long", "full",
     "clean", "dirty", "explicit", "edit", "remix", "alternate", "reprise",
     "demo", "new", "special", "super", "ultra", "hd", "hq",
+    # the type words themselves
+    "mix", "version", "vip", "dub", "bootleg", "flip", "rework", "refix",
+    # voice, language and arrangement versions
+    "male", "female", "film", "piano", "orchestral", "solo", "vocal",
+    "stripped", "cinematic", "tiktok", "lofi", "lo-fi", "official", "trailer",
+    "brass", "band", "renaissance", "summer", "spanish", "spanglish",
+    # genre versions
+    "dnb", "garage", "house", "techno", "trap", "drill", "reggae", "jersey",
 })
 
 # A capture that is only digits and punctuation is a year or a catalogue
 # fragment, not a name.
 REMIX_NON_NAME_RE = r'^[0-9\s\-\.,:]+$'
+# The same, for one word of a name.
+REMIX_NUMBER_WORD_RE = r'[0-9\-\.,:]+'
 
 
-def remix_credit(title: str) -> str | None:
+def _remix_name_ok(name: str) -> bool:
+    """The guards both forms share, as build_track_credits applies them."""
+    if not name:
+        return False
+    low = name.lower()
+    return not (
+        low in REMIX_FORMAT_STOPLIST
+        or all(w in REMIX_FORMAT_STOPLIST or re.fullmatch(REMIX_NUMBER_WORD_RE, w)
+               for w in low.split(" "))
+        or re.match(REMIX_NON_NAME_RE, name)
+        # A capture spanning another " - " means the title has more structure
+        # than the pattern models; refuse rather than guess.
+        or " - " in name)
+
+
+def _is_album_artist(name: str, album_artist: str | None) -> bool:
+    """A bracket version named for the album artist is theirs, not a remix:
+    "(Armaan Malik Version)" on Armaan Malik, and "(Taylor's Version)" on
+    Taylor Swift, whose possessive leaves only her first word."""
+    if not album_artist:
+        return False
+    a, n = album_artist.strip(" ").lower(), name.lower()
+    return n == a or a.startswith(n + " ")
+
+
+def remix_credit(title: str | None, album_artist: str | None = None) -> str | None:
     """The remixer a title names, by Stage 1b's own rule, for Python callers.
 
-    The same REMIX_CREDIT_RE and the same two guards the `remixers` CTE in
-    build_track_credits applies, so a title parses the same way in Stage 8's
-    anchor judge and Stage 10's routing as it does in track_credits: "Bounce -
-    Radio Edit" names a format rather than a person, and "Song - 2019 Remix"
-    names a year. The pattern sits inside what both RE2 and Python accept.
+    The rule remixers_sql applies in build_track_credits, step for step, so a
+    title parses the same way in Stage 8's anchor judge and Stage 10's routing
+    as it does in track_credits (a test runs titles through both). The dash
+    form first — "Die For Me - Ian Asher Remix" — then the bracketed one —
+    "Falling (blackbear Remix)". Every pattern sits inside what both RE2 and
+    Python accept, and names are trimmed of spaces only, as DuckDB's trim() is.
+
+    `album_artist` is needed for the bracket form's self-versions: without it,
+    "Love Story (Taylor's Version)" names "Taylor". Pass the album artist, or
+    for a Spotify search result its first-credited artist.
 
     It lives here rather than in either consumer because Stage 10 imports
     Stage 8: a copy in running.py could not be reached from playlists.py
     without a circular import.
     """
-    m = re.search(REMIX_CREDIT_RE, title or "", re.IGNORECASE)
+    title = title or ""
+    m = re.search(REMIX_CREDIT_RE, title, re.IGNORECASE)
+    if m and _remix_name_ok(m.group(1).strip(" ")):
+        return m.group(1).strip(" ")
+    m = re.search(REMIX_BRACKET_RE, title)
     if not m:
         return None
-    name = m.group(1).strip()
-    if (not name or name.lower() in REMIX_FORMAT_STOPLIST
-            or re.match(REMIX_NON_NAME_RE, name) or " - " in name):
+    body = m.group(1).strip(" ")
+    if re.search(REMIX_CREDIT_LIST_RE, body, re.IGNORECASE):
+        return None
+    m = re.search(REMIX_BRACKET_NAME_RE, body, re.IGNORECASE)
+    if not m:
+        return None
+    name = m.group(1).strip(" ")
+    p = re.search(REMIX_POSSESSIVE_RE, name, re.IGNORECASE)
+    if p:
+        name = p.group(1).strip(" ")
+    if not _remix_name_ok(name) or _is_album_artist(name, album_artist):
         return None
     return name
+
+
+def _sql_str(pattern: str) -> str:
+    """A pattern as the body of a single-quoted SQL literal."""
+    return pattern.replace("'", "''")
+
+
+def remixers_sql(source: str, title: str = "track_name",
+                 album_artist: str = "album_artist") -> str:
+    """remix_credit in SQL: `source`'s rows plus a `remixer` column, NULL
+    where the title names none. The same patterns and guards, in the same
+    order; build_track_credits reads it, and a test holds the two to agreeing.
+    """
+    stop = ", ".join(f"'{_sql_str(w)}'" for w in sorted(REMIX_FORMAT_STOPLIST))
+
+    def ok(n: str) -> str:
+        return f"""coalesce(
+                {n} <> ''
+                AND lower({n}) NOT IN ({stop})
+                AND NOT list_bool_and(list_transform(
+                        string_split(lower({n}), ' '),
+                        w -> list_contains([{stop}], w)
+                             OR regexp_full_match(w, '{REMIX_NUMBER_WORD_RE}')))
+                AND NOT regexp_matches({n}, '{REMIX_NON_NAME_RE}')
+                AND NOT contains({n}, ' - '), false)"""
+
+    body = f"trim(regexp_extract({title}, '{REMIX_BRACKET_RE}', 1))"
+    poss = _sql_str(REMIX_POSSESSIVE_RE)
+    return f"""
+        SELECT * EXCLUDE (_rc_dash, _rc_body, _rc_bracket),
+            CASE
+                WHEN {ok('_rc_dash')} THEN _rc_dash
+                WHEN {ok('_rc_bracket')}
+                     AND NOT coalesce(
+                         lower(_rc_bracket) = lower(trim({album_artist}))
+                         OR starts_with(lower(trim({album_artist})),
+                                        lower(_rc_bracket) || ' '), false)
+                    THEN _rc_bracket
+            END AS remixer
+        FROM (
+            SELECT *,
+                trim(CASE WHEN regexp_matches(_rc_body, '{poss}', 'i')
+                          THEN regexp_extract(_rc_body, '{poss}', 1, 'i')
+                          ELSE _rc_body END) AS _rc_bracket
+            FROM (
+                SELECT *,
+                    trim(regexp_extract({title}, '{REMIX_CREDIT_RE}', 1, 'i'))
+                        AS _rc_dash,
+                    CASE WHEN regexp_matches({body}, '{REMIX_CREDIT_LIST_RE}', 'i')
+                         THEN ''
+                         ELSE trim(regexp_extract(
+                             {body}, '{REMIX_BRACKET_NAME_RE}', 1, 'i'))
+                    END AS _rc_body
+                FROM {source}
+            )
+        )"""
 
 
 def _re2_escape(name: str) -> str:
@@ -197,7 +336,6 @@ def build_protected_names(con: duckdb.DuckDBPyConnection) -> str:
 
 
 def build_track_credits(con: duckdb.DuckDBPyConnection) -> None:
-    stoplist = ", ".join(f"'{w}'" for w in sorted(REMIX_FORMAT_STOPLIST))
     # Spliced into single-quoted SQL literals, so a name's own quote is doubled
     # (an "O'Brien & Sons" would otherwise end the string).
     protected = build_protected_names(con).replace("'", "''")
@@ -323,27 +461,16 @@ def build_track_credits(con: duckdb.DuckDBPyConnection) -> None:
                 ) AS artist_name
             FROM blobs
         ),
-        -- The title-suffix remixer. Same floor-not-fix caveat as `featured`:
-        -- it only sees credits Spotify spelled into the title.
-        remixed AS (
+        -- The remixer the title names, dash form or bracketed (remixers_sql,
+        -- which is remix_credit's rule). Same floor-not-fix caveat as
+        -- `featured`: it only sees credits Spotify spelled into the title.
+        remixers AS (
             SELECT
                 spotify_track_uri, track_name, album_artist,
                 played_seconds, n_plays,
-                trim(regexp_extract(track_name, '{REMIX_CREDIT_RE}', 1, 'i'))
-                    AS artist_name
-            FROM unseen
-        ),
-        remixers AS (
-            SELECT * FROM remixed
-            WHERE artist_name IS NOT NULL
-              AND artist_name <> ''
-              -- "Radio Edit" describes a format, not a person.
-              AND lower(artist_name) NOT IN ({stoplist})
-              -- Years and catalogue fragments are not names.
-              AND NOT regexp_matches(artist_name, '{REMIX_NON_NAME_RE}')
-              -- A capture spanning another " - " means the title has more
-              -- structure than this pattern models; refuse rather than guess.
-              AND NOT contains(artist_name, ' - ')
+                remixer AS artist_name
+            FROM ({remixers_sql('unseen')})
+            WHERE remixer IS NOT NULL
         ),
         album_artists AS (
             SELECT

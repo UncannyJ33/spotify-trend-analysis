@@ -261,6 +261,21 @@ before the split. A capital ` X ` is not a separator (it turned "X Ambassadors"
 into an unrelated act called "Ambassadors"), and an inner `ft.` is: "(with 21
 Savage ft. Project Pat)" is two people.
 
+Remixes hide the same way. Spotify bills a remix to the *original* artist, so
+"Die For Me - Ian Asher Remix" is filed under Halsey and reads as pop. Stage 1b
+reads the remixer back out of the title — the dash suffix `- X Remix` first, then
+the bracketed `(X Remix)` / `[X Remix]` where the dash names nobody — and
+credits them as `remixer`, which Stage 3 weights like a feature, so time only
+moves between performers of the same play. The bracketed form needed guards,
+each one a real title: only the last bracketed group counts, and only where it
+ends the title (`(feat. Tion Wayne & Central Cee) [Fumez The Engineer Remix]` is
+Fumez The Engineer's); a credit list is not a remix (`(with David Guetta & Little
+Mix)`); a possessive names its owner (`[Tiësto's Big Room Remix]`); a version
+named for the album artist is theirs (`(Taylor's Version)` on Taylor Swift); and
+format, voice and genre words are nobody, in either form (`Radio Edit`, `Male
+Version`, `dnb edit`). A suffix that still names no one real lands on Stage 2's
+review list and is answered `IGNORE`.
+
 That guesswork is superseded wherever real data exists. If you run the
 [Stage 6 poller](#stage-6--history-poller), every track it sees contributes its
 true performer list, which replaces the parsed credits for all plays of that
@@ -834,7 +849,7 @@ genuinely cannot catch the failures that matter: a filter that drops the right
 are the few pipeline invariants a report cannot see, such as time lost evenly,
 which moves no share.
 
-`tests/` pins that logic instead, in 20 files — Stage 8's selection,
+`tests/` pins that logic instead, in 21 files — Stage 8's selection,
 within-artist track choice and anchor judge (Halsey and Ellie Goulding must not
 anchor indie, and a remix is judged on its remixer) and its discovery rule (a
 record RUNN only features on is not RUNN's to offer), Stage 9's scoring (above all Daft Punk and Kendrick
@@ -844,7 +859,9 @@ refuses), its remixer parsing (`Radio Edit` must never become an artist called
 "Radio"), its discovery seeds, track gate and supply order, Stage 11's rule that its
 source is only ever read, the never-delete guarantee and the rename alias, each of the override files, and the scope
 arithmetic on the shared Spotify token. On the pipeline side:
-`test_credit_names.py` (names Stage 1b must not cut), `test_override_cache.py`
+`test_credit_names.py` (names Stage 1b must not cut),
+`test_bracket_remix_credits.py` (the bracketed remixer, its guards, and Stage
+1b's SQL and Python agreeing title for title), `test_override_cache.py`
 (a pinned override costs requests once), `test_trend_horizon.py` (Stage 3 stops
 at the export), `test_time_conservation.py`, `test_seed_weights.py` (Stage 5
 seeds on recent time) and `test_recommend_cache.py` (caches hold answers, never

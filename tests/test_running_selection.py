@@ -297,6 +297,7 @@ CREATE TABLE plays AS SELECT * FROM (VALUES
   -- C10: which credits may place a track.
   ('uri:frag',  'Fragments of Time', 'Daft Punk', 300.0, 'trackdone', DATE '2026-06-01', 280000, FALSE),
   ('uri:one',   'The One - NGHTMRE Remix', 'Habstrakt', 300.0, 'trackdone', DATE '2026-06-01', 200000, FALSE),
+  ('uri:two',   'The Two (NGHTMRE Remix)', 'Habstrakt', 300.0, 'trackdone', DATE '2026-06-01', 200000, FALSE),
   ('uri:eyes',  'Eyes Cut Deeper (feat. Inéz)', 'Subtronics', 300.0, 'trackdone', DATE '2026-06-01', 200000, FALSE),
   ('uri:cryst', 'crystallized (feat. Inéz) - Subtronics Remix', 'John Summit', 300.0, 'trackdone', DATE '2026-06-01', 200000, FALSE),
   ('uri:light', 'light years (feat. Inéz)', 'John Summit', 300.0, 'trackdone', DATE '2026-06-01', 200000, FALSE)
@@ -313,6 +314,8 @@ CREATE TABLE track_credits AS SELECT * FROM (VALUES
   ('uri:frag',   'Todd Edwards', 'featured',     'export'),
   ('uri:one',    'Habstrakt',    'album_artist', 'export'),
   ('uri:one',    'NGHTMRE',      'remixer',      'export'),
+  ('uri:two',    'Habstrakt',    'album_artist', 'export'),
+  ('uri:two',    'NGHTMRE',      'remixer',      'export'),
   ('uri:eyes',   'Subtronics',   'album_artist', 'poller'),
   ('uri:eyes',   'Inéz',         'featured',     'poller'),
   ('uri:cryst',  'John Summit',  'album_artist', 'export'),
@@ -364,6 +367,8 @@ check("...a poller feature does", pool_clusters("uri:frag"), ["speed garage"])
 # "The One - NGHTMRE Remix" in garage; the record is NGHTMRE's.
 check("C10 routing: a remix goes to the remixer's cluster only",
       pool_clusters("uri:one"), ["dubstep"])
+check("...the bracketed form too (Stage 1b's rule, not the dash regex)",
+      pool_clusters("uri:two"), ["dubstep"])
 # credits.py types every non-first poller artist as `featured`, remixers
 # included, which is why routing reads the title rather than credit_type.
 kp.execute("UPDATE track_credits SET credit_type = 'featured', "

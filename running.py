@@ -74,7 +74,7 @@ import duckdb
 
 import config
 from consolidate import find_playlist, gentle_token, read_playlist
-from credits import REMIX_CREDIT_RE, remix_credit
+from credits import remix_credit
 from enrich import MB_MIN_INTERVAL, Throttled, load_genre_vocabulary, normalise
 from playlists import (
     FORBIDDEN_NOTE,
@@ -86,9 +86,11 @@ from playlists import (
     choose_tracks,
     ensure_playlist,
     is_live,
+    lead_artist,
     mb_genre_recordings,
     pin_artist_id,
     playlist_items,
+    register_remix_credit,
     register_song_key,
     sp_artist_tracks_credited,
     write_archive,
@@ -412,6 +414,7 @@ def build_known_pool(con: duckdb.DuckDBPyConnection) -> None:
     can bring REHAB and Disturbia while his Luude remix counts against Luude.
     """
     register_song_key(con)
+    register_remix_credit(con)
     con.execute(
         f"""
         CREATE OR REPLACE TABLE known_pool AS
@@ -488,15 +491,15 @@ def build_known_pool(con: duckdb.DuckDBPyConnection) -> None:
                    OR (c.credit_type = 'featured' AND c.credit_source = 'poller'))
         ),
         routed AS (
-            -- The remixer a pressing's TITLE names, when they are an admitting
-            -- cluster artist on the record. regexp_extract gives '' on no
-            -- match, and no credited name is that short.
+            -- The remixer a pressing's TITLE names (Stage 1b's rule, dash or
+            -- bracketed), when they are an admitting cluster artist on the
+            -- record. NULL on no remixer, which equals nothing.
             SELECT a.spotify_track_uri,
                    first(a.cluster ORDER BY a.w DESC, a.cluster) AS remix_cluster
             FROM admitting a
             JOIN members m ON m.rep_uri = a.spotify_track_uri
-            WHERE lower(trim(a.artist_name)) = lower(trim(
-                      regexp_extract(m.track_name, '{REMIX_CREDIT_RE}', 1, 'i')))
+            WHERE lower(trim(a.artist_name))
+                  = lower(remix_credit(m.track_name, m.album_artist))
             GROUP BY 1
         ),
         credited AS (
@@ -1054,7 +1057,7 @@ def gate_discovery(tracks: list[dict], cand: dict, pinned_id: str | None,
         if vetoed(row, vetoes) or not is_fresh(row):
             continue
 
-        rc = remix_credit(title)
+        rc = remix_credit(title, lead_artist(t))
         credited_keys = {normalise(n) for n in credited}
         remixer = normalise(rc) if rc and normalise(rc) in credited_keys else None
         lead = artists[0] if artists else {}

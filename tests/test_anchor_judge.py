@@ -53,7 +53,12 @@ CREATE TABLE plays AS SELECT * FROM (VALUES
   ('Folk Act',   'Sweet Song - Nobody Known Remix', 'uri:nk',   2900.0),
   -- artist_tags keeps MusicBrainz's negative counts (163 genre rows, to -6)
   ('Downvoted Elsewhere', 'Minus Two',          'uri:dvx',   2700.0),
-  ('Downvoted Spec',      'Cancelled Out',      'uri:dvs',   2600.0)
+  ('Downvoted Spec',      'Cancelled Out',      'uri:dvs',   2600.0),
+  -- the bracketed remix, judged like the dash one
+  ('Folk Act',   'Quiet Song (Wave Guy Remix)', 'uri:qs-r',  2950.0),
+  -- a self-version: "(Taylor's Version)" on Taylor Swift names "Taylor"
+  -- unless the judge is told who the album artist is
+  ('Tay Singer', 'Love Tale (Tay''s Version)', 'uri:tay',    2400.0)
 ) t(artist_name, track_name, spotify_track_uri, played_seconds)""")
 con.execute("ALTER TABLE plays ADD COLUMN month DATE DEFAULT DATE '2026-06-01'")
 con.execute("ALTER TABLE plays ADD COLUMN ms_played_estimated BOOLEAN DEFAULT FALSE")
@@ -91,7 +96,9 @@ CREATE TABLE artist_tags AS SELECT * FROM (VALUES
   -- indie pop 2 and indie folk -3 beside pop 4: clamped 2 of 6 = 0.33
   -- (admitted); unclamped the downvoted spec tag cancels the real one, -1 of 3
   ('Downvoted Spec', 'indie pop', 2), ('Downvoted Spec', 'indie folk', -3),
-  ('Downvoted Spec', 'pop', 4)
+  ('Downvoted Spec', 'pop', 4),
+  ('Wave Guy', 'wave', 2),
+  ('Tay Singer', 'country pop', 3)
 ) t(artist_name, tag, tag_count)""")
 con.execute("ALTER TABLE artist_tags ADD COLUMN is_genre BOOLEAN DEFAULT TRUE")
 # Stage 8 reads the title, never credit_type — but the table is here so a
@@ -110,6 +117,8 @@ indie = playlists.select_anchor_tracks(con, INDIE)
 garage = playlists.select_anchor_tracks(con, GARAGE)
 metal = playlists.select_anchor_tracks(con, ["heavy metal"])
 bass = playlists.select_anchor_tracks(con, ["dubstep"])
+wave = playlists.select_anchor_tracks(con, ["wave"])
+country = playlists.select_anchor_tracks(con, ["country pop"])
 
 # --- the share gate ------------------------------------------------------
 check("Halsey-shaped artist (indie 0.09) no longer anchors indie",
@@ -141,6 +150,14 @@ check("...so it no longer anchors its album artist's indie",
       "uri:bod" in uris(indie), False)
 check("a remix whose remixer has no tags cannot anchor, even where the "
       "album artist qualifies", "uri:nk" in uris(indie), False)
+check("a bracketed remix is judged on its remixer too",
+      [(r["spotify_track_uri"], r["judge"]) for r in wave],
+      [("uri:qs-r", "Wave Guy")])
+check("...so it does not anchor its album artist's indie",
+      "uri:qs-r" in uris(indie), False)
+check("a self-version is judged on its album artist, not the first word",
+      [(r["spotify_track_uri"], r["judge"]) for r in country],
+      [("uri:tay", "Tay Singer")])
 
 # --- reuse, not copies ---------------------------------------------------
 check("Stage 10 uses credits.remix_credit itself",
@@ -148,9 +165,12 @@ check("Stage 10 uses credits.remix_credit itself",
 check("Stage 10 uses playlists.register_song_key itself",
       running.register_song_key is playlists.register_song_key, True)
 check("remix_credit in SQL agrees with Python (and gives NULL for no remix)",
-      con.execute("SELECT remix_credit('Colors - Garage Guy Remix'), "
-                  "remix_credit('Bounce - Radio Edit'), remix_credit(NULL)"
-                  ).fetchone(), ("Garage Guy", None, None))
+      con.execute("SELECT remix_credit('Colors - Garage Guy Remix', 'Pop Singer'), "
+                  "remix_credit('Bounce - Radio Edit', 'X'), "
+                  "remix_credit('Falling (blackbear Remix)', NULL), "
+                  "remix_credit('Love Story (Taylor''s Version)', 'Taylor Swift'), "
+                  "remix_credit(NULL, NULL)"
+                  ).fetchone(), ("Garage Guy", None, "blackbear", None, None))
 
 # --- one song, one anchor -------------------------------------------------
 dd = duckdb.connect()

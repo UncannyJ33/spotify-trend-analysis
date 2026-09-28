@@ -323,6 +323,22 @@ correct.
   `remaster` is NOT a remix type (it captured `"2012 -"` out of `War Pigs - 2012 - Remaster`).
   A suffix naming no person is still extracted, then fails to resolve and is answered `IGNORE` —
   junk degrades to a review row, never to bad data.
+- **The bracketed remix is the same credit, and a naive regex gets a quarter of it wrong.**
+  `Falling (blackbear Remix)` is a blackbear record filed under Trevor Daniel: 28 tracks / 472 min
+  here. The dash rule is tried first and the bracket read only where it named nobody. Each guard is a
+  real title: only the LAST group, and only where it ends the title (else `(feat. Tion Wayne &
+  Central Cee) [Fumez The Engineer Remix]` yields a feature list); a group opening `with`/`feat.` is
+  a credit list (`(with David Guetta & Little Mix)` — the Mix is a name); a possessive names its
+  owner (`[Tiësto's Big Room Remix]` → Tiësto); a version named for the album artist or its first
+  word is theirs — `(Taylor's Version)` otherwise credits a "Taylor", which is why `remix_credit`
+  takes the album artist and every caller must pass it (a search result's first-credited artist).
+  `REMIX_FORMAT_STOPLIST` refuses a name when it, or every word of it, is a format, voice or genre
+  word (`Male Version`, `2017 Demo`, `dnb edit`); it applies to both forms, and 25 dash tracks /
+  233 min had been crediting "Drill", "Summer", "TikTok" and "VIP" as performers. The dash form's
+  own parse is otherwise untouched: `- Tiësto's Big Room Remix` still yields "Tiësto's Big Room".
+  The rule exists twice — `credits.remix_credit` for Stages 8 and 10, `remixers_sql` inside
+  `build_track_credits` — and `test_bracket_remix_credits.py` holds them to one answer per title.
+  Stage 10's routing calls `remix_credit` too; the dash regex it used to inline could not see brackets.
 - **Stage 10 gates discovery candidates harder than library artists, on purpose.** A weighted share
   alone is exploitable by a sparse tag vector: one `tech house` vote and no drag tags is 1/1, and
   Boys Noize and Mr. Oizo were duly offered as speed garage. `RUN_MIN_CANDIDATE_CLUSTER_WEIGHT`
