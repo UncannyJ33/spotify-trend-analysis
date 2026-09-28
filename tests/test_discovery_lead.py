@@ -75,6 +75,18 @@ check("...and discovery_eligible then refuses it as someone else's remix",
       uris(playlists.discovery_eligible(
           playlists.candidate_led([led_other_remix], "RUNN", "sp-runn"), "RUNN")),
       [])
+# The bracketed form is the same credit: someone else's remix is refused, and
+# a self-version is the candidate's own record, not a remix by "Taylor".
+check("a bracketed remix by someone else is refused too",
+      uris(playlists.discovery_eligible(
+          [trk("u:btriv", "Alive (Trivecta Remix)", RUNN, ("Trivecta", "sp-triv"))],
+          "RUNN")), [])
+taylor = ("Taylor Swift", "sp-ts")
+tv = trk("u:tv", "Love Story (Taylor's Version)", taylor)
+check("a self-version passes the lead test...",
+      uris(playlists.candidate_led([tv], "Taylor Swift", "sp-ts")), ["u:tv"])
+check("...and is not refused as a stranger's remix",
+      uris(playlists.discovery_eligible([tv], "Taylor Swift")), ["u:tv"])
 page = [led_other_remix, free_fall, own_remix, own, alive]
 check("relevance order survives the filter",
       uris(playlists.candidate_led(page, "RUNN", "sp-runn")),

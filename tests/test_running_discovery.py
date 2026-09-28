@@ -32,6 +32,7 @@ os.environ["SPOTIFY_RUNNING_OVERRIDES"] = str(_TMP / "running_overrides.csv")
 import duckdb
 import config
 import playlists
+import credits
 import running
 
 failures = []
@@ -456,20 +457,32 @@ check("no credit folding to the candidate pins nothing",
       running.pin_artist_id([trk("u:x", "X", 1, ("Someone", "sp-s"))], "Dem 2"),
       (None, []))
 
-# --- remix credit: credits.py's pattern, imported, not copied -----------
-for title, want in [("Everyday - Netsky Remix", "Netsky"),
-                    ("Halsey - Ian Asher Remix", "Ian Asher"),
-                    ("Bounce - Radio Edit", None),
-                    ("War Pigs - 2012 - Remaster", None),
-                    ("Song - 2019 Remix", None),
-                    ("Plain Title", None)]:
-    check(f"remix_credit({title!r})", running.remix_credit(title), want)
-for title in ("Everyday - Netsky Remix", "Beauty And A Beat - Wideboys Radio Mix"):
-    sql = gcon.execute(
-        f"SELECT trim(regexp_extract(?, '{running.REMIX_CREDIT_RE}', 1, 'i'))",
-        [title]).fetchone()[0]
+# --- remix credit: credits.py's rule, imported, not copied --------------
+for title, lead, want in [("Everyday - Netsky Remix", "Rusko", "Netsky"),
+                          ("Halsey - Ian Asher Remix", "Halsey", "Ian Asher"),
+                          ("Bounce - Radio Edit", "Calvin Harris", None),
+                          ("War Pigs - 2012 - Remaster", "Black Sabbath", None),
+                          ("Song - 2019 Remix", "X", None),
+                          ("Undo (AWAY Remix)", "RL Grime", "AWAY"),
+                          ("Love Story (Taylor's Version)", "Taylor Swift", None),
+                          ("Plain Title", "X", None)]:
+    check(f"remix_credit({title!r})", running.remix_credit(title, lead), want)
+gcon.execute("""CREATE OR REPLACE TABLE rc_titles AS SELECT * FROM (VALUES
+    ('Everyday - Netsky Remix', 'Rusko'),
+    ('Beauty And A Beat - Wideboys Radio Mix', 'Justin Bieber'),
+    ('Undo (AWAY Remix)', 'RL Grime')) t(track_name, album_artist)""")
+for title, lead, sql in gcon.execute(
+        f"SELECT track_name, album_artist, remixer "
+        f"FROM ({credits.remixers_sql('rc_titles')}) ORDER BY 1").fetchall():
     check(f"...Python agrees with Stage 1b's SQL on {title!r}",
-          running.remix_credit(title), sql)
+          running.remix_credit(title, lead), sql)
+# A self-version on a search result: the lead is the album artist, so
+# "(Taylor's Version)" does not name a stranger called Taylor and get refused.
+check("lead_artist reads a search result's first credit",
+      running.lead_artist({"artists": [{"name": "Taylor Swift"}, {"name": "X"}]}),
+      "Taylor Swift")
+check("...and is None for a track with no artists",
+      running.lead_artist({"artists": []}), None)
 
 # --- the credited search cache: only answers are kept --------------------
 class FakeSp:

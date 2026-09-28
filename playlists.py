@@ -226,7 +226,8 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
         ),
         judged AS (
             SELECT *,
-                   coalesce(remix_credit(track_name), artist_name) AS judge,
+                   coalesce(remix_credit(track_name, artist_name), artist_name)
+                       AS judge,
                    song_key(track_name) AS song_key
             FROM recent
         ),
@@ -427,10 +428,10 @@ def _title_key(name: str) -> str:
 
 
 def _register_udf(con: duckdb.DuckDBPyConnection, name: str, fn,
-                  null_handling: str = "default") -> None:
+                  null_handling: str = "default", n_args: int = 1) -> None:
     if not con.execute("SELECT count(*) FROM duckdb_functions() "
                        "WHERE function_name = ?", [name]).fetchone()[0]:
-        con.create_function(name, fn, ["VARCHAR"], "VARCHAR",
+        con.create_function(name, fn, ["VARCHAR"] * n_args, "VARCHAR",
                             null_handling=null_handling)
 
 
@@ -445,10 +446,19 @@ def register_song_key(con: duckdb.DuckDBPyConnection) -> None:
 
 
 def register_remix_credit(con: duckdb.DuckDBPyConnection) -> None:
-    """remix_credit(title) in SQL — credits.remix_credit itself, so the anchor
-    judge parses a title exactly as Stage 1b does. NULL when the title names
-    no remixer, hence null_handling='special'."""
-    _register_udf(con, "remix_credit", remix_credit, null_handling="special")
+    """remix_credit(title, album_artist) in SQL — credits.remix_credit itself,
+    so the anchor judge parses a title exactly as Stage 1b does. The album
+    artist is what keeps "(Taylor's Version)" from naming "Taylor". NULL when
+    the title names no remixer, hence null_handling='special'."""
+    _register_udf(con, "remix_credit", remix_credit, null_handling="special",
+                  n_args=2)
+
+
+def lead_artist(track: dict) -> str | None:
+    """A Spotify track's first-credited artist: the album artist remix_credit
+    needs to tell a self-version from a remix on a search result."""
+    artists = track.get("artists") or []
+    return (artists[0] or {}).get("name") if artists else None
 
 
 def mb_genre_recordings(http: Throttled, artist_mbid: str, tags: list[str],
@@ -540,7 +550,7 @@ def candidate_led(tracks: list[dict], artist: str,
     out = []
     for t in tracks:
         ids = [a.get("id") for a in t.get("artists") or []]
-        rc = remix_credit(t.get("track_name") or "")
+        rc = remix_credit(t.get("track_name") or "", lead_artist(t))
         # The remixer clause still wants the pinned id ON the record: the
         # title's name folds like a namesake's ("Big Tune - DEM2 Remix" is not
         # Dem 2's), and only the id tells them apart.
@@ -570,7 +580,7 @@ def discovery_eligible(tracks: list[dict], artist: str) -> list[dict]:
         title = t.get("track_name") or ""
         if is_live(title):
             continue
-        rc = remix_credit(title)
+        rc = remix_credit(title, lead_artist(t))
         if rc and normalise(rc) != me:
             continue
         out.append(t)
