@@ -202,6 +202,69 @@ check("a cached candidate spends no search", sp2.calls, [])
 check("...and selects the same tracks",
       uris(again[0]["tracks"]), uris(sels[0]["tracks"]))
 
+# --- a quota lockout stops the searching, not the cache --------------------
+# Failed searches are rightly never cached, so under a lockout every uncached
+# candidate used to be asked again — two requests and a sleep each, in every
+# playlist — and each ask pushed the lockout further out. Two playlists, three
+# uncached candidates and one cached one (RUNN, from the runs above).
+con.execute("""
+CREATE OR REPLACE TABLE genre_gaps AS SELECT * FROM (VALUES
+  ('indie', 0.0005, 30.0, 12, 0.9), ('garage', 0.0004, 20.0, 8, 0.8)
+) t(tag, gap_score, hours, n_artists, rel_change_per_year)""")
+con.execute("""
+CREATE OR REPLACE TABLE recommendations AS SELECT * FROM (VALUES
+  ('Locked A', 'm-la', 0.99), ('Locked B', 'm-lb', 0.98),
+  ('RUNN', 'm-runn', 0.9), ('Locked C', 'm-lc', 0.5)
+) t(artist_name, mbid, score)""")
+with (config.CACHE_DIR / "candidate_tags.jsonl").open("w", encoding="utf-8") as fh:
+    for mbid in ("m-la", "m-lb", "m-runn", "m-lc"):
+        fh.write(json.dumps({"mbid": mbid, "tags": [
+            {"tag": "indie", "count": 3}, {"tag": "garage", "count": 3}]}) + "\n")
+
+
+class FailingSp:
+    """Every search fails. `locked`: still 429 after the client's retry, which
+    is what Spotify.rate_limited records; otherwise an ordinary 5xx."""
+    def __init__(self, locked):
+        self.locked, self.calls, self.rate_limited = locked, [], False
+    def get(self, path, params=None):
+        self.calls.append(params["q"])
+        if self.locked:
+            self.rate_limited = True
+            return {"_status": 429, "_body": "rate limited"}
+        return {"_status": 503, "_body": "unavailable"}
+
+
+def run_failing(locked):
+    sp = FailingSp(locked)
+    out = io.StringIO()
+    playlists.mb_genre_recordings = lambda http, mbid, tags, cache: set()
+    try:
+        with contextlib.redirect_stdout(out):
+            sels = playlists.build_selections(con, NoNetwork(), sp)
+    finally:
+        playlists.mb_genre_recordings = saved
+    return sp, sels, out.getvalue()
+
+
+cache_before = playlists.SP_TRACKS_CREDITED_CACHE.read_text(encoding="utf-8")
+sp, sels, printed = run_failing(locked=True)
+check("a lockout costs one search for the whole run, not one per candidate",
+      sp.calls, ['artist:"Locked A"'])
+check("...the cache still serves every playlist",
+      [[t["track_name"] for t in s["tracks"] if t["slot"] == "discovery"]
+       for s in sels],
+      [["Wires - RUNN Remix", "Falling Apart"]] * 2)
+check("...the stop is said once", printed.count("no more searches"), 1)
+check("...and the failure is not cached",
+      playlists.SP_TRACKS_CREDITED_CACHE.read_text(encoding="utf-8"),
+      cache_before)
+
+sp, _, printed = run_failing(locked=False)
+check("an ordinary failure stops nothing: each playlist asks again",
+      sp.calls, ['artist:"Locked A"', 'artist:"Locked B"', 'artist:"Locked C"'] * 2)
+check("...and says nothing about a lockout", "no more searches" in printed, False)
+
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)
 print("all assertions passed")

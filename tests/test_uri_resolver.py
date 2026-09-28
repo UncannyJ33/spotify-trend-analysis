@@ -190,6 +190,8 @@ sp = playlists.Spotify("tok")
 check("429 is retried", sp.get("/search"), {"ok": True})
 check("Retry-After honoured", 3 in slept, True)
 check("retry actually re-issued the request", len(calls), 2)
+check("a 429 the retry clears does not mark the client rate-limited",
+      sp.rate_limited, False)
 
 # A bad Retry-After must not hang the run.
 slept.clear()
@@ -197,10 +199,24 @@ seq = [_R(429, {"Retry-After": "99999"}), _R(200)]
 playlists.Spotify("tok").get("/search")
 check("absurd Retry-After is capped", max(slept) <= 30, True)
 
+# Still 429 after the one wait: a quota lockout. The envelope says so and the
+# client remembers it, so Stage 8 stops searching instead of spending the
+# lockout on more 429s.
+calls.clear()
+seq = [_R(429, {"Retry-After": "3"}), _R(429, {"Retry-After": "3"})]
+playlists.requests.request = lambda m, u, **kw: (calls.append((m, u)), seq.pop(0))[1]
+sp = playlists.Spotify("tok")
+check("a 429 that outlives the retry returns a 429 envelope",
+      sp.get("/search")["_status"], 429)
+check("...after exactly one retry", len(calls), 2)
+check("...and marks the client rate-limited", sp.rate_limited, True)
+
 # 4xx comes back as an inspectable envelope, not an exception and not None.
 playlists.requests.request = lambda m, u, **kw: _R(404, body="gone")
-env = playlists.Spotify("tok").get("/playlists/nope")
+sp = playlists.Spotify("tok")
+env = sp.get("/playlists/nope")
 check("error returns an envelope", env["_status"], 404)
+check("an ordinary error is not a rate limit", sp.rate_limited, False)
 
 # A network failure returns None rather than raising into the caller.
 def _boom(*a, **k):

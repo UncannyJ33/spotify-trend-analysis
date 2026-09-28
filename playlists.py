@@ -619,14 +619,18 @@ class Spotify:
     """Thin bearer-token client.
 
     429s are honoured — Spotify's Retry-After is real, unlike MusicBrainz's —
-    but capped, so a bad header cannot park a run for hours. There is
-    deliberately NO delete verb: this stage must never be able to remove a
-    playlist, and the cheapest way to guarantee that is to not implement it.
+    but capped, so a bad header cannot park a run for hours. A 429 that is
+    still a 429 after that one wait sets `rate_limited`: the app is locked out,
+    not briefly throttled, and every further request only extends the lockout.
+    build_selections stops searching on it. There is deliberately NO delete
+    verb: this stage must never be able to remove a playlist, and the cheapest
+    way to guarantee that is to not implement it.
     """
 
     def __init__(self, token: str):
         self.h = {"Authorization": f"Bearer {token}"}
         self._last = 0.0
+        self.rate_limited = False
 
     def _wait(self):
         gap = SP_MIN_INTERVAL - (time.monotonic() - self._last)
@@ -649,6 +653,8 @@ class Spotify:
                     hinted = 1
                 time.sleep(min(hinted, 30))
                 continue
+            if r.status_code == 429:
+                self.rate_limited = True
             if r.status_code >= 400:
                 return {"_status": r.status_code, "_body": r.text[:200]}
             return r.json() if r.text else {}
@@ -926,6 +932,14 @@ def build_selections(con, http, sp) -> list[dict]:
     they lead or remixed (candidate_led — a feature is not their record), drop
     live recordings and other people's remixes (discovery_eligible), then
     choose_tracks. Every filter keeps relevance order.
+
+    A quota lockout stops the SEARCHING, not the run. A failed search is never
+    cached, so without a stop every uncached candidate was asked again — two
+    requests and a sleep each, in every playlist — and each ask pushed the
+    lockout further out. Once the client reports a 429 that outlived its retry
+    (Spotify.rate_limited), only candidates the shared cache already answers
+    are considered. A single 5xx or network error does not stop anything: that
+    is one request failing, not the app being locked out.
     """
     tag_cache = load_jsonl(config.CACHE_DIR / "candidate_tags.jsonl", "mbid")
     genre_rec_cache = load_jsonl(GENRE_RECORDINGS_CACHE, "key")
@@ -949,8 +963,15 @@ def build_selections(con, http, sp) -> list[dict]:
             if len(discovery) >= config.PLAYLIST_SIZE:   # enough material
                 break
             name = cand["artist_name"]
-            pinned_id, tracks = pin_artist_id(
-                sp_artist_tracks_credited(sp, name, credited_cache), name)
+            locked = getattr(sp, "rate_limited", False)
+            if locked and normalise(name) not in credited_cache:
+                continue                       # a cached answer is still free
+            hits = sp_artist_tracks_credited(sp, name, credited_cache)
+            if not locked and getattr(sp, "rate_limited", False):
+                print("  ⚠ Spotify still answers 429 after a retry — no more "
+                      "searches this run, cached artists only. Re-run once "
+                      "the quota has recovered.")
+            pinned_id, tracks = pin_artist_id(hits, name)
             tracks = discovery_eligible(candidate_led(tracks, name, pinned_id),
                                         name)
             if not tracks:
