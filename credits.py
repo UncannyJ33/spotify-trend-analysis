@@ -44,6 +44,7 @@ Output: data/track_credits.parquet
 from __future__ import annotations
 
 import argparse
+import re
 
 import duckdb
 
@@ -112,6 +113,29 @@ REMIX_FORMAT_STOPLIST = frozenset({
 # A capture that is only digits and punctuation is a year or a catalogue
 # fragment, not a name.
 REMIX_NON_NAME_RE = r'^[0-9\s\-\.,:]+$'
+
+
+def remix_credit(title: str) -> str | None:
+    """The remixer a title names, by Stage 1b's own rule, for Python callers.
+
+    The same REMIX_CREDIT_RE and the same two guards the `remixers` CTE in
+    build_track_credits applies, so a title parses the same way in Stage 8's
+    anchor judge and Stage 10's routing as it does in track_credits: "Bounce -
+    Radio Edit" names a format rather than a person, and "Song - 2019 Remix"
+    names a year. The pattern sits inside what both RE2 and Python accept.
+
+    It lives here rather than in either consumer because Stage 10 imports
+    Stage 8: a copy in running.py could not be reached from playlists.py
+    without a circular import.
+    """
+    m = re.search(REMIX_CREDIT_RE, title or "", re.IGNORECASE)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    if (not name or name.lower() in REMIX_FORMAT_STOPLIST
+            or re.match(REMIX_NON_NAME_RE, name) or " - " in name):
+        return None
+    return name
 
 
 def _re2_escape(name: str) -> str:

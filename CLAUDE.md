@@ -65,12 +65,14 @@ fail silently — no listening time created or lost, no double-counted performer
 
 **Scripts, not a library.** Each stage is a standalone module with `main()`, argparse flags, and a
 `report()`. Stages import each other only to reuse, never to copy: `recommend` ← `enrich`;
-`forecast` ← `analyze`; `playlists` ← `enrich`, `recommend`, `report`, `poll`; `consolidate` ←
-`enrich`, `playlists`, `poll`; `running` ← `consolidate`, `credits` (the remix regex and its guards),
-`enrich`, `playlists`, `recommend`, `report`; `capture` ← `consolidate` (`read_playlist`, whose
-`duration_ms` key Stage 11 depends on), `playlists`, `poll`; `app` ← `recommend` (the λ dial). A second copy is how
-two definitions of one idea drift apart — `running.register_song_key` registers
-`playlists._title_key` itself as a DuckDB function rather than re-spelling it in SQL.
+`forecast` ← `analyze`; `playlists` ← `credits` (`remix_credit`), `enrich`, `recommend`, `report`,
+`poll`; `consolidate` ← `enrich`, `playlists`, `poll`; `running` ← `consolidate`, `credits` (the
+remix regex and `remix_credit`), `enrich`, `playlists`, `recommend`, `report`; `capture` ←
+`consolidate` (`read_playlist`, whose `duration_ms` key Stage 11 depends on), `playlists`, `poll`;
+`app` ← `recommend` (the λ dial). A second copy is how two definitions of one idea drift apart —
+`playlists.register_song_key` registers `playlists._title_key` itself as a DuckDB function rather
+than re-spelling it in SQL, and Stage 10 imports it; `credits.remix_credit` is Stage 1b's remix rule
+in Python, and Stages 8 and 10 both import it.
 
 **`config.py` is the only place paths and tuning constants are defined.** Every stage imports it.
 Paths are overridable via same-named environment variables (`SPOTIFY_EXPORT_DIR`, `SPOTIFY_DATA_DIR`,
@@ -250,16 +252,46 @@ correct.
   which recordings are on-genre. MusicBrainz's own ordering is Lucene relevance and is useless for
   ranking — ask it for Aphex Twin's techno and a SAW:II bootleg fragment comes first. `choose_tracks`
   applies the genre flag as a *stable* sort key so relevance survives inside each group.
-- **Anchors gate on `tag_count`, candidates do not.** `MIN_TAG_COUNT_FOR_ANCHOR` keeps an artist out
-  of a playlist unless MusicBrainz shows real community support for that genre. Counts go negative on
-  downvotes and Stage 2 clamps them at 0, so 0 means "nobody stands behind this" — REAPER carries
-  `heavy metal` at 0 and anchored a metal playlist on it. The floor costs ~5% of genre rows (531 of
-  9,943, across 245 artists), which is the price of not putting a track the listener already knows
-  into a genre it does not belong to.
-- **A playlist spec's `tags` is a list, and every consumer must treat it as one.** `select_anchor_tracks`
-  semi-joins so an artist carrying three of the tags stays one artist rather than three copies of its
-  listening time; `mb_genre_recordings` sends one Lucene `OR` rather than one request per tag, and
-  sorts the tags into its cache key so `a|b` and `b|a` do not fork the cache.
+- **Stage 8 anchors and strangers clear one bar: a share, then a floor.** `playlists.serving_sql`
+  admits an artist when the spec's tags hold at least `ANCHOR_MIN_TAG_SHARE` (0.25) of its whole genre
+  weight, AND one spec tag reaches `MIN_TAG_COUNT_FOR_ANCHOR`. Its `greatest(tag_count, 0)` clamps are
+  load-bearing — `artist_tags` keeps negative counts (163 genre rows, to -6) — and a test pins them.
+  Carrying a tag is not serving a genre: under "any spec tag", Halsey (indie pop 3 of 32) and Ellie
+  Goulding (indie pop + indie folk 5 of 31) — pop, and heavily played — took four of six indie
+  anchors. The floor keeps its old job: 0 means "nobody stands behind this", and REAPER anchored a
+  metal playlist on `heavy metal` at 0. 0.25 keeps Metallica (heavy metal 42 of 164, outvoted by
+  thrash metal) and costs The Killers (0.17) and The White Stripes (0.19) their indie rock anchors —
+  known and accepted. Discovery candidates run through the SAME SQL, so a stranger never clears less
+  than a library artist. That cut the garage and heavy metal stranger pools from 18 to 5 and 28 to 5.
+  Mostly off-label (Röyksopp, Pendulum, Papa Roach, Deftones), but Megadeth (0.23, outvoted by thrash
+  metal), Pantera (0.21, groove metal) and Rainbow (0.19, hard rock) went too — the split Metallica
+  survives at 0.26. Do not loosen the bar to refill them — widen the spec (`heavy metal|thrash
+  metal|speed metal|groove metal` brings back Megadeth, Pantera and Slayer) or fix Stage 5's supply.
+  The bar judges against the spec as written and cannot repair an adjacent tag in it: with `electro
+  house` in the garage spec, four of five garage strangers (Boys Noize, the classic false "speed
+  garage") and The Chainsmokers' anchors qualify on electro or tech house alone.
+- **A Stage 8 anchor is judged on the remixer its title names, else the album artist.**
+  `credits.remix_credit` is Stage 1b's rule in Python — one definition, which Stage 10 imports too —
+  and it reads the TITLE, never `credit_type`, because credits.py types every non-first poller artist
+  as `featured`, remixers included. "Colors - Ian Asher Remix" anchored indie as a Halsey track and
+  "I Was Made For Lovin' You - Disco Lines Remix" anchored heavy metal as KISS. A remixer with no genre
+  tags leaves the track unable to anchor; falling back to the original artist would have put "Sweet
+  Disposition - John Summit & Silver Panda Remix" in indie rock. That also catches Stage 1b's
+  mis-parses, silently: "Robin Schulz Radio" (from `- Robin Schulz Radio Edit`), "A-Trak Remix Radio",
+  "Eric Prydz Private", "Vocal", "TikTok", "2024 Remastered" have no tags, so those tracks cannot
+  anchor at all. The fix belongs in Stage 1b, SQL and `remix_credit` together (strip trailing
+  Radio/Club/Remix/Private tokens, widen `REMIX_FORMAT_STOPLIST`), never a Stage 8 fallback. The
+  per-artist cap stays keyed on the album artist, as in Stage 10.
+- **One song, one anchor, within a playlist and across the run.** Within a playlist the key is
+  (album artist, `song_key`), so two pressings — Solo Kei's "cowboy killers" is two URIs — or an
+  original and its remix do not both take anchor slots. Across playlists `select_run_anchors` carries
+  (judge, `song_key`) forward and the first playlist in build order keeps the song; "cowboy killers"
+  otherwise anchors indie AND indie rock. The judge is in the cross-playlist key so a remix anchoring
+  garage does not keep its original out of indie — the line Stage 10's `Placements` draws.
+- **A playlist spec's `tags` is a list, and every consumer must treat it as one.** `serving_sql` sums
+  the spec's tags per artist, so an artist carrying three of them stays one artist rather than three
+  copies of its listening time; `mb_genre_recordings` sends one Lucene `OR` rather than one request per
+  tag, and sorts the tags into its cache key so `a|b` and `b|a` do not fork the cache.
 - **`public: false` does not work, and Stage 8's playlists are link-readable.** Spotify accepts the
   field on create, reports `public: true` regardless, and a later `PUT {"public": false}` returns 200
   without changing it. They stay off the server-rendered public profile page, but any playlist is

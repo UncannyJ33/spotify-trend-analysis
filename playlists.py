@@ -5,8 +5,10 @@
 
 One playlist per under-explored rising genre (Stage 7's gap analysis), capped
 at N_PLAYLISTS. Each mixes ANCHOR_TRACKS familiar tracks — the listener's own
-recent plays by library artists serving that genre — with discovery tracks
-from Stage 5's candidate artists.
+recent plays that serve that genre, judged on the remixer where the title
+names one — with discovery tracks from Stage 5's candidate artists. Anchors and
+strangers clear the same bar: the genre's share of the artist's whole tag
+weight (serving_sql), not the mere presence of a tag.
 
 Two sources split the judgment. Spotify's search relevance ORDERS an artist's
 tracks — with ListenBrainz's popularity dataset disabled it is the only
@@ -39,6 +41,7 @@ import duckdb
 import requests
 
 import config
+from credits import remix_credit
 from enrich import MB_MIN_INTERVAL, Throttled, normalise
 from recommend import append_jsonl, load_jsonl
 from report import pretty
@@ -111,29 +114,92 @@ def select_gaps(con: duckdb.DuckDBPyConnection, limit: int | None = -1) -> list[
     return [dict(zip(cols, r)) for r in rows]
 
 
-def select_anchor_tracks(con: duckdb.DuckDBPyConnection,
-                         tags: list[str]) -> list[dict]:
-    """The listener's own recent favourites by artists serving these genres.
+def serving_sql(tags_rel: str, key: str, n_tags: int) -> str:
+    """The `key`s in `tags_rel` whose genre weight leans on a spec's tags.
+
+    Carrying a tag is not serving a genre. Halsey carries indie pop(3) beside
+    pop(6), electropop(4) and alternative pop(4); Ellie Goulding carries indie
+    pop(3) and indie folk(2) beside electropop(7) and dance-pop(5). A set test
+    ("any spec tag") admitted both, they are heavily played, and they took the
+    top anchor slots of an indie playlist. So an artist serves the spec only
+    when the spec's tags hold at least ANCHOR_MIN_TAG_SHARE of their whole
+    genre weight — Halsey's is 0.09, Ellie Goulding's 0.16 — AND one of those
+    tags clears MIN_TAG_COUNT_FOR_ANCHOR, the floor that says somebody stands
+    behind it. The greatest(tag_count, 0) clamps are load-bearing, not a
+    repeat: artist_tags keeps MusicBrainz's negative counts (163 genre rows,
+    down to -6; only Stage 3 and the candidate cache clamp their own copies).
+    Unclamped, a downvote elsewhere shrinks the denominator — spec 1 beside
+    5 and -2 reads 0.25 instead of 0.17 — and a downvoted spec tag cancels a
+    real one. Do not delete them as redundant.
+
+    ONE definition for both sides — library anchors over artist_tags and
+    strangers over the candidate tag cache — so a stranger can never clear
+    less than a library artist does. `tags_rel` must expose (key, tag,
+    tag_count) restricted to genres; bind the spec's tags TWICE, in order.
+    """
+    ph = ", ".join("?" for _ in range(n_tags))
+    return f"""
+        SELECT {key}
+        FROM {tags_rel}
+        GROUP BY {key}
+        HAVING sum(CASE WHEN tag IN ({ph}) THEN greatest(tag_count, 0) ELSE 0 END)
+               / nullif(sum(greatest(tag_count, 0)), 0)
+                   >= {config.ANCHOR_MIN_TAG_SHARE}
+           AND max(CASE WHEN tag IN ({ph}) THEN tag_count END)
+                   >= {config.MIN_TAG_COUNT_FOR_ANCHOR}
+    """
+
+
+def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
+                         taken: set[tuple[str, str]] | None = None) -> list[dict]:
+    """The listener's own recent favourites that serve these genres.
 
     `tags` is a list because a playlist may span several related genres — an
     indie playlist wants indie pop and indie folk together, and a bass one
-    wants dubstep alongside its neighbours. The artist qualifies if it carries
-    ANY of them, matched by a semi-join so an artist carrying three of the
-    tags is still one artist rather than three copies of its listening time.
+    wants dubstep alongside its neighbours. The spec's tags are weighed
+    together, per artist, so an artist carrying three of them is still one
+    artist rather than three copies of its listening time.
 
-    Anchors are chosen at artist level and at track level by the listener's own
-    recent play time — their URIs come straight from the export, so no search
-    is ever needed for anchors. Recording-level genre matching is NOT attempted
-    here: library tracks have no recording MBIDs, and resolving them is the
-    per-track explosion this project has twice declined.
+    WHO JUDGES A TRACK. The remixer its title names (credits.remix_credit,
+    Stage 1b's own rule), else the album artist. The export bills a remix to
+    the ORIGINAL artist, so "Colors - Ian Asher Remix" and "Without Me -
+    ILLENIUM Remix" were judged as Halsey tracks and anchored indie, and "I Was
+    Made For Lovin' You - Disco Lines Remix" anchored heavy metal as KISS. It
+    is read from the TITLE, not from track_credits.credit_type: credits.py
+    types every non-first poller artist as `featured`, so the polled pressing
+    of "Black Out Days - Subtronics Remix" has Subtronics as a feature. A
+    remixer with no genre tags leaves the track unable to anchor at all — the
+    original artist's genre is exactly the wrong answer for a remix.
 
-    MIN_TAG_COUNT_FOR_ANCHOR gates on community support. A tag clamped to 0 is
-    one nobody stands behind, and it used to be enough to anchor a playlist.
+    WHAT QUALIFIES. serving_sql: the judge's weight on the spec's tags as a
+    share of their whole genre weight, plus the MIN_TAG_COUNT_FOR_ANCHOR floor.
+
+    ONE SONG, ONE ANCHOR. Spotify presses the album cut, the single and the
+    remaster as distinct URIs, and the dry run anchored Solo Kei's "cowboy
+    killers" twice in one playlist. Within a playlist the key is (album
+    artist, song key), so an original and its remix do not both take anchor
+    slots. `taken` holds the (judge, song key) pairs earlier playlists in the
+    same run placed (select_run_anchors) — the same song used to anchor indie
+    AND indie rock — and the first playlist to claim one keeps it. That key
+    keeps a remix apart from its original, so a remix anchoring garage does
+    not keep the original out of the playlist it belongs in; Stage 10's
+    Placements draws the same line. Taken songs go before dedupe and dedupe
+    before the per-artist cap, so a freed slot passes to a different song
+    instead of being lost.
+
+    Tracks rank by the listener's own recent play time — their URIs come
+    straight from the export, so no search is ever needed for anchors.
+    Recording-level genre matching is NOT attempted here: library tracks have
+    no recording MBIDs, and resolving them is the per-track explosion this
+    project has twice declined. The per-artist cap stays on the ALBUM artist,
+    as in Stage 10.
     """
     if not tags:
         return []
-    cols = ["artist_name", "track_name", "spotify_track_uri", "hours"]
-    placeholders = ", ".join("?" for _ in tags)
+    register_song_key(con)
+    register_remix_credit(con)
+    cols = ["artist_name", "judge", "track_name", "spotify_track_uri", "hours",
+            "song_key"]
     rows = con.execute(
         f"""
         WITH recent AS (
@@ -145,50 +211,99 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection,
               -- export's coverage would slide the window forward.
               AND p.month >= {config.ANALYSIS_HORIZON_SQL}
                              - INTERVAL {config.ANCHOR_WINDOW_MONTHS} MONTH
-              AND EXISTS (
-                  SELECT 1 FROM artist_tags t
-                  WHERE t.artist_name = p.artist_name
-                    AND t.is_genre
-                    AND t.tag_count >= {config.MIN_TAG_COUNT_FOR_ANCHOR}
-                    AND t.tag IN ({placeholders})
-              )
             GROUP BY 1, 2, 3
+        ),
+        judged AS (
+            SELECT *,
+                   coalesce(remix_credit(track_name), artist_name) AS judge,
+                   song_key(track_name) AS song_key
+            FROM recent
+        ),
+        serving AS (
+            {serving_sql("(SELECT artist_name, tag, tag_count FROM artist_tags "
+                         "WHERE is_genre)", "artist_name", len(tags))}
+        ),
+        fresh AS (
+            SELECT j.*
+            FROM judged j
+            JOIN serving s ON s.artist_name = j.judge
+            WHERE NOT list_contains(?::VARCHAR[][], [j.judge, j.song_key])
+        ),
+        one_per_song AS (
+            SELECT * FROM fresh
+            QUALIFY row_number() OVER (
+                PARTITION BY artist_name, song_key
+                ORDER BY hours DESC, spotify_track_uri
+            ) = 1
         )
-        SELECT artist_name, track_name, spotify_track_uri, hours
-        FROM recent
+        SELECT {', '.join(cols)}
+        FROM one_per_song
         QUALIFY row_number() OVER (
             PARTITION BY artist_name ORDER BY hours DESC, spotify_track_uri
         ) <= {config.TRACKS_PER_ARTIST}
         ORDER BY hours DESC, spotify_track_uri
         LIMIT {config.ANCHOR_TRACKS}
         """,
-        list(tags),
+        [*tags, *tags, sorted([list(k) for k in taken or ()])],
     ).fetchall()
     return [dict(zip(cols, r)) for r in rows]
 
 
+def select_run_anchors(con: duckdb.DuckDBPyConnection,
+                       specs: list[dict]) -> list[list[dict]]:
+    """Anchors for every playlist in build order, each song anchoring once.
+
+    Playlists that share a genre neighbourhood share artists — Solo Kei
+    carries indie pop and indie rock at a third each — and each playlist
+    picking alone anchored "cowboy killers" in both. `taken` carries (judge,
+    song key) forward, so the first playlist to claim a song keeps it and the
+    next moves on down its own list.
+    """
+    taken: set[tuple[str, str]] = set()
+    out = []
+    for spec in specs:
+        anchors = select_anchor_tracks(con, spec["tags"], taken)
+        taken |= {(a["judge"], a["song_key"]) for a in anchors}
+        out.append(anchors)
+    return out
+
+
 def select_candidates(con: duckdb.DuckDBPyConnection, tags: list[str],
                       tag_cache: dict) -> list[dict]:
-    """Stage 5 candidates whose tag vector serves any of these genres.
+    """Stage 5 candidates whose tag vector serves these genres.
 
     Library artists are excluded by normalised name: the discovery slots are
     for strangers, and the familiar ones already have the anchor slots.
+
+    A stranger must clear the bar a library anchor clears — serving_sql, the
+    same share and the same floor — and never less. Nobody has vouched for a
+    stranger, which is why Stage 10 gates them harder still. Under the old
+    "any spec tag" rule the heavy metal playlist filled with Papa Roach
+    (heavy metal 1 of 26), Deftones (1 of 60) and Rage Against the Machine
+    (1 of 39), and garage with Röyksopp (1 of 35) and Pendulum (1 of 52).
     """
-    wanted = set(tags)
+    if not tags:
+        return []
     known = {normalise(r[0]) for r in con.execute(
         "SELECT DISTINCT artist_name FROM plays WHERE artist_name IS NOT NULL"
     ).fetchall()}
     rows = con.execute(
         "SELECT artist_name, mbid, score FROM recommendations ORDER BY score DESC"
     ).fetchall()
-    out = []
-    for name, mbid, score in rows:
-        if normalise(name) in known:
-            continue
-        got = {t["tag"] for t in (tag_cache.get(mbid) or {}).get("tags", [])}
-        if got & wanted:
-            out.append({"artist_name": name, "mbid": mbid, "score": score})
-    return out
+    con.execute("CREATE OR REPLACE TEMP TABLE _candidate_tags "
+                "(mbid VARCHAR, tag VARCHAR, tag_count INTEGER)")
+    vectors = {(mbid, t.get("tag"), t.get("count"))
+               for _, mbid, _ in rows
+               for t in (tag_cache.get(mbid) or {}).get("tags", [])}
+    if vectors:
+        con.executemany("INSERT INTO _candidate_tags VALUES (?, ?, ?)",
+                        list(vectors))
+    serving = {r[0] for r in con.execute(
+        serving_sql("_candidate_tags", "mbid", len(tags)), [*tags, *tags]
+    ).fetchall()}
+    return [{"artist_name": name, "mbid": mbid, "score": score}
+            for name, mbid, score in rows
+            if normalise(name) not in known and mbid in serving]
 
 
 def load_playlist_specs(con: duckdb.DuckDBPyConnection) -> list[dict]:
@@ -298,6 +413,31 @@ def _title_key(name: str) -> str:
     """
     head = re.split(r"\s+[-–—(\[]", name or "", maxsplit=1)[0]
     return normalise(head) or normalise(name or "")
+
+
+def _register_udf(con: duckdb.DuckDBPyConnection, name: str, fn,
+                  null_handling: str = "default") -> None:
+    if not con.execute("SELECT count(*) FROM duckdb_functions() "
+                       "WHERE function_name = ?", [name]).fetchone()[0]:
+        con.create_function(name, fn, ["VARCHAR"], "VARCHAR",
+                            null_handling=null_handling)
+
+
+def register_song_key(con: duckdb.DuckDBPyConnection) -> None:
+    """song_key(title) in SQL — _title_key itself, not a copy.
+
+    Its normalise() folds accents through NFKD and drops "the" and "and",
+    which DuckDB cannot reproduce, and a second definition is exactly how two
+    keys for one idea drift apart. Stage 10 imports this one.
+    """
+    _register_udf(con, "song_key", _title_key)
+
+
+def register_remix_credit(con: duckdb.DuckDBPyConnection) -> None:
+    """remix_credit(title) in SQL — credits.remix_credit itself, so the anchor
+    judge parses a title exactly as Stage 1b does. NULL when the title names
+    no remixer, hence null_handling='special'."""
+    _register_udf(con, "remix_credit", remix_credit, null_handling="special")
 
 
 def mb_genre_recordings(http: Throttled, artist_mbid: str, tags: list[str],
@@ -640,12 +780,12 @@ def build_selections(con, http, sp) -> list[dict]:
     artist_tracks_cache = load_jsonl(ARTIST_TRACKS_CACHE, "key")
 
     out = []
-    for spec in load_playlist_specs(con):
+    specs = load_playlist_specs(con)
+    for spec, anchors in zip(specs, select_run_anchors(con, specs)):
         tags = spec["tags"]
         blend = "" if tags == [spec["label"]] else f"  [{' + '.join(tags)}]"
         print(f"\n{pretty(spec['label'])}"
               f"{' (pinned)' if spec['pinned'] else ''}{blend}")
-        anchors = select_anchor_tracks(con, tags)
         print(f"  {len(anchors)} anchors from your own listening")
 
         seen_uris = {a["spotify_track_uri"] for a in anchors}

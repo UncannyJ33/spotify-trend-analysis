@@ -75,7 +75,7 @@ import duckdb
 
 import config
 from consolidate import find_playlist, gentle_token, read_playlist
-from credits import REMIX_CREDIT_RE, REMIX_FORMAT_STOPLIST, REMIX_NON_NAME_RE
+from credits import REMIX_CREDIT_RE, remix_credit
 from enrich import MB_MIN_INTERVAL, Throttled, load_genre_vocabulary, normalise
 from playlists import (
     FORBIDDEN_NOTE,
@@ -89,6 +89,7 @@ from playlists import (
     ensure_playlist,
     mb_genre_recordings,
     playlist_items,
+    register_song_key,
     write_archive,
 )
 from recommend import (
@@ -179,18 +180,6 @@ def version_key_sql(col: str) -> str:
     return (f"coalesce(nullif(regexp_replace(lower(regexp_replace("
             f"{col}, '{note}', '', 'g')), '{fold}', '', 'g'), ''), "
             f"regexp_replace(lower({col}), '{fold}', '', 'g'))")
-
-
-def register_song_key(con: duckdb.DuckDBPyConnection) -> None:
-    """song_key(title) in SQL — playlists._title_key itself, not a copy.
-
-    Its normalise() folds accents through NFKD and drops "the" and "and",
-    which DuckDB cannot reproduce, and a second definition is exactly how two
-    keys for one idea drift apart.
-    """
-    if not con.execute("SELECT count(*) FROM duckdb_functions() "
-                       "WHERE function_name = 'song_key'").fetchone()[0]:
-        con.create_function("song_key", _title_key, ["VARCHAR"], "VARCHAR")
 
 
 class Placements:
@@ -1100,24 +1089,6 @@ def drag_artists(con: duckdb.DuckDBPyConnection) -> set[str]:
     return {normalise(r[0]) for r in con.execute(
         "SELECT artist_name FROM artist_clusters "
         "WHERE drag_w > greatest(garage_w, bass_w)").fetchall()}
-
-
-def remix_credit(title: str) -> str | None:
-    """The remixer a title names, by Stage 1b's own rule.
-
-    credits.REMIX_CREDIT_RE and its two guards are imported, not copied, so a
-    title parses the same way here as it does in track_credits: "Bounce - Radio
-    Edit" names a format rather than a person, and "Song - 2019 Remix" names a
-    year. The pattern sits inside what both RE2 and Python accept.
-    """
-    m = re.search(REMIX_CREDIT_RE, title or "", re.IGNORECASE)
-    if not m:
-        return None
-    name = m.group(1).strip()
-    if (not name or name.lower() in REMIX_FORMAT_STOPLIST
-            or re.match(REMIX_NON_NAME_RE, name) or " - " in name):
-        return None
-    return name
 
 
 def gate_discovery(tracks: list[dict], cand: dict, pinned_id: str | None,
