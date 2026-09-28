@@ -336,6 +336,11 @@ correct.
   word (`Male Version`, `2017 Demo`, `dnb edit`); it applies to both forms, and 25 dash tracks /
   233 min had been crediting "Drill", "Summer", "TikTok" and "VIP" as performers. The dash form's
   own parse is otherwise untouched: `- Tiësto's Big Room Remix` still yields "Tiësto's Big Room".
+  Two bracket credits still name nobody — `(Angel Mix)` is a named version, `(Hobbs & Shaw Remix)` a
+  film — and are left to `artist_overrides.csv`, not the stoplist, which holds format words only.
+  "Junk degrades to a review row" holds only for junk that fails to resolve: a common word resolves
+  SILENTLY to whichever tagged namesake Stage 2 ranks first, never reaching the review list. "AWAY"
+  (`Undo - AWAY Remix`) already sits on a shoegaze band that way. Answer such names by hand.
   The rule exists twice — `credits.remix_credit` for Stages 8 and 10, `remixers_sql` inside
   `build_track_credits` — and `test_bracket_remix_credits.py` holds them to one answer per title.
   Stage 10's routing calls `remix_credit` too; the dash regex it used to inline could not see brackets.

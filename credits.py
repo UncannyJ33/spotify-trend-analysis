@@ -131,8 +131,12 @@ REMIX_POSSESSIVE_RE = r"^(.+?)['’]s(?:\s.*)?$"
 # 102 minutes, "- TikTok Version" credited "TikTok". Every word here comes from
 # a real title in this library, bar the obvious pairs (female, lo-fi) and the
 # garage and techno edits a dance library will meet; a type word alone ("VIP
-# Mix") names nobody. Not "angel": "(Angel Mix)" may be a named version, but
-# Angel is also somebody's name, and Stage 2's review list is where it goes.
+# Mix") names nobody. Not "angel", nor any other name-shaped word: "(Angel
+# Mix)" is a named version, "(Hobbs & Shaw Remix)" a film, and a stoplist of
+# such words never ends. They are answered in artist_overrides.csv, and they
+# must be: Stage 2's review list will NOT catch a common word, because its
+# exact-name rule resolves "Angel" to whichever tagged namesake ranks first, as
+# it already resolved "- AWAY Remix" to a shoegaze band.
 REMIX_FORMAT_STOPLIST = frozenset({
     "radio", "extended", "club", "original", "instrumental", "album", "single",
     "acoustic", "live", "dance", "main", "bonus", "deluxe", "sped up", "slowed",
