@@ -133,9 +133,34 @@ PLAYLIST_OVERRIDES_CSV = _path_from_env(
 # support. MusicBrainz tag counts go negative on downvotes and Stage 2 clamps
 # them at 0, so a 0 means "nobody stands behind this tag" — REAPER carries
 # `heavy metal` at 0 and anchored a metal playlist on the strength of it.
-# Candidates are unaffected; this gates anchors only, where a wrong genre is
-# most visible because the listener already knows the track.
+# Discovery candidates face the same floor: a stranger must clear at least what
+# a library anchor clears (playlists.serving_sql holds both).
 MIN_TAG_COUNT_FOR_ANCHOR = 1
+
+# Carrying a genre is not serving it. An artist serves a playlist only when the
+# spec's tags hold at least this share of their whole genre weight (counts
+# clamped at 0), judged on the track's REMIXER where its title names one. The
+# old rule was "carries any spec tag", and it let Halsey (indie pop 3 of 32,
+# 0.09) and Ellie Goulding (indie pop + indie folk 5 of 31, 0.16) — both pop by
+# any listener's ear, both heavily played — take four of six indie anchors.
+#
+# 0.25 is read off this library. It drops Halsey 0.09, Ellie Goulding 0.16,
+# Fred again.. 0.19 and Calvin Harris 0.14 (garage), Led Zeppelin 0.04 and
+# Evanescence 0.05 (heavy metal), Fall Out Boy 0.02 and Tame Impala 0.05
+# (indie rock). It keeps Metallica 0.26 — heavy metal 42 split against thrash
+# metal 67, the closest call it has to make — Black Sabbath 0.44, John Summit
+# 0.50, NOTION 0.67, Lord Huron 0.50, Noah Kahan 0.43 and Myles Smith 0.50.
+# Its known cost: The Killers (indie rock 8 of 47, 0.17) and The White Stripes
+# (9 of 48, 0.19) stop anchoring indie rock, because MusicBrainz files them
+# first as alternative and garage rock. Anyone moving this should re-read
+# those two lists rather than the one example that prompted the move.
+#
+# The same bar applies to Stage 8's discovery candidates. It costs the
+# garage and heavy metal playlists most of their stranger pool (18 candidates
+# to 5, 28 to 5) — which is the point: the 13 and 23 it drops include
+# Röyksopp, Pendulum, Papa Roach and Deftones, none of them the genre on the
+# label. A short playlist beats a wrong one, as `assemble` already says.
+ANCHOR_MIN_TAG_SHARE = 0.25
 
 # The title marker is for the user's eyes in their own library: anything
 # carrying it is pipeline-managed and safe to regenerate; anything without it

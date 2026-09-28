@@ -486,8 +486,8 @@ shoegaze,shoegaze|dream pop
 ambient,ambient|drone|field recording
 ```
 
-`tags` is pipe-separated and an artist qualifies by carrying any of them, so a
-playlist can span related genres. That does two jobs: it blends genres that only
+`tags` is pipe-separated and weighed together — an artist's votes on any of
+them count toward the playlist — so a playlist can span related genres. That does two jobs: it blends genres that only
 make sense apart from each other, and it rescues a genre whose candidate pool is
 too thin to fill `PLAYLIST_SIZE` on its own. In the author's data one gap genre
 had just 6 candidate artists — a hard ceiling of 16 tracks at two per artist —
@@ -501,17 +501,39 @@ description, because several genres worth pinning are ones the history says
 you're moving away from — claiming they're rising would be a lie the playlist
 tells its owner every time they open it.
 
-Each is **anchored discovery**. Around five tracks are your own recent
-favourites by library artists who serve that genre — familiar ground, and their
-URIs come free from the export, so no lookup is needed. An anchor artist must
-carry the genre with a MusicBrainz tag count of at least
-`MIN_TAG_COUNT_FOR_ANCHOR`: counts go negative on downvotes and Stage 2 clamps
-them to zero, so a zero means nobody stands behind that tag. Without the floor,
-an electronic act carrying a metal tag at count 0 anchored a metal playlist.
+Each is **anchored discovery**. Up to six tracks are your own recent
+favourites that serve that genre — familiar ground, and their URIs come free from the
+export, so no lookup is needed. Three rules decide which:
 
-The rest are strangers, drawn from Stage 5's candidates. The anchors are spread
-at even intervals rather than stacked at the front: five songs you know followed
-by twenty you don't reads as two playlists stapled together.
+- **Serving a genre is a share, not a tag.** The playlist's tags must hold at
+  least `ANCHOR_MIN_TAG_SHARE` (a quarter) of the artist's whole MusicBrainz
+  genre weight, and one of them must reach `MIN_TAG_COUNT_FOR_ANCHOR` — counts
+  go negative on downvotes and Stage 2 clamps them to zero, so a zero means
+  nobody stands behind that tag. The share exists because "carries any of the
+  tags" let Halsey (indie pop 3 of 32 votes) and Ellie Goulding (5 of 31) — pop
+  by any ear, and heavily played — take four of six indie anchors. A quarter is
+  read off the author's library: it keeps Metallica, whose heavy metal (42) is
+  outvoted by thrash metal (67), and its known cost is The Killers and The White
+  Stripes, which MusicBrainz files first as alternative and garage rock and
+  which drop out of indie rock.
+- **A remix is judged on its remixer.** Spotify bills a remix to the original
+  artist, so "Colors - Ian Asher Remix" read as a Halsey track and anchored
+  indie, and a Disco Lines remix of KISS anchored heavy metal. The remixer named
+  in the title (Stage 1b's rule) judges the track instead; a remixer with no
+  genre tags means the track cannot anchor at all, rather than falling back to
+  the original artist's genres.
+- **One song, one anchor.** The album cut, the single and the remaster are
+  distinct URIs, so dedupe is on the folded title — within a playlist, and
+  across the run, where the first playlist to claim a song keeps it.
+
+The rest are strangers, drawn from Stage 5's candidates, and a stranger must
+clear the same share and floor as an anchor — never less. That cost the
+author's garage and heavy metal playlists most of their stranger pool (18
+candidates down to 5, and 28 down to 5), because what it removed was Röyksopp,
+Pendulum, Papa Roach and Deftones: a playlist that runs short is better than
+one that is wrong. The anchors are spread at even intervals rather than stacked
+at the front: six songs you know followed by nineteen you don't reads as two
+playlists stapled together.
 
 Two sources split the judgment, and neither could do the job alone:
 
@@ -792,8 +814,9 @@ genuinely cannot catch the failures that matter: a filter that drops the right
 are the few pipeline invariants a report cannot see, such as time lost evenly,
 which moves no share.
 
-`tests/` pins that logic instead, in 18 files — Stage 8's selection and
-within-artist track choice, Stage 9's scoring (above all Daft Punk and Kendrick
+`tests/` pins that logic instead, in 19 files — Stage 8's selection,
+within-artist track choice and anchor judge (Halsey and Ellie Goulding must not
+anchor indie, and a remix is judged on its remixer), Stage 9's scoring (above all Daft Punk and Kendrick
 Lamar, the two real artists that break the naive genre rules), Stage 10's
 intensity classification (ILLENIUM, who an include-list admits and a share test
 refuses), its remixer parsing (`Radio Edit` must never become an artist called
@@ -829,7 +852,8 @@ what it is. The ones worth touching:
 | `TRAJECTORY_LAMBDA` | 2.0 | How hard recommendations lean on trajectory vs similarity |
 | `N_PLAYLISTS` | 4 | How many gap genres get a playlist |
 | `PLAYLIST_SIZE` | 25 | Tracks per playlist, anchors included |
-| `ANCHOR_TRACKS` | 5 | How many of those are your own familiar tracks |
+| `ANCHOR_TRACKS` | 6 | How many of those are your own familiar tracks |
+| `ANCHOR_MIN_TAG_SHARE` | 0.25 | How much of an artist's genre weight a playlist's tags must hold, for anchors and strangers alike |
 | `TRACKS_PER_ARTIST` | 2 | Stops one act owning a playlist |
 | `RUN_TARGET_MINUTES` | 240 | Length of each running playlist |
 | `RUN_KNOWN_FRACTION` | 0.6 | Share of that time from your own history |
