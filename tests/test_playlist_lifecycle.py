@@ -13,10 +13,13 @@ def check(label, got, want):
 
 class FakeSp:
     """Records every verb; serves canned playlist data."""
-    def __init__(self, existing=None, dead_ids=(), pages=None):
+    def __init__(self, existing=None, dead_ids=(), pages=None, id_failures=None):
         self.existing = existing or []      # [{"id","name"}] user's playlists
         self.dead = set(dead_ids)
         self.pages = pages                  # optional paged /me/playlists
+        # pid -> canned response, for a stored-id check that fails as
+        # something OTHER than a confirmed 404 (a 502 outage, a 429, ...).
+        self.id_failures = id_failures or {}
         self.verbs = []
         self.created = []
         self.put_bodies = []
@@ -26,6 +29,8 @@ class FakeSp:
             return {"items": [], "next": None}
         if path.startswith("/playlists/"):
             pid = path.split("/")[2]
+            if pid in self.id_failures:
+                return self.id_failures[pid]
             if pid in self.dead:
                 return {"_status": 404, "_body": "gone"}
             return {"id": pid, "name": "whatever"}
@@ -106,6 +111,92 @@ try:
     check("failed create raises", False, True)
 except SystemExit:
     check("failed create raises", True, True)
+
+
+# --------------------------------------------------------------------------
+# The 2026-09-29 outage bug: a Spotify FAILURE is never evidence a playlist
+# is gone. Only a confirmed 404 on the stored id, or a listing read whole
+# with no match, may lead to a create.
+# --------------------------------------------------------------------------
+
+# 8. A 502 on the stored-id check must raise, not fall through to name-adopt
+#    and create a duplicate.
+sp = FakeSp(existing=[{"id": "adopt-me", "name": NAME}],
+           id_failures={"keep-me": {"_status": 502, "_body": "bad gateway"}})
+state = {"dubstep": {"id": "keep-me", "name": NAME}}
+try:
+    playlists.ensure_playlist(sp, "dubstep", NAME, state)
+    check("502 on the id check raises", False, True)
+except SystemExit:
+    check("502 on the id check raises", True, True)
+check("...and zero POSTs", sp.created, [])
+
+# 9. A confirmed 404 on the id, but the /me/playlists listing itself fails
+#    partway: must raise rather than read the failure as "no match".
+sp = FakeSp(dead_ids={"keep-me"}, pages=[{"_status": 500, "_body": "boom"}])
+state = {"dubstep": {"id": "keep-me", "name": NAME}}
+try:
+    playlists.ensure_playlist(sp, "dubstep", NAME, state)
+    check("404 id + failing listing page raises", False, True)
+except SystemExit:
+    check("404 id + failing listing page raises", True, True)
+check("...and zero POSTs", sp.created, [])
+
+# 9b. Same, but the very FIRST /me/playlists call fails (no pagination ever
+#     starts) — also a failure to read the listing whole, not a "no match".
+sp = FakeSp(dead_ids={"keep-me"}, pages=[{"_status": 503, "_body": "unavailable"}])
+state = {"dubstep": {"id": "keep-me", "name": NAME}}
+try:
+    playlists.ensure_playlist(sp, "dubstep", NAME, state)
+    check("404 id + first listing call failing raises", False, True)
+except SystemExit:
+    check("404 id + first listing call failing raises", True, True)
+check("...and zero POSTs", sp.created, [])
+
+# 10. A confirmed 404 on the id, and the listing reads whole with an exact
+#     match: adopts it, zero POSTs — the positive-evidence path still works.
+sp = FakeSp(dead_ids={"keep-me"}, existing=[{"id": "adopt-me", "name": NAME}])
+state = {"dubstep": {"id": "keep-me", "name": NAME}}
+pid = playlists.ensure_playlist(sp, "dubstep", NAME, state)
+check("404 id + full listing with a match adopts it", pid, "adopt-me")
+check("...and zero POSTs", sp.created, [])
+
+# 11. A confirmed 404 on the id, and the listing reads whole with no match at
+#     all: exactly one create, no more.
+sp = FakeSp(dead_ids={"keep-me"}, existing=[{"id": "x", "name": "unrelated"}])
+state = {"dubstep": {"id": "keep-me", "name": NAME}}
+pid = playlists.ensure_playlist(sp, "dubstep", NAME, state)
+check("404 id + full listing with no match creates", pid, "new-1")
+check("...exactly one POST", len(sp.created), 1)
+
+
+# --------------------------------------------------------------------------
+# consolidate.find_playlist — the same "read it whole" rule, exposed as two
+# distinct errors so a caller (running.py's prefer boost) can tell a Spotify
+# outage from a genuinely missing playlist.
+# --------------------------------------------------------------------------
+
+import consolidate
+
+sp = FakeSp(pages=[{"_status": 502, "_body": "bad gateway"}])
+try:
+    consolidate.find_playlist(sp, "Workout · Claude")
+    check("find_playlist on a failing listing raises PlaylistApiFailure", False, True)
+except consolidate.PlaylistApiFailure:
+    check("find_playlist on a failing listing raises PlaylistApiFailure", True, True)
+except SystemExit:
+    check("find_playlist on a failing listing raises PlaylistApiFailure "
+          "(not the generic not-found SystemExit)", False, True)
+
+sp = FakeSp(existing=[{"id": "x", "name": "unrelated"}])
+try:
+    consolidate.find_playlist(sp, "Workout · Claude")
+    check("find_playlist on a complete listing with no match raises", False, True)
+except consolidate.PlaylistApiFailure:
+    check("find_playlist on a complete listing with no match raises the "
+          "not-found error, not PlaylistApiFailure", False, True)
+except SystemExit:
+    check("find_playlist on a complete listing with no match raises", True, True)
 
 
 # --------------------------------------------------------------------------

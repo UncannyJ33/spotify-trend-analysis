@@ -244,6 +244,17 @@ correct.
   `ensure_playlist` and may also pass exact legacy names (`config.RUN_PLAYLIST_LEGACY_NAMES`), tried
   only when nothing carries the current name, so lost state after a rename finds the old playlist
   instead of creating a second; Stage 8 passes none.
+- **A Spotify failure is never evidence a playlist is gone or absent.** During a 502 outage on
+  2026-09-29, `ensure_playlist`'s stored-ID check treated the 502 exactly like a confirmed 404 (both
+  just fail `_alive`), fell through to name-adopt, and would have POSTed a duplicate run playlist had
+  the create call also not been down; the same outage made `consolidate.find_playlist` read a failed
+  `/me/playlists` listing as "no playlist named exactly 'Workout · Claude'", and Stage 10 silently
+  skipped the `prefer` boost. `ensure_playlist` now falls through to name-adopt only on a *confirmed*
+  404 (`_confirmed_gone`) and creates only once the whole listing has been read without a failing page
+  (`listed_whole`); any other failure raises `SystemExit` instead of guessing. `find_playlist` raises
+  the distinct `PlaylistApiFailure` for a failed listing, separate from its ordinary not-found
+  `SystemExit`, so a caller that means to shrug off a genuinely missing playlist (Stage 10's `prefer`
+  boost) does not also shrug off Spotify being down — that case must abort the run.
 - **Spotify scopes only ever widen.** `poll.access_token(client_id, scope)` re-consents with the
   union of granted + needed, so running Stage 8 never strips the poller's scope or vice versa. Two
   paths would silently narrow it and are guarded: a failed refresh re-authorises with what was held

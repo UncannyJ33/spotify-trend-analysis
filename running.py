@@ -73,7 +73,7 @@ from functools import partial
 import duckdb
 
 import config
-from consolidate import find_playlist, gentle_token, read_playlist
+from consolidate import PlaylistApiFailure, find_playlist, gentle_token, read_playlist
 from credits import remix_credit
 from enrich import MB_MIN_INTERVAL, Throttled, load_genre_vocabulary, normalise
 from playlists import (
@@ -884,16 +884,27 @@ def prefer_members(sp, names: list[str]) -> dict[str, set]:
     key) pairs so a different pressing of a member still counts.
 
     Read-only, through Stage 9's exact-name lookup. Its hard errors — no
-    playlist of that exact name, two of them, a failed listing — are right
-    for Stage 9, where a wrong source consolidates the wrong music. Here the
-    playlist is only a tie-breaker, so a failure is a warning and the boost is
-    simply absent: the selection is then exactly what it would be without the
-    row.
+    playlist of that exact name, two of them — are right for Stage 9, where a
+    wrong source consolidates the wrong music. Here the playlist is only a
+    tie-breaker, so a genuinely absent or ambiguous playlist is a warning and
+    the boost is simply absent: the selection is then exactly what it would be
+    without the row.
+
+    A FAILED LISTING is not that. PlaylistApiFailure means find_playlist never
+    got to read the whole listing, so "no match" was never actually
+    established — the playlist may exist and Spotify just did not say so. The
+    2026-09-29 outage made exactly this call answer "no playlist named
+    exactly 'Workout · Claude'" while Spotify was in fact down, and the run
+    silently printed "0 members, 0 boosted" instead of the real answer. That
+    must abort the run, not be swallowed as a warning like a truly missing
+    playlist.
     """
     members: dict[str, set] = {"uris": set(), "songs": set()}
     for name in names:
         try:
             tracks = read_playlist(sp, find_playlist(sp, name)["id"])
+        except PlaylistApiFailure:
+            raise
         except SystemExit as e:
             print(f"  ! prefer {name!r} skipped, no boost applied: {e}")
             continue

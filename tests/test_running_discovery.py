@@ -730,11 +730,27 @@ check("...leaving everything else where it was",
 # A `prefer` row has no artist: the old "no artist, skip" guard would have
 # thrown it away before it was read.
 prefer_row = ",prefer,,Workout · Claude,D1 near-tie prior\n"
+
+# An API FAILURE on the /me/playlists listing (the 2026-09-29 outage shape)
+# must ABORT the run — not be swallowed as a warning. Before the fix, this
+# used to leave the selection identical to no prefer row at all, printing
+# "0 members, 0 boosted" while Spotify was simply down.
 failing = WorkoutSp(None)
-check("find_playlist failing leaves the selection identical to no prefer row",
-      run_known(prefer_row, failing), base)
-check("...having asked, and warned rather than exited",
+try:
+    run_known(prefer_row, failing)
+    check("a failing prefer listing aborts the run", False, True)
+except running.PlaylistApiFailure:
+    check("a failing prefer listing aborts the run", True, True)
+check("...having asked before aborting",
       failing.calls.count("/me/playlists") >= 1, True)
+
+# A GENUINELY MISSING prefer playlist (the listing read whole, no match) is
+# a different case and keeps today's warn-and-skip: the selection is exactly
+# what it would be without the row.
+missing = WorkoutSp([{"id": "pl-other", "name": "Something Else · Claude"}])
+check("a genuinely missing prefer playlist still warns and skips",
+      run_known(prefer_row, missing), base)
+
 boosted = run_known(prefer_row, WorkoutSp([{"id": "pl-w", "name": "Workout · Claude"}]))
 check("a member within the margin now leads the non-member it trailed",
       boosted["dubstep"].index("uri:w") < boosted["dubstep"].index("uri:f4"), True)
