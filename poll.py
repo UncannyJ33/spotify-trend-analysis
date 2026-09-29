@@ -39,7 +39,7 @@ import socketserver
 import threading
 import urllib.parse
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import duckdb
 import requests
@@ -328,6 +328,25 @@ def store(con: duckdb.DuckDBPyConnection, rows: list[dict]) -> int:
     return before - after
 
 
+def context_counts_since(con: duckdb.DuckDBPyConnection, since: datetime) -> list[tuple]:
+    """(context_uri, count) for polled plays at or after `since`, most first.
+
+    `since` must be a naive datetime already in UTC, matching `ts`. Bound as a
+    parameter rather than computed in SQL so the comparison never goes through
+    DuckDB's own now() (session-timezone-aware — see the caller).
+    """
+    return con.execute(
+        f"""
+        SELECT context_uri, count(*) AS n
+        FROM '{POLLED_PARQUET}'
+        WHERE ts >= ?
+        GROUP BY context_uri
+        ORDER BY n DESC
+        """,
+        [since],
+    ).fetchall()
+
+
 def status(con: duckdb.DuckDBPyConnection) -> None:
     print("\n" + "=" * 70)
     print("STAGE 6 — POLLED HISTORY")
@@ -352,13 +371,16 @@ def status(con: duckdb.DuckDBPyConnection) -> None:
     if "context_uri" not in context_cols:
         print("  context: not recorded yet")
     else:
-        rows = con.execute(f"""
-            SELECT context_uri, count(*) AS n
-            FROM '{POLLED_PARQUET}'
-            WHERE ts >= now() - INTERVAL 30 DAY
-            GROUP BY context_uri
-            ORDER BY n DESC
-        """).fetchall()
+        # A naive Python UTC cutoff, bound as a parameter — never DuckDB's own
+        # now(). `ts` is naive but holds UTC values (see the ts-is-UTC gotcha
+        # in CLAUDE.md); DuckDB's now() is TIMESTAMP WITH TIME ZONE in the
+        # SESSION's local zone (whatever the OS is set to, not UTC), and
+        # comparing it to `ts` implicitly casts the naive column as if it
+        # were local wall-clock time, shifting the window by the local UTC
+        # offset. A Python-computed, explicitly-UTC cutoff sidesteps that
+        # cast entirely.
+        since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30)
+        rows = context_counts_since(con, since)
         if not rows:
             print("  (no plays in the last 30 days)")
         else:

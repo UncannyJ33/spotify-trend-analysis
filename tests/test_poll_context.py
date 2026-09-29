@@ -18,7 +18,7 @@ import sys
 sys.path.insert(0, ".")
 import pathlib
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import duckdb
 
@@ -117,6 +117,29 @@ fresh_type = con2.execute(
     f"SELECT typeof(context_uri) FROM '{fresh}' LIMIT 1").fetchone()[0]
 check("a fresh CREATE from an all-null-context batch is still VARCHAR",
       fresh_type, "VARCHAR")
+
+# --- 6. The "last 30 days" window must not depend on the session's local
+# timezone. `ts` is naive but holds UTC values; DuckDB's now() is
+# TIMESTAMP WITH TIME ZONE in the session's local zone (whatever the OS
+# happens to be set to), and `ts >= now() - INTERVAL 30 DAY` implicitly casts
+# the naive column as if it were local wall-clock time — shifting the
+# effective cutoff by the local UTC offset. context_counts_since() takes an
+# explicit, already-UTC `since` bound as a parameter instead, so it must give
+# the same answer no matter what TimeZone the connection is set to.
+tz_file = pathlib.Path(tempfile.mkdtemp()) / "polled_plays_tz.parquet"
+poll.POLLED_PARQUET = tz_file
+con3 = duckdb.connect()
+REF = datetime(2026, 9, 29, 12, 0)  # arbitrary fixed instant, naive UTC
+poll.store(con3, [
+    new_row(REF - timedelta(days=10), "spotify:track:ggg", "spotify:playlist:recent"),
+    new_row(REF - timedelta(days=40), "spotify:track:hhh", "spotify:playlist:stale"),
+])
+since = REF - timedelta(days=30)
+for tz in ("UTC", "America/Chicago", "Pacific/Kiritimati", "Etc/GMT+12"):
+    con3.execute(f"SET TimeZone='{tz}'")
+    got = dict(poll.context_counts_since(con3, since))
+    check(f"only the 10-day-old play counts, TimeZone={tz}",
+          got, {"spotify:playlist:recent": 1})
 
 print()
 if failures:
