@@ -565,4 +565,19 @@ config are tracked. Before changing anything here, understand why it is the way 
   changed little" as "it does not work". The token's consent now holds `user-read-recently-played`
   alongside the playlist scopes — the union, as `missing_scopes` intends. Polled months are
   provisional until the next export and stay out of every trend (see the coverage-cut invariant).
+- **The poller runs every 3 h via launchd while SJ is awake** (Task 1.3, Q3, answered 2026-09-29),
+  invoking `poll.py` unchanged — the job supplies only the schedule. This was chosen over daily
+  because the 50-item page is exceeded on about 40% of days (2026's median day had 45 plays), so a
+  daily poll silently drops plays; a 3 h cadence keeps each fetch well under the page limit.
+
+  `poll.py --status` reads `data/polled_plays.parquet`, `data/playlist_state.json`,
+  `data/running_state.json` and `data/capture_state.json` only, and touches the network for nothing.
+- **`data/polled_plays.parquet` is the only home of `context_uri` and must never be pruned.**
+  `ingest.merge_polled` deliberately doesn't carry the column into `plays_raw` — it lists every
+  destination column by name, so widening the polled schema costs it nothing and loses it nothing.
+  Which playlist (or Liked Songs, or a Spotify-generated mix) a play actually came from exists
+  nowhere else once a polled row ages out of the coverage cut, so a step that trims or rebuilds this
+  file from `plays.parquet` would silently erase context history that can never be recovered from the
+  export. `poll.store`'s `ALTER TABLE ... ADD COLUMN IF NOT EXISTS context_uri VARCHAR` plus its
+  `INSERT ... BY NAME` exist so an older file widens in place rather than getting rebuilt.
 - `ts` is UTC, so monthly buckets are UTC months.

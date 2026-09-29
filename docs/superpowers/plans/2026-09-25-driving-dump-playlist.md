@@ -138,6 +138,8 @@ LIKED SONGS BACKFILL (Step 0) — verified 2026-09-27, completed and read back 2
 
 ### Task 1.1: Where to save from now on (no code, SJ's call: Q1)
 
+**Answered 2026-09-29: keep adding to Driving #2.** It's the easiest option and needs no new habit; `capture.py`'s `Fresh · Claude` already reads it by name.
+
 Two workable answers. Both keep the pipeline out of Driving #2.
 
 - **Keep adding to Driving #2** (recommended *for now*). Needs no consent, no backfill; Phase 2 reads it by name. Its cost is the one SJ already pays: an ever-longer playlist. Freezing it later costs nothing, as Driving #1 showed.
@@ -183,22 +185,24 @@ This is the measurement every later gate depends on. It also settles the evaluat
   When the column doesn't exist yet, print `context: not recorded yet`. No network.
 - `ingest.merge_polled`: **no change.** Verified 2026-09-26: it lists every column by name in its `INSERT INTO plays_raw BY NAME SELECT …`, so an extra column in `polled_plays.parquet` is simply not selected.
 
-- [ ] **Step 1: Write the failing test** (`tests/test_poll_context.py`). It points `poll.POLLED_PARQUET` at a temp file, never the real one, and checks:
+- [x] **Step 1: Write the failing test** (`tests/test_poll_context.py`). It points `poll.POLLED_PARQUET` at a temp file, never the real one, and checks:
   1. rows stored by the old `to_rows` shape (no `context_uri`) create an old-schema file;
   2. new rows append, old rows read `NULL`, new rows keep their URI;
   3. a batch with every context null appends without a type error, and the column is still VARCHAR afterwards;
   4. re-storing the same `(ts, uri)` is still counted as a dupe, and the non-null context wins;
   5. the row count in equals the row count out, with nothing lost.
-- [ ] **Step 2: Run it and confirm it fails.** Expect `KeyError: 'context_uri'` or a column-count mismatch from `store`.
-- [ ] **Step 3: Implement** the three changes above.
-- [ ] **Step 4: Verify.**
-  - The test passes, and `tests/test_scope_auth.py` still passes.
-  - `.venv/bin/python poll.py --status` prints the new block with no auth prompt.
-  - With SJ present: `poll.py` once, then `--status` shows real contexts.
-- [ ] **Step 5: Schedule (SJ's call: Q3).** Use launchd every 3 h while awake, running `poll.py` unchanged. In 2026 the median day had 45 plays and 80 of 201 days exceeded the 50-item page, so a daily poll loses plays on about 40% of days. A scheduled poll makes the polled tail of `plays.parquet` grow until the next export replaces it; that is `merge_polled` working as designed, but it is also why the data caveat above matters.
-- [ ] **Step 6: Commit** on `driving-dump`.
+- [x] **Step 2: Run it and confirm it fails.** Expect `KeyError: 'context_uri'` or a column-count mismatch from `store`. (Confirmed 2026-09-29: `_duckdb.BinderException: table polled has 18 columns but 19 values were supplied`, on the positional `INSERT INTO polled SELECT * FROM incoming` — same failure family the plan predicted.)
+- [x] **Step 3: Implement** the three changes above.
+- [x] **Step 4: Verify.**
+  - The test passes (11 checks, including the first-ever-CREATE cast case), and `tests/test_scope_auth.py` still passes, as does the full suite (`for t in tests/test_*.py; do ... done`, 2026-09-29).
+  - `.venv/bin/python poll.py --status` prints the new block with no auth prompt (verified in a data-less worktree: prints `context: not recorded yet`, no network call).
+  - With SJ present: `poll.py` once, then `--status` shows real contexts. **Not done from this worktree** — it has no `.env`/`.cache`/`data` and this task ran unattended; needs a live run against the real repo with SJ present.
+- [x] **Step 5: Schedule (SJ's call: Q3).** Use launchd every 3 h while awake, running `poll.py` unchanged. In 2026 the median day had 45 plays and 80 of 201 days exceeded the 50-item page, so a daily poll loses plays on about 40% of days. A scheduled poll makes the polled tail of `plays.parquet` grow until the next export replaces it; that is `merge_polled` working as designed, but it is also why the data caveat above matters. **Answered 2026-09-29: yes** (see Q3 below); the launchd job was being installed as of that date. Recorded in `CLAUDE.md` Gotchas.
+- [x] **Step 6: Commit** on `driving-dump`.
 
 ### Task 1.4: Put hot captures on the runs with pins (no code; SJ's call: Q4)
+
+**Answered 2026-09-29: pin `headrush` only.** John Summit's 4 candidate tracks stay unpinned — 9 tracks of one artist in one playlist is too many. The `running_overrides.csv` row below is not yet written (this task's worktree carries no gitignored files); it remains to do against the real repo.
 
 Some saved tracks are heavily played yet sit in no live playlist. Stage 10 can't reach them today:
 - Four of the five John Summit tracks saved on 2026-04-24 (WITH ME 28, SHADOWS 27, SHADES OF BLUE 27, ALL THE TIME 20 plays in 2026, per pressing; LIGHTS GO OUT has 1) are in no other playlist. He already holds 5 tracks in the garage run through an override, against a cap of `RUN_TRACKS_PER_ARTIST = 3`.
@@ -372,10 +376,10 @@ The evaluation found garage discovery nearly empty (**RC3**): 14 of 20 seeds hav
 
 ## Open questions for SJ
 
-1. **From now on, keep adding to Driving #2, or heart?** *Recommend Driving #2 for now.* It needs no consent and Phase 2 reads it directly. The heart is the better long-term capture point but only once Step 0 has run, and Step 0 waits on consent you have deferred. `--source` is repeatable so the switch costs nothing later.
+1. **(Answered 2026-09-29: keep adding to Driving #2.)** **From now on, keep adding to Driving #2, or heart?** *Recommend Driving #2 for now.* It needs no consent and Phase 2 reads it directly. The heart is the better long-term capture point but only once Step 0 has run, and Step 0 waits on consent you have deferred. `--source` is repeatable so the switch costs nothing later. SJ's reasoning, 2026-09-29: it's the easiest option, and `capture.py`'s `Fresh · Claude` already reads it by name — nothing forces a switch.
 2. **(Answered 2026-09-27: yes — build Phase 2.)** **When you put the dump on, is it in order or shuffle, and would you reach for a 100-track newest-first playlist?** The data says both: about 60% shuffle in 2025 dump sessions, a quarter to 40% in 2026 (on few plays). *Recommend building Phase 2 at 100 tracks* (5.0 h, 57% of the dump's 2026 plays). 75 tracks (3.8 h, 47%) is the tighter alternative. If the answer is "I'd just use Sort → Recently added", Phase 2 is not worth building.
-3. **Can `poll.py` run on launchd every 3 h while you're awake, and later refresh `Fresh · Claude` in the same job?** *Recommend yes to the poll now, and to the refresh after two clean manual runs.* Without a schedule, no gate in this plan can be judged.
-4. **Pin hot saves onto the runs?** *Recommend pinning `headrush` to the garage run now.* The four John Summit tracks are your call: D2 is decided in their favour, but pinning all four puts 9 of his tracks in one playlist.
+3. **(Answered 2026-09-29: yes.)** **Can `poll.py` run on launchd every 3 h while you're awake, and later refresh `Fresh · Claude` in the same job?** *Recommend yes to the poll now, and to the refresh after two clean manual runs.* Without a schedule, no gate in this plan can be judged. SJ, 2026-09-29: yes — the launchd job was being installed as of that date. Recorded in `CLAUDE.md` Gotchas.
+4. **(Answered 2026-09-29: pin `headrush` only.)** **Pin hot saves onto the runs?** *Recommend pinning `headrush` to the garage run now.* The four John Summit tracks are your call: D2 is decided in their favour, but pinning all four puts 9 of his tracks in one playlist. SJ, 2026-09-29: pin `headrush` only — John Summit's 4 saves stay unpinned, since 9 tracks of one artist in one playlist is too many. (Task 1.4's own `running_overrides.csv` edit is unchanged by this task; recorded here as the answer of record.)
 5. **(Answered 2026-09-27: consented; Step 0 ran.)** **When you're ready, consent to `user-library-read` (and `user-library-modify` if Step 0 goes ahead)?** Nothing in Phases 1–2 needs it. It unlocks `--source liked` and the backfill. The backfill will steer Spotify's mixes toward the whole dump; decide Q1 first.
 6. **Heart the 291 Driving #1 tracks you still played in 2026 (45.8 h)?** *Recommend no.* Driving #1 already is that archive, and hearting rap-era tracks may steer the mixes, which deliver most of your listening, back toward rap.
 7. **Should the pipeline ever reorder Driving #2 in place?** *Recommend no.* See "Not being built" for the only form it could take.

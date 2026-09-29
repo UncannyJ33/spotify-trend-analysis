@@ -39,7 +39,7 @@ import socketserver
 import threading
 import urllib.parse
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import duckdb
 import requests
@@ -271,6 +271,7 @@ def to_rows(items: list[dict]) -> list[dict]:
             # preserved: Spotify lists the primary performer first.
             "track_artists": ARTIST_SEP.join(a["name"] for a in artists) or None,
             "reason_start": (it.get("context") or {}).get("type"),
+            "context_uri": (it.get("context") or {}).get("uri"),
             "reason_end": None,
             "shuffle": None, "skipped": None, "offline": None,
             "incognito_mode": None,
@@ -281,27 +282,69 @@ def to_rows(items: list[dict]) -> list[dict]:
 
 
 def store(con: duckdb.DuckDBPyConnection, rows: list[dict]) -> int:
-    """Append, de-duplicating on the play identity. Idempotent like Stage 1."""
+    """Append, de-duplicating on the play identity. Idempotent like Stage 1.
+
+    context_uri needs care on both insert paths. A pandas column that is all
+    None arrives in DuckDB typed INTEGER (as reason_end and shuffle already
+    do), so it is CAST to VARCHAR explicitly on every insert — the first-ever
+    CREATE included — rather than only when a batch happens to carry a URI.
+    An older polled_plays.parquet predating this column is widened with
+    ALTER TABLE ... ADD COLUMN IF NOT EXISTS, and the insert goes BY NAME
+    because the positional form breaks the moment the schema is wider than
+    the file on disk.
+    """
     import pandas as pd
 
     incoming = pd.DataFrame(rows)
     con.register("incoming", incoming)
+    has_context = "context_uri" in incoming.columns
+    incoming_select = (
+        "SELECT * REPLACE (CAST(context_uri AS VARCHAR) AS context_uri) FROM incoming"
+        if has_context else "SELECT * FROM incoming"
+    )
     if POLLED_PARQUET.exists():
         con.execute(f"CREATE OR REPLACE TABLE polled AS SELECT * FROM '{POLLED_PARQUET}'")
-        con.execute("INSERT INTO polled SELECT * FROM incoming")
+        if has_context:
+            con.execute("ALTER TABLE polled ADD COLUMN IF NOT EXISTS context_uri VARCHAR")
+        con.execute(f"INSERT INTO polled BY NAME {incoming_select}")
     else:
-        con.execute("CREATE OR REPLACE TABLE polled AS SELECT * FROM incoming")
+        con.execute(f"CREATE OR REPLACE TABLE polled AS {incoming_select}")
 
     before = con.execute("SELECT count(*) FROM polled").fetchone()[0]
-    con.execute("""
+    table_cols = {c[0] for c in con.execute("DESCRIBE polled").fetchall()}
+    # NULLS LAST so a re-fetched play keeps its earlier non-null context
+    # rather than losing it to a later, context-less re-fetch of the same
+    # play. Only ordered on context_uri once the column actually exists —
+    # a polled_plays.parquet that predates this change may not have it yet.
+    order_by = "ORDER BY context_uri NULLS LAST" if "context_uri" in table_cols else ""
+    con.execute(f"""
         CREATE OR REPLACE TABLE polled AS
         SELECT * FROM polled
-        QUALIFY row_number() OVER (PARTITION BY ts, spotify_track_uri) = 1
+        QUALIFY row_number() OVER (PARTITION BY ts, spotify_track_uri {order_by}) = 1
     """)
     after = con.execute("SELECT count(*) FROM polled").fetchone()[0]
     con.execute(f"COPY (SELECT * FROM polled ORDER BY ALL) TO '{POLLED_PARQUET}' "
                 f"(FORMAT PARQUET, COMPRESSION ZSTD)")
     return before - after
+
+
+def context_counts_since(con: duckdb.DuckDBPyConnection, since: datetime) -> list[tuple]:
+    """(context_uri, count) for polled plays at or after `since`, most first.
+
+    `since` must be a naive datetime already in UTC, matching `ts`. Bound as a
+    parameter rather than computed in SQL so the comparison never goes through
+    DuckDB's own now() (session-timezone-aware — see the caller).
+    """
+    return con.execute(
+        f"""
+        SELECT context_uri, count(*) AS n
+        FROM '{POLLED_PARQUET}'
+        WHERE ts >= ?
+        GROUP BY context_uri
+        ORDER BY n DESC
+        """,
+        [since],
+    ).fetchall()
 
 
 def status(con: duckdb.DuckDBPyConnection) -> None:
@@ -319,7 +362,78 @@ def status(con: duckdb.DuckDBPyConnection) -> None:
         n, hi = con.execute(
             f"SELECT count(*), max(ts) FROM '{config.PLAYS_RAW_PARQUET}'").fetchone()
         print(f"export     : {n:,} plays   through {hi:%Y-%m-%d}")
+
+    print("\nplays by context, last 30 days")
+    context_cols = set()
+    if POLLED_PARQUET.exists():
+        context_cols = {c[0] for c in con.execute(
+            f"DESCRIBE SELECT * FROM '{POLLED_PARQUET}'").fetchall()}
+    if "context_uri" not in context_cols:
+        print("  context: not recorded yet")
+    else:
+        # A naive Python UTC cutoff, bound as a parameter — never DuckDB's own
+        # now(). `ts` is naive but holds UTC values (see the ts-is-UTC gotcha
+        # in CLAUDE.md); DuckDB's now() is TIMESTAMP WITH TIME ZONE in the
+        # SESSION's local zone (whatever the OS is set to, not UTC), and
+        # comparing it to `ts` implicitly casts the naive column as if it
+        # were local wall-clock time, shifting the window by the local UTC
+        # offset. A Python-computed, explicitly-UTC cutoff sidesteps that
+        # cast entirely.
+        since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30)
+        rows = context_counts_since(con, since)
+        if not rows:
+            print("  (no plays in the last 30 days)")
+        else:
+            names = _known_playlist_names()
+            for uri, n in rows:
+                label = "(no context)" if uri is None else _label_context(uri, names)
+                print(f"  {n:>4}  {label}")
     print("=" * 70)
+
+
+# The Spotify algorithm's own playlists ("Discover Weekly", the Daily Mixes,
+# Release Radar, ...) all use this fixed ID prefix. There is no readable name
+# behind it, only the prefix.
+SPOTIFY_GENERATED_PREFIX = "37i9dQZF1"
+
+
+def _known_playlist_names() -> dict[str, str]:
+    """Playlist id -> display name, gathered from every state file that might
+    name a context: Stage 8's frontiers, Stage 10's runs, and (Phase 2)
+    Stage 11's Fresh · Claude plus the sources it reads."""
+    names: dict[str, str] = {}
+    for path in (config.PLAYLIST_STATE_JSON, config.RUNNING_STATE_JSON,
+                 getattr(config, "CAPTURE_STATE_JSON", None)):
+        if not path or not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        for value in data.values():
+            entries = value if isinstance(value, list) else [value]
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("id") and entry.get("name"):
+                    names[entry["id"]] = entry["name"]
+    return names
+
+
+def _label_context(uri: str, names: dict[str, str]) -> str:
+    """A context_uri, made readable where possible.
+
+    Checked in order: a name from a state file beats everything else (an
+    override always wins); then the fixed Liked Songs shape; then the fixed
+    Spotify-generated-playlist prefix; anything left over is shown raw.
+    """
+    segments = uri.split(":")
+    pid = segments[2] if len(segments) >= 3 and segments[1] == "playlist" else None
+    if pid and pid in names:
+        return names[pid]
+    if uri.endswith(":collection"):
+        return "Liked Songs"
+    if pid and pid.startswith(SPOTIFY_GENERATED_PREFIX):
+        return "Spotify-generated (unreadable)"
+    return uri
 
 
 def main() -> None:
