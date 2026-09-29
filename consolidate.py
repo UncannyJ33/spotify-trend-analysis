@@ -314,6 +314,19 @@ def gentle_token(client_id: str, scope: str) -> str:
     return access_token(client_id, scope)
 
 
+class PlaylistApiFailure(SystemExit):
+    """find_playlist: the /me/playlists listing itself failed to come back
+    whole — a page answered with an error envelope, or not at all — as
+    distinct from reading the WHOLE listing and finding no exact match.
+
+    The distinction exists for callers that treat a merely absent playlist as
+    soft ("no boost, just a warning") but must not treat a Spotify outage the
+    same way: an unread page could easily have held the match, so absence
+    proves nothing here. running.py's `prefer` boost is exactly that caller —
+    see its use of this class.
+    """
+
+
 def find_playlist(sp, name: str) -> dict:
     """Resolve one playlist by EXACT name, exact including case.
 
@@ -321,16 +334,26 @@ def find_playlist(sp, name: str) -> dict:
     is somebody's hand-made playlist. Here the stakes are lower (this only
     reads) but a wrong source silently consolidates the wrong music, so an
     ambiguous or missing name is a hard error rather than a best guess.
+
+    Two distinct hard errors, not one: PlaylistApiFailure when the listing
+    itself never came back whole (a failing page, or no response at all —
+    checked by whether the loop reached its own `break`, not by inspecting
+    whatever `page` happens to hold), and plain SystemExit when the listing
+    WAS read in full and truly contains no exact match. Collapsing those two
+    into one message is how a 502 outage used to read exactly like "no
+    playlist by that name".
     """
     hits, page = [], sp.get("/me/playlists", params={"limit": 50})
+    listed_whole = False
     while isinstance(page, dict) and "_status" not in page:
         hits.extend(p for p in page.get("items", []) if p.get("name") == name)
         nxt = page.get("next")
         if not nxt:
+            listed_whole = True
             break
         page = sp.get(nxt.removeprefix(SP_API), params=None)
-    if isinstance(page, dict) and "_status" in page:
-        raise SystemExit(f"Could not list playlists: {page}")
+    if not listed_whole:
+        raise PlaylistApiFailure(f"Could not list playlists: {page}")
     if not hits:
         raise SystemExit(f"No playlist named exactly {name!r}.")
     if len(hits) > 1:

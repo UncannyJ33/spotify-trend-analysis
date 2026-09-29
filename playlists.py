@@ -803,6 +803,21 @@ def _alive(resp) -> bool:
     return bool(isinstance(resp, dict) and "_status" not in resp and resp.get("id"))
 
 
+def _confirmed_gone(resp) -> bool:
+    """True only when Spotify has said, in terms, that this id no longer
+    exists (404) — never for a 5xx, a 429, an error envelope carrying some
+    other status, or no response at all (a network failure, `sp.get` -> None).
+
+    That distinction is the whole fix for the 2026-09-29 outage: a 502 on the
+    stored-ID check used to read exactly like a 404 (`_alive` is False either
+    way), so an outage fell through to name-adopt and then POSTed a fresh
+    playlist — a duplicate, had Spotify accepted the create. A Spotify FAILURE
+    is never evidence a playlist is gone; only Spotify affirmatively saying so
+    is.
+    """
+    return isinstance(resp, dict) and resp.get("_status") == 404
+
+
 def ensure_playlist(sp, tag: str, name: str, state: dict,
                     aliases: tuple[str, ...] = ()) -> str:
     """Resolve the playlist this stage owns for `tag`, creating if needed.
@@ -812,7 +827,9 @@ def ensure_playlist(sp, tag: str, name: str, state: dict,
     EXACT on purpose, case and all. A near-miss is somebody's hand-made
     playlist, and adopting it would mean this stage overwrites something a
     person built. Creating a duplicate is the cheap mistake; overwriting is
-    the expensive one.
+    the expensive one — but so is a duplicate born of a Spotify outage, so
+    both checks below refuse to create unless they have POSITIVE evidence
+    there is nothing to adopt, not merely a failure to find it.
 
     `aliases` are names the playlist carried before a rename (Stage 10's
     garage run was "speed garage run · Claude"), tried in order after `name`
@@ -820,14 +837,34 @@ def ensure_playlist(sp, tag: str, name: str, state: dict,
     listing; an alias is adopted only when nothing carries the current name,
     so lost state after a rename finds the old playlist instead of creating
     a second. Stage 8 passes none.
+
+    THE STORED ID falls through to name-adopt ONLY on a confirmed 404. Any
+    other failure — 5xx, 429, an error envelope, no response — raises
+    immediately: the id may well still be alive, and guessing otherwise is how
+    a 502 outage on 2026-09-29 nearly duplicated a run playlist.
+
+    THE LISTING must be read WHOLE — every page answered — before "nothing
+    matched" is trusted enough to create. A page failing partway used to just
+    stop the loop and fall out the bottom as if the rest of the library held
+    no match; now any page failing (including the very first request) raises,
+    because an unread page could hold the exact name this call is looking for.
     """
     entry = state.get(tag) or {}
     if entry.get("id"):
-        if _alive(sp.get(f"/playlists/{entry['id']}", params={"fields": "id,name"})):
+        resp = sp.get(f"/playlists/{entry['id']}", params={"fields": "id,name"})
+        if _alive(resp):
             return entry["id"]
+        if not _confirmed_gone(resp):
+            raise SystemExit(
+                f"Spotify is failing on the stored playlist id for {tag!r} "
+                f"({entry['id']}): {resp}. Not creating a playlist that may "
+                "already exist — a Spotify failure is never evidence a "
+                "playlist is gone.")
+        # Confirmed 404: genuinely gone. Fall through to the name/alias search.
 
     under_alias: dict[str, str] = {}
     page = sp.get("/me/playlists", params={"limit": 50})
+    listed_whole = False
     while isinstance(page, dict) and "_status" not in page:
         for item in page.get("items", []):
             if item.get("name") == name:
@@ -836,8 +873,14 @@ def ensure_playlist(sp, tag: str, name: str, state: dict,
                 under_alias.setdefault(item["name"], item["id"])
         nxt = page.get("next")
         if not nxt:
+            listed_whole = True
             break
         page = sp.get(nxt.removeprefix(SP_API), params=None)
+    if not listed_whole:
+        raise SystemExit(
+            f"Spotify is failing while listing playlists (looking for "
+            f"{name!r}): {page}. Not creating a playlist that may already "
+            "exist — a Spotify failure is never evidence a playlist is gone.")
     for alias in aliases:
         if alias in under_alias:
             return under_alias[alias]
