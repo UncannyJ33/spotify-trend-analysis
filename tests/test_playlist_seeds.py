@@ -97,6 +97,29 @@ check("seed cache file written for answers only",
              for l in playlists.PLAYLIST_SEED_CACHE.read_text().splitlines()),
       ["FKJ", "Nujabes"])
 
+# --- fold-alike library names; error records do not shadow good ones --------
+con2 = duckdb.connect()
+con2.execute("""CREATE TABLE artist_tags AS SELECT * FROM (VALUES
+  ('Dream', 'mbid-dream', 'eurobeat', 3, true, 'musicbrainz'),
+  ('The-Dream', 'mbid-thedream', 'contemporary r&b', 3, true, 'musicbrainz')
+) t(artist_name, mbid, tag, tag_count, is_genre, source)""")
+asked_before = len(asked)
+out3 = io.StringIO()
+with contextlib.redirect_stdout(out3):
+    r_exact = playlists.resolve_seed(con2, None, "The-Dream", {}, {})
+    r_fold2 = playlists.resolve_seed(con2, None, "the dream", {}, {})
+    mine_ok = {"Okay": {"artist_name": "Okay", "status": "resolved", "mbid": "m-okay"}}
+    r_shadow = playlists.resolve_seed(
+        con2, None, "Okay", {"Okay": {"artist_name": "Okay", "status": "error"}}, mine_ok)
+check("exact library name wins over a fold-alike", r_exact,
+      {"artist_name": "The-Dream", "mbid": "mbid-thedream"})
+check("a seed folding to two library artists is refused", r_fold2, None)
+check("...naming both and the Name=MBID remedy",
+      all(x in out3.getvalue() for x in ("Dream", "The-Dream", "Name=MBID")), True)
+check("neither spent a MusicBrainz call", len(asked), asked_before)
+check("a Stage 2 error record does not shadow a good own-cache answer",
+      r_shadow, {"artist_name": "Okay", "mbid": "m-okay"})
+
 # --- pooling ---------------------------------------------------------------
 # A real UUID: "Dead=m-dead" would be refused at the Name=MBID check
 # (enrich.MBID_RE, verified) and the no-neighbours path never run.

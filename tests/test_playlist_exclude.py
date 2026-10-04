@@ -75,6 +75,14 @@ got = [t["track_name"] for t in playlists.drop_excluded(tracks, ["drake"])]
 check("a discovery track featuring an excluded artist is dropped", got, ["Clouded"])
 check("empty exclude is a no-op", len(playlists.drop_excluded(tracks, [])), 2)
 
+nonlatin = [{"track_name": "A", "artists": [{"name": "Brent Faiyaz"}]},
+            {"track_name": "B", "artists": [{"name": None}]},
+            {"track_name": "C", "artists": [{"name": "Земфира"}]}]
+check("an exclude folding to '' drops nothing",
+      len(playlists.drop_excluded(nonlatin, ["Земфира"])), 3)
+check("_exclude_keys discards empty folds",
+      playlists._exclude_keys(["Земфира", "Drake"]), {playlists.normalise("Drake")})
+
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)
 print("all assertions passed")

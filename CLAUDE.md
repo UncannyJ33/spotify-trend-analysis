@@ -287,7 +287,7 @@ correct.
   Stage 5 seeds on the whole taste vector, and a genre SJ wants but barely plays (vaporwave, ~0 h)
   gets no supply from it. `playlists.seed_candidates` pools each seed's ListenBrainz neighbours,
   normalised per seed, and every one of them, the seed included, clears the same `serving_sql` bar
-  as any stranger. A seed name resolves only on an exact MusicBrainz match (`resolve_seed`); anything
+  as any stranger. A seed name resolves only on an exact MusicBrainz match (`resolve_seed`; one that folds to two library artists, `Dream`/`The-Dream`, is refused too); anything
   else is skipped with a warning and answered as `Name=MBID`, never guessed. `artist_overrides.csv` is
   read before any cache, as Stage 9 does: a `NONE` there refuses the seed even though Stage 2's raw
   cache still holds the wrong auto-match. Resolutions are cached in

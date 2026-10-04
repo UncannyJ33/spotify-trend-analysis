@@ -225,7 +225,7 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
     register_song_key(con)
     register_remix_credit(con)
     register_norm_name(con)
-    excl = sorted({normalise(n) for n in exclude})
+    excl = sorted(_exclude_keys(exclude))
     cols = ["artist_name", "judge", "track_name", "spotify_track_uri", "hours",
             "song_key"]
     rows = con.execute(
@@ -331,7 +331,7 @@ def select_candidates(con: duckdb.DuckDBPyConnection, tags: list[str],
     """
     if not tags:
         return []
-    excl = {normalise(n) for n in exclude}
+    excl = _exclude_keys(exclude)
     known = {normalise(r[0]) for r in con.execute(
         "SELECT DISTINCT artist_name FROM plays WHERE artist_name IS NOT NULL"
     ).fetchall()}
@@ -604,13 +604,19 @@ def candidate_led(tracks: list[dict], artist: str,
     return out
 
 
+def _exclude_keys(exclude) -> set[str]:
+    """Folded exclude names. A name that folds to '' (non-Latin) is dropped:
+    '' in the set would match every NULL or non-Latin artist."""
+    return {k for n in exclude if (k := normalise(n))}
+
+
 def drop_excluded(tracks: list[dict], exclude) -> list[dict]:
     """Drop any track whose Spotify credit list names an excluded artist.
 
     The whole credit list, not just the lead: an exclude row says "not in this
     playlist", and a Drake feature on someone else's record is still Drake.
     """
-    excl = {normalise(n) for n in exclude}
+    excl = _exclude_keys(exclude)
     if not excl:
         return list(tracks)
     return [t for t in tracks
@@ -1063,18 +1069,35 @@ def resolve_seed(con: duckdb.DuckDBPyConnection, http, seed: str,
                   "Name=MBID if MusicBrainz has since gained an entry.")
             return None
     register_norm_name(con)
-    row = con.execute(
-        "SELECT artist_name, max(mbid) FROM artist_tags "
-        "WHERE norm_name(artist_name) = ? GROUP BY 1 ORDER BY 1 LIMIT 1",
-        [normalise(name)]).fetchone()
-    if row is not None:
-        if row[1]:
-            return {"artist_name": row[0], "mbid": row[1]}
-        print(f"  ⚠ seed {name!r} is a library artist with no MusicBrainz id "
-              "(answered NONE in artist_overrides.csv) — give it as Name=MBID")
+    no_mbid = (f"  ⚠ seed {name!r} is a library artist with no MusicBrainz id "
+               "(answered NONE in artist_overrides.csv) — give it as Name=MBID")
+    exact = con.execute(
+        "SELECT max(mbid) FROM artist_tags WHERE artist_name = ? GROUP BY artist_name",
+        [name]).fetchone()
+    if exact is not None:
+        if exact[0]:
+            return {"artist_name": name, "mbid": exact[0]}
+        print(no_mbid)
         return None
-    rec = stage2.get(name) or mine.get(name)
-    if rec is None or rec.get("status") == "error":
+    folded = con.execute(
+        "SELECT artist_name, max(mbid) FROM artist_tags "
+        "WHERE norm_name(artist_name) = ? GROUP BY 1 ORDER BY 1",
+        [normalise(name)]).fetchall()
+    if folded:
+        mbids = {r[1] for r in folded if r[1]}
+        if len(mbids) == 1:
+            return {"artist_name": next(r[0] for r in folded if r[1]),
+                    "mbid": next(iter(mbids))}
+        if len(mbids) > 1:
+            names = ", ".join(f"{r[0]} ({r[1]})" for r in folded if r[1])
+            print(f"  ⚠ seed {name!r} matches more than one library artist: "
+                  f"{names} — skipped. Give it as Name=MBID.")
+            return None
+        print(no_mbid)
+        return None
+    rec = next((r for r in (stage2.get(name), mine.get(name))
+                if r and r.get("status") != "error"), None)
+    if rec is None:
         rec = resolve_via_musicbrainz(http, name)
         if rec.get("status") != "error":
             append_jsonl(PLAYLIST_SEED_CACHE, rec)
@@ -1104,7 +1127,7 @@ def seed_candidates(con: duckdb.DuckDBPyConnection, http, spec: dict, *,
     artists are anchors, never discovery). Excluded names never enter the pool.
     Everything then clears _serving_mbids — the same bar as every stranger.
     """
-    excl = {normalise(n) for n in spec.get("exclude", [])}
+    excl = _exclude_keys(spec.get("exclude", []))
     seeds = [r for s in spec.get("seeds", [])
              if (r := resolve_seed(con, http, s, stage2, mine, overrides))]
     if not seeds:
