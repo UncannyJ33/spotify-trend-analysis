@@ -26,7 +26,8 @@ con.execute("""
 CREATE TABLE genre_gaps AS SELECT * FROM (VALUES
   ('dubstep', 0.0005, 30.0, 81, 0.91), ('heavy metal', 0.0003, 4.9, 16, 1.27),
   ('techno', 0.0004, 8.7, 38, 1.32), ('rap rock', 0.0007, 12.3, 13, 1.01),
-  ('edm', 0.0002, 98.7, 160, 0.50)
+  ('edm', 0.0002, 98.7, 160, 0.50), ('ambient', 0.00015, 1.0, 3, 0.10),
+  ('jazz', 0.0001, 1.0, 3, 0.10), ('folk', 0.00005, 1.0, 3, 0.10)
 ) t(tag, gap_score, hours, n_artists, rel_change_per_year)""")
 
 tmp = pathlib.Path(tempfile.mkdtemp())
@@ -38,9 +39,11 @@ playlists.config.PLAYLIST_OVERRIDES_CSV = csv_path
 # --------------------------------------------------------------------------
 specs = playlists.load_playlist_specs(con)
 check("no override file -> top gaps by score",
-      [s["label"] for s in specs], ["rap rock", "dubstep", "techno", "heavy metal"])
+      [s["label"] for s in specs],
+      ["rap rock", "dubstep", "techno", "heavy metal", "edm", "ambient", "jazz"])
 check("fallback specs are single-tag", [s["tags"] for s in specs],
-      [["rap rock"], ["dubstep"], ["techno"], ["heavy metal"]])
+      [["rap rock"], ["dubstep"], ["techno"], ["heavy metal"], ["edm"],
+       ["ambient"], ["jazz"]])
 check("fallback specs are never pinned", {s["pinned"] for s in specs}, {False})
 check("fallback specs carry their gap stats",
       all(s["gap"] and s["gap"]["n_artists"] for s in specs), True)
@@ -90,7 +93,7 @@ check("empty tags fall back to the label", specs[1]["tags"], ["bare label"])
 
 # More rows than N_PLAYLISTS: capped, not silently obeyed.
 csv_path.write_text("label,tags\n" + "".join(
-    f"g{i},tag{i}\n" for i in range(9)), encoding="utf-8")
+    f"g{i},tag{i}\n" for i in range(12)), encoding="utf-8")
 specs = playlists.load_playlist_specs(con)
 check("row count capped at N_PLAYLISTS", len(specs), playlists.config.N_PLAYLISTS)
 
@@ -104,6 +107,29 @@ check("empty override file yields no playlists",
 csv_path.write_text("﻿label,tags\ndubstep,dubstep\n", encoding="utf-8")
 check("BOM does not corrupt the first label",
       [s["label"] for s in playlists.load_playlist_specs(con)], ["dubstep"])
+
+# --------------------------------------------------------------------------
+# seeds / exclude — optional columns (2026-10-04). An old two-column file must
+# parse exactly as before.
+# --------------------------------------------------------------------------
+csv_path.write_text("label,tags\nindie,indie pop\n", encoding="utf-8")
+s = playlists.load_playlist_specs(con)[0]
+check("two-column file -> seeds []", s["seeds"], [])
+check("two-column file -> exclude []", s["exclude"], [])
+
+csv_path.write_text(
+    "label,tags,seeds,exclude\n"
+    "vapor soul,neo soul|alternative r&b, Frank Ocean | Masego ,Drake|  NAV \n"
+    "lo-fi,lo-fi hip hop,Joji,\n", encoding="utf-8")
+specs = playlists.load_playlist_specs(con)
+check("seeds split and trimmed", specs[0]["seeds"], ["Frank Ocean", "Masego"])
+check("exclude split and trimmed", specs[0]["exclude"], ["Drake", "NAV"])
+check("blank exclude -> []", specs[1]["exclude"], [])
+
+csv_path.unlink()
+check("gap fallback specs carry empty seeds/exclude",
+      {(tuple(s["seeds"]), tuple(s["exclude"]))
+       for s in playlists.load_playlist_specs(con)}, {((), ())})
 
 if failures:
     print(f"{len(failures)} FAILURE(S)"); sys.exit(1)

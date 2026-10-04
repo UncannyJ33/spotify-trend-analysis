@@ -66,8 +66,12 @@ For each seed name, in order:
 
 1. `artist_tags.parquet`: a library artist already has its MBID.
 2. Stage 2's resolution cache (`enrich.load_cache`).
-3. `enrich.resolve_via_musicbrainz`, appending the answer to Stage 2's cache the way
-   `consolidate.resolve_missing` does.
+3. `enrich.resolve_via_musicbrainz`, appending the answer to Stage 8's own
+   `.cache/playlist_seed_resolution.jsonl`. This follows `consolidate.resolve_missing`, which keeps its
+   own cache: a seed is not a library artist and must never appear in `artist_tags`.
+
+An `artist_overrides.csv` row outranks all three: an MBID is used, and `IGNORE`/`NONE` skips the seed.
+A seed cell can also be `Name=MBID`, which is used as given.
 
 If the result is not an exact resolution with an MBID, Stage 8 prints a warning naming the seed and
 saying "put its MBID in the seeds column", then skips it. It never takes the top search hit, because

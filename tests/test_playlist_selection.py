@@ -9,7 +9,8 @@ con.execute("""
 CREATE TABLE genre_gaps AS SELECT * FROM (VALUES
   ('dubstep', 0.0005, 30.0, 81, 0.91), ('classical', 0.00008, 6.4, 83, 0.78),
   ('dance', 0.00003, 62.8, 231, 0.20), ('deep house', 0.00002, 8.2, 73, 0.19),
-  ('wave', 0.00001, 2.0, 5, 0.50)
+  ('wave', 0.00001, 2.0, 5, 0.50), ('ambient', 0.000009, 1.0, 3, 0.10),
+  ('jazz', 0.000008, 1.0, 3, 0.10), ('folk', 0.000007, 1.0, 3, 0.10)
 ) t(tag, gap_score, hours, n_artists, rel_change_per_year)""")
 con.execute("""
 CREATE TABLE plays AS SELECT * FROM (VALUES
@@ -67,7 +68,7 @@ def check(label, got, want):
     print(f"  {'PASS' if ok else 'FAIL'}  {label}")
 
 gaps = playlists.select_gaps(con)
-check("gaps capped at N_PLAYLISTS", len(gaps), 4)
+check("gaps capped at N_PLAYLISTS", len(gaps), playlists.config.N_PLAYLISTS)
 check("gaps ordered by score", [g["tag"] for g in gaps][:2], ["dubstep", "classical"])
 
 anchors = playlists.select_anchor_tracks(con, ["dubstep"])

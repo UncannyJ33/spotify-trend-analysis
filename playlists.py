@@ -44,8 +44,11 @@ import requests
 
 import config
 from credits import remix_credit
-from enrich import MB_MIN_INTERVAL, Throttled, normalise
-from recommend import append_jsonl, load_jsonl
+from enrich import (MB_MIN_INTERVAL, MBID_RE, Throttled, load_cache,
+                    load_genre_vocabulary, load_overrides, normalise,
+                    resolve_via_musicbrainz)
+from recommend import (CANDIDATE_TAG_CACHE, SIMILAR_CACHE, append_jsonl,
+                       fetch_candidate_tags, fetch_similar, load_jsonl)
 from report import pretty
 
 SP_API = "https://api.spotify.com/v1"
@@ -65,6 +68,11 @@ MB_RECORDING_URL = "https://musicbrainz.org/ws/2/recording"
 MB_RECORDING_LIMIT = 100    # one page is plenty; this is a filter, not a ranking
 
 GENRE_RECORDINGS_CACHE = config.CACHE_DIR / "genre_recordings.jsonl"
+# Seed-name resolutions this stage asked MusicBrainz for, the way Stage 9 keeps
+# its own (consolidate.CONSOLIDATE_CACHE): Stage 2's cache is READ first, free,
+# but never written from here — a seed is not a library artist and must not
+# appear in artist_tags. Answers only; an "error" is never written.
+PLAYLIST_SEED_CACHE = config.CACHE_DIR / "playlist_seed_resolution.jsonl"
 
 # Discovery searches with WHO IS ON each track, shared by Stages 8 and 10: every
 # hit keeps Spotify's own credit list ({name, id}, in Spotify's order) and the
@@ -162,7 +170,8 @@ def serving_sql(tags_rel: str, key: str, n_tags: int) -> str:
 
 
 def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
-                         taken: set[tuple[str, str]] | None = None) -> list[dict]:
+                         taken: set[tuple[str, str]] | None = None,
+                         exclude=()) -> list[dict]:
     """The listener's own recent favourites that serve these genres.
 
     `tags` is a list because a playlist may span several related genres — an
@@ -198,6 +207,12 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
     before the per-artist cap, so a freed slot passes to a different song
     instead of being lost.
 
+    EXCLUDE. A spec's `exclude` names artists kept out of this playlist. Both
+    the judge and the album artist are tested, so a remix judged as an
+    excluded remixer goes too. Filtering happens BEFORE the per-artist cap and
+    LIMIT, so an excluded artist's slots pass to someone else rather than
+    shrinking the playlist.
+
     Tracks rank by the listener's own recent play time — their URIs come
     straight from the export, so no search is ever needed for anchors.
     Recording-level genre matching is NOT attempted here: library tracks have
@@ -209,6 +224,8 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
         return []
     register_song_key(con)
     register_remix_credit(con)
+    register_norm_name(con)
+    excl = sorted(_exclude_keys(exclude))
     cols = ["artist_name", "judge", "track_name", "spotify_track_uri", "hours",
             "song_key"]
     rows = con.execute(
@@ -240,6 +257,8 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
             FROM judged j
             JOIN serving s ON s.artist_name = j.judge
             WHERE NOT list_contains(?::VARCHAR[][], [j.judge, j.song_key])
+              AND NOT list_contains(?::VARCHAR[], norm_name(j.judge))
+              AND NOT list_contains(?::VARCHAR[], coalesce(norm_name(j.artist_name), ''))
         ),
         one_per_song AS (
             SELECT * FROM fresh
@@ -256,7 +275,7 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
         ORDER BY hours DESC, spotify_track_uri
         LIMIT {config.ANCHOR_TRACKS}
         """,
-        [*tags, *tags, sorted([list(k) for k in taken or ()])],
+        [*tags, *tags, sorted([list(k) for k in taken or ()]), excl, excl],
     ).fetchall()
     return [dict(zip(cols, r)) for r in rows]
 
@@ -274,14 +293,30 @@ def select_run_anchors(con: duckdb.DuckDBPyConnection,
     taken: set[tuple[str, str]] = set()
     out = []
     for spec in specs:
-        anchors = select_anchor_tracks(con, spec["tags"], taken)
+        anchors = select_anchor_tracks(con, spec["tags"], taken,
+                                      spec.get("exclude", ()))
         taken |= {(a["judge"], a["song_key"]) for a in anchors}
         out.append(anchors)
     return out
 
 
+def _serving_mbids(con: duckdb.DuckDBPyConnection, mbids: list[str],
+                   tags: list[str], tag_cache: dict) -> set[str]:
+    """Which of `mbids` serve `tags`, judged by serving_sql over the candidate
+    tag cache — the one bar every stranger clears, Stage 5's and seeded alike."""
+    con.execute("CREATE OR REPLACE TEMP TABLE _candidate_tags "
+                "(mbid VARCHAR, tag VARCHAR, tag_count INTEGER)")
+    vectors = {(m, t.get("tag"), t.get("count"))
+               for m in mbids for t in (tag_cache.get(m) or {}).get("tags", [])}
+    if vectors:
+        con.executemany("INSERT INTO _candidate_tags VALUES (?, ?, ?)", list(vectors))
+    return {r[0] for r in con.execute(
+        serving_sql("_candidate_tags", "mbid", len(tags)), [*tags, *tags]
+    ).fetchall()}
+
+
 def select_candidates(con: duckdb.DuckDBPyConnection, tags: list[str],
-                      tag_cache: dict) -> list[dict]:
+                      tag_cache: dict, exclude=()) -> list[dict]:
     """Stage 5 candidates whose tag vector serves these genres.
 
     Library artists are excluded by normalised name: the discovery slots are
@@ -296,26 +331,23 @@ def select_candidates(con: duckdb.DuckDBPyConnection, tags: list[str],
     """
     if not tags:
         return []
+    excl = _exclude_keys(exclude)
     known = {normalise(r[0]) for r in con.execute(
         "SELECT DISTINCT artist_name FROM plays WHERE artist_name IS NOT NULL"
     ).fetchall()}
     rows = con.execute(
         "SELECT artist_name, mbid, score FROM recommendations ORDER BY score DESC"
     ).fetchall()
-    con.execute("CREATE OR REPLACE TEMP TABLE _candidate_tags "
-                "(mbid VARCHAR, tag VARCHAR, tag_count INTEGER)")
-    vectors = {(mbid, t.get("tag"), t.get("count"))
-               for _, mbid, _ in rows
-               for t in (tag_cache.get(mbid) or {}).get("tags", [])}
-    if vectors:
-        con.executemany("INSERT INTO _candidate_tags VALUES (?, ?, ?)",
-                        list(vectors))
-    serving = {r[0] for r in con.execute(
-        serving_sql("_candidate_tags", "mbid", len(tags)), [*tags, *tags]
-    ).fetchall()}
+    serving = _serving_mbids(con, [m for _, m, _ in rows], tags, tag_cache)
     return [{"artist_name": name, "mbid": mbid, "score": score}
             for name, mbid, score in rows
-            if normalise(name) not in known and mbid in serving]
+            if normalise(name) not in known and normalise(name) not in excl
+            and mbid in serving]
+
+
+def _pipe_list(raw: str | None) -> list[str]:
+    """A pipe-separated override cell as a list, trimmed, blanks dropped."""
+    return [t.strip() for t in (raw or "").split("|") if t.strip()]
 
 
 def load_playlist_specs(con: duckdb.DuckDBPyConnection) -> list[dict]:
@@ -332,21 +364,27 @@ def load_playlist_specs(con: duckdb.DuckDBPyConnection) -> list[dict]:
     A label that IS a gap genre keeps its trend numbers and its description;
     one that is not is marked pinned, and says so rather than claiming to be
     rising when the history says it is falling.
+
+    `seeds` names artists whose ListenBrainz neighbours feed this playlist's
+    discovery (seed_candidates); `exclude` keeps artists out of this playlist
+    only — anchors, candidates and any discovery track crediting them.
     """
     gaps = {g["tag"]: g for g in select_gaps(con, limit=None)}
     if not config.PLAYLIST_OVERRIDES_CSV.exists():
-        return [{"label": g["tag"], "tags": [g["tag"]], "pinned": False, "gap": g}
+        return [{"label": g["tag"], "tags": [g["tag"]], "seeds": [], "exclude": [],
+                 "pinned": False, "gap": g}
                 for g in select_gaps(con)]
 
     specs = []
     with config.PLAYLIST_OVERRIDES_CSV.open(encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
             label = (row.get("label") or "").strip()
-            raw = (row.get("tags") or "").strip()
             if not label or label.startswith("#"):
                 continue
-            tags = [t.strip() for t in raw.split("|") if t.strip()] or [label]
+            tags = _pipe_list(row.get("tags")) or [label]
             specs.append({"label": label, "tags": tags,
+                          "seeds": _pipe_list(row.get("seeds")),
+                          "exclude": _pipe_list(row.get("exclude")),
                           "pinned": label not in gaps, "gap": gaps.get(label)})
     if len(specs) > config.N_PLAYLISTS:
         print(f"  ! {config.PLAYLIST_OVERRIDES_CSV.name} lists {len(specs)} "
@@ -443,6 +481,12 @@ def register_song_key(con: duckdb.DuckDBPyConnection) -> None:
     keys for one idea drift apart. Stage 10 imports this one.
     """
     _register_udf(con, "song_key", _title_key)
+
+
+def register_norm_name(con: duckdb.DuckDBPyConnection) -> None:
+    """norm_name(name) in SQL — enrich.normalise itself, so an exclude row
+    matches an artist exactly as every other name comparison here does."""
+    _register_udf(con, "norm_name", normalise)
 
 
 def register_remix_credit(con: duckdb.DuckDBPyConnection) -> None:
@@ -558,6 +602,26 @@ def candidate_led(tracks: list[dict], artist: str,
                 or (rc is not None and normalise(rc) == me and pinned_id in ids)):
             out.append(t)
     return out
+
+
+def _exclude_keys(exclude) -> set[str]:
+    """Folded exclude names. A name that folds to '' (non-Latin) is dropped:
+    '' in the set would match every NULL or non-Latin artist."""
+    return {k for n in exclude if (k := normalise(n))}
+
+
+def drop_excluded(tracks: list[dict], exclude) -> list[dict]:
+    """Drop any track whose Spotify credit list names an excluded artist.
+
+    The whole credit list, not just the lead: an exclude row says "not in this
+    playlist", and a Drake feature on someone else's record is still Drake.
+    """
+    excl = _exclude_keys(exclude)
+    if not excl:
+        return list(tracks)
+    return [t for t in tracks
+            if not any(normalise(a.get("name") or "") in excl
+                       for a in t.get("artists") or [])]
 
 
 def discovery_eligible(tracks: list[dict], artist: str) -> list[dict]:
@@ -970,6 +1034,138 @@ def register_sources(con: duckdb.DuckDBPyConnection) -> None:
         con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT * FROM '{path}'")
 
 
+def resolve_seed(con: duckdb.DuckDBPyConnection, http, seed: str,
+                 stage2: dict, mine: dict,
+                 overrides: dict | None = None) -> dict | None:
+    """A seed cell -> {"artist_name", "mbid"}, or None. Never guesses.
+
+    `Name=MBID` is used as given. Otherwise, in order: artist_overrides.csv
+    (an MBID row is the answer; IGNORE/NONE is a refusal), the library
+    (artist_tags, matched through normalise), Stage 2's cache, this stage's
+    cache, then MusicBrainz. The override file comes before every cache for
+    the reason consolidate.resolve_missing gives: Stage 2's raw cache still
+    holds whatever the search matched before a NONE row was written — PLAT.
+    sat on the vaporwave ＰＬＡＴ — and the MBID is what seeds ListenBrainz. A
+    tags-only override row leaves resolution alone, as it does in Stage 2.
+    Only status "resolved" with an MBID counts — the Henrik lesson: a wrong
+    artist invents listening in genres never played, which is worse than none.
+    A library name with no MBID carries hand tags under NONE and is not
+    searched again.
+    """
+    name, _, pinned = (p.strip() for p in seed.partition("="))
+    if pinned:
+        if MBID_RE.fullmatch(pinned.lower()):
+            return {"artist_name": name, "mbid": pinned.lower()}
+        print(f"  ⚠ seed {seed!r}: {pinned!r} is not an MBID — skipped")
+        return None
+    ov = (overrides or {}).get(normalise(name))
+    if ov is not None:
+        if ov.get("mbid"):
+            return {"artist_name": name, "mbid": ov["mbid"]}
+        if ov.get("ignore") or ov.get("none"):
+            print(f"  ⚠ seed {name!r} is answered "
+                  f"{'IGNORE' if ov.get('ignore') else 'NONE'} in "
+                  f"{config.ARTIST_OVERRIDES_CSV.name} — skipped. Give it as "
+                  "Name=MBID if MusicBrainz has since gained an entry.")
+            return None
+    register_norm_name(con)
+    no_mbid = (f"  ⚠ seed {name!r} is a library artist with no MusicBrainz id "
+               "(answered NONE in artist_overrides.csv) — give it as Name=MBID")
+    exact = con.execute(
+        "SELECT max(mbid) FROM artist_tags WHERE artist_name = ? GROUP BY artist_name",
+        [name]).fetchone()
+    if exact is not None:
+        if exact[0]:
+            return {"artist_name": name, "mbid": exact[0]}
+        print(no_mbid)
+        return None
+    folded = con.execute(
+        "SELECT artist_name, max(mbid) FROM artist_tags "
+        "WHERE norm_name(artist_name) = ? GROUP BY 1 ORDER BY 1",
+        [normalise(name)]).fetchall()
+    if folded:
+        mbids = {r[1] for r in folded if r[1]}
+        if len(mbids) == 1:
+            return {"artist_name": next(r[0] for r in folded if r[1]),
+                    "mbid": next(iter(mbids))}
+        if len(mbids) > 1:
+            names = ", ".join(f"{r[0]} ({r[1]})" for r in folded if r[1])
+            print(f"  ⚠ seed {name!r} matches more than one library artist: "
+                  f"{names} — skipped. Give it as Name=MBID.")
+            return None
+        print(no_mbid)
+        return None
+    rec = next((r for r in (stage2.get(name), mine.get(name))
+                if r and r.get("status") != "error"), None)
+    if rec is None:
+        rec = resolve_via_musicbrainz(http, name)
+        if rec.get("status") != "error":
+            append_jsonl(PLAYLIST_SEED_CACHE, rec)
+            mine[name] = rec
+    if rec.get("status") == "resolved" and rec.get("mbid"):
+        return {"artist_name": name, "mbid": rec["mbid"]}
+    print(f"  ⚠ seed {name!r} did not resolve exactly on MusicBrainz "
+          f"({rec.get('status')}) — skipped. Answer it as Name=MBID.")
+    return None
+
+
+def seed_candidates(con: duckdb.DuckDBPyConnection, http, spec: dict, *,
+                    sim_cache: dict, tag_cache: dict, stage2: dict, mine: dict,
+                    vocab: set[str], known: set[str],
+                    overrides: dict | None = None) -> list[dict]:
+    """Strangers near the artists a person named for this playlist.
+
+    Stage 5 seeds on the whole taste vector, dominated by workout listening, so
+    a genre the listener WANTS but barely plays (vaporwave: ~0 h) gets no
+    supply from it. A seed is the human's statement of where the playlist
+    should go; ListenBrainz supplies who is near it.
+
+    Similarity is normalised per seed before pooling — ListenBrainz scores share
+    no scale (Skrillex tops out at 3955, REAPER at 181), the rule Stage 10's
+    discovery_candidates learned. An unheard seed is itself a candidate,
+    ranked above every neighbour; a library seed only feeds neighbours (library
+    artists are anchors, never discovery). Excluded names never enter the pool.
+    Everything then clears _serving_mbids — the same bar as every stranger.
+    """
+    excl = _exclude_keys(spec.get("exclude", []))
+    seeds = [r for s in spec.get("seeds", [])
+             if (r := resolve_seed(con, http, s, stage2, mine, overrides))]
+    if not seeds:
+        return []
+    top = float(len(seeds)) + 1.0     # above any pooled sum (each seed adds <= 1)
+    pooled: dict[str, dict] = {}
+    for seed in seeds:
+        key = normalise(seed["artist_name"])
+        if key not in known and key not in excl:
+            pooled[seed["mbid"]] = {"artist_name": seed["artist_name"],
+                                    "mbid": seed["mbid"], "score": top}
+    for seed in seeds:
+        similar = fetch_similar(http, seed["mbid"], sim_cache)
+        if not similar:
+            print(f"  ⚠ ListenBrainz has no neighbours for seed "
+                  f"{seed['artist_name']!r} — it adds nothing this run")
+            continue
+        best = max(float(x.get("score") or 0) for x in similar) or 1.0
+        for sim in similar:
+            key = normalise(sim.get("name") or "")
+            if not sim.get("mbid") or key in known or key in excl:
+                continue
+            row = pooled.setdefault(sim["mbid"], {
+                "artist_name": sim["name"], "mbid": sim["mbid"], "score": 0.0})
+            row["score"] += float(sim.get("score") or 0) / best
+    ranked = sorted(pooled.values(),
+                    key=lambda r: (-r["score"], r["mbid"]))[:config.PLAYLIST_SEED_CANDIDATES]
+    for cand in ranked:
+        fetch_candidate_tags(http, cand["mbid"], vocab, tag_cache)
+    serving = _serving_mbids(con, [c["mbid"] for c in ranked], spec["tags"], tag_cache)
+    refused = [s["artist_name"] for s in seeds
+               if s["mbid"] in pooled and s["mbid"] not in serving]
+    if refused:
+        print(f"  ⚠ seed(s) {', '.join(refused)} do not serve "
+              f"{' + '.join(spec['tags'])} by MusicBrainz's tags — not offered")
+    return [c for c in ranked if c["mbid"] in serving]
+
+
 def build_selections(con, http, sp) -> list[dict]:
     """Everything up to (but excluding) the Spotify writes; shared by both
     modes so --dry-run previews exactly what a live run would do.
@@ -993,13 +1189,30 @@ def build_selections(con, http, sp) -> list[dict]:
     (Spotify.rate_limited), only candidates the shared cache already answers
     are considered. A single 5xx or network error does not stop anything: that
     is one request failing, not the app being locked out.
+
+    Seeded candidates (seed_candidates) go first — they are the human's
+    statement — then Stage 5's, deduped on MBID.
     """
-    tag_cache = load_jsonl(config.CACHE_DIR / "candidate_tags.jsonl", "mbid")
+    tag_cache = load_jsonl(CANDIDATE_TAG_CACHE, "mbid")
     genre_rec_cache = load_jsonl(GENRE_RECORDINGS_CACHE, "key")
     credited_cache = load_jsonl(SP_TRACKS_CREDITED_CACHE, "key")
 
     out = []
     specs = load_playlist_specs(con)
+    sim_cache = load_jsonl(SIMILAR_CACHE, "seed_mbid")
+    seed_cache = load_jsonl(PLAYLIST_SEED_CACHE, "artist_name")
+    stage2 = load_cache()
+    # The genre vocabulary and artist_overrides.csv are read only when a seed
+    # needs them: the vocabulary is one cached file (fetched once), and the
+    # override file is personal data that a seedless run — and every existing
+    # test, which never points SPOTIFY_ARTIST_OVERRIDES at a scratch dir — has
+    # no business opening.
+    seeded_any = any(s.get("seeds") for s in specs)
+    vocab = load_genre_vocabulary(http) if seeded_any else set()
+    overrides = load_overrides() if seeded_any else {}
+    known = {normalise(r[0]) for r in con.execute(
+        "SELECT DISTINCT artist_name FROM plays WHERE artist_name IS NOT NULL"
+    ).fetchall()}
     for spec, anchors in zip(specs, select_run_anchors(con, specs)):
         tags = spec["tags"]
         blend = "" if tags == [spec["label"]] else f"  [{' + '.join(tags)}]"
@@ -1008,8 +1221,15 @@ def build_selections(con, http, sp) -> list[dict]:
         print(f"  {len(anchors)} anchors from your own listening")
 
         seen_uris = {a["spotify_track_uri"] for a in anchors}
-        candidates = select_candidates(con, tags, tag_cache)
-        print(f"  {len(candidates)} candidate artists carry these genres")
+        seeded = seed_candidates(con, http, spec, sim_cache=sim_cache,
+                                 tag_cache=tag_cache, stage2=stage2,
+                                 mine=seed_cache, vocab=vocab, known=known,
+                                 overrides=overrides)
+        have = {c["mbid"] for c in seeded}
+        candidates = seeded + [c for c in select_candidates(
+            con, tags, tag_cache, spec.get("exclude", ())) if c["mbid"] not in have]
+        print(f"  {len(candidates)} candidate artists carry these genres "
+              f"({len(seeded)} from your seeds)")
 
         discovery: list[dict] = []
         for cand in candidates:
@@ -1025,8 +1245,9 @@ def build_selections(con, http, sp) -> list[dict]:
                       "searches this run, cached artists only. Re-run once "
                       "the quota has recovered.")
             pinned_id, tracks = pin_artist_id(hits, name)
-            tracks = discovery_eligible(candidate_led(tracks, name, pinned_id),
-                                        name)
+            tracks = drop_excluded(
+                discovery_eligible(candidate_led(tracks, name, pinned_id), name),
+                spec.get("exclude", ()))
             if not tracks:
                 continue
             on_genre = mb_genre_recordings(http, cand["mbid"], tags, genre_rec_cache)

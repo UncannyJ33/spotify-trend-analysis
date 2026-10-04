@@ -115,11 +115,15 @@ MIN_SHARE_FOR_TREND = 0.005  # 0.5% of a month's listening
 PLAYLISTS_PARQUET = DATA_DIR / "playlists.parquet"      # archive of every run
 PLAYLIST_STATE_JSON = DATA_DIR / "playlist_state.json"  # gap tag -> playlist id
 
-N_PLAYLISTS = 4            # hard cap agreed with the user: never more than 4
+N_PLAYLISTS = 7            # cap agreed with the user: 4, raised to 7 by SJ on 2026-10-04
 PLAYLIST_SIZE = 25
 ANCHOR_TRACKS = 6          # familiar tracks from library artists serving the gap
 TRACKS_PER_ARTIST = 2      # one act must not own a playlist
 ANCHOR_WINDOW_MONTHS = 18  # anchors ranked on recent listening, like SEED_WINDOW_MONTHS
+# Seeded discovery (playlist_overrides.csv `seeds`): how many pooled ListenBrainz
+# neighbours per playlist get a MusicBrainz genre lookup (1.1 s each, cached)
+# before the share bar. Bounds a first run at ~45 s of tag lookups per playlist.
+PLAYLIST_SEED_CANDIDATES = 40
 
 # Which playlists to build, when the gap ranking is not the right answer. Same
 # split as .env and artist_overrides.csv: the real file is gitignored because it

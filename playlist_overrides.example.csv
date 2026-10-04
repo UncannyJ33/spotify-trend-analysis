@@ -10,6 +10,14 @@
 #          a NEW playlist instead of updating the existing one.
 #   tags   one or more MusicBrainz genre tags, pipe-separated. An artist
 #          qualifies by carrying ANY of them. Omit to use the label itself.
+#   seeds  optional. Artists whose ListenBrainz neighbours feed this playlist's
+#          discovery, pipe-separated — for a genre your listening history is
+#          too thin to supply. A name must resolve EXACTLY on MusicBrainz or it
+#          is skipped with a warning; answer it as Name=MBID. Neighbours clear
+#          the same genre-share bar as every other stranger.
+#   exclude optional. Artists kept out of THIS playlist entirely: never an
+#          anchor, never a candidate, and any discovery track crediting them
+#          (a feature included) is dropped. Other playlists are unaffected.
 #
 # Blending tags does two jobs. It puts genres together that only make sense
 # together, and it rescues a genre whose candidate pool is too thin to fill
@@ -27,9 +35,9 @@
 # functional listening from attentive listening. This is where a human supplies
 # what the data does not contain.
 #
-# At most N_PLAYLISTS rows are used (config.py, default 4).
-label,tags
-shoegaze,shoegaze|dream pop
+# At most N_PLAYLISTS rows are used (config.py, default 7).
+label,tags,seeds,exclude
+shoegaze,shoegaze|dream pop,Slowdive|Ride,
 ambient,ambient|drone|field recording
 bossa nova,bossa nova
 delta blues,delta blues|country blues
