@@ -162,7 +162,8 @@ def serving_sql(tags_rel: str, key: str, n_tags: int) -> str:
 
 
 def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
-                         taken: set[tuple[str, str]] | None = None) -> list[dict]:
+                         taken: set[tuple[str, str]] | None = None,
+                         exclude=()) -> list[dict]:
     """The listener's own recent favourites that serve these genres.
 
     `tags` is a list because a playlist may span several related genres — an
@@ -198,6 +199,12 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
     before the per-artist cap, so a freed slot passes to a different song
     instead of being lost.
 
+    EXCLUDE. A spec's `exclude` names artists kept out of this playlist. Both
+    the judge and the album artist are tested, so a remix judged as an
+    excluded remixer goes too. Filtering happens BEFORE the per-artist cap and
+    LIMIT, so an excluded artist's slots pass to someone else rather than
+    shrinking the playlist.
+
     Tracks rank by the listener's own recent play time — their URIs come
     straight from the export, so no search is ever needed for anchors.
     Recording-level genre matching is NOT attempted here: library tracks have
@@ -209,6 +216,8 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
         return []
     register_song_key(con)
     register_remix_credit(con)
+    register_norm_name(con)
+    excl = sorted({normalise(n) for n in exclude})
     cols = ["artist_name", "judge", "track_name", "spotify_track_uri", "hours",
             "song_key"]
     rows = con.execute(
@@ -240,6 +249,8 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
             FROM judged j
             JOIN serving s ON s.artist_name = j.judge
             WHERE NOT list_contains(?::VARCHAR[][], [j.judge, j.song_key])
+              AND NOT list_contains(?::VARCHAR[], norm_name(j.judge))
+              AND NOT list_contains(?::VARCHAR[], coalesce(norm_name(j.artist_name), ''))
         ),
         one_per_song AS (
             SELECT * FROM fresh
@@ -256,7 +267,7 @@ def select_anchor_tracks(con: duckdb.DuckDBPyConnection, tags: list[str],
         ORDER BY hours DESC, spotify_track_uri
         LIMIT {config.ANCHOR_TRACKS}
         """,
-        [*tags, *tags, sorted([list(k) for k in taken or ()])],
+        [*tags, *tags, sorted([list(k) for k in taken or ()]), excl, excl],
     ).fetchall()
     return [dict(zip(cols, r)) for r in rows]
 
@@ -274,14 +285,30 @@ def select_run_anchors(con: duckdb.DuckDBPyConnection,
     taken: set[tuple[str, str]] = set()
     out = []
     for spec in specs:
-        anchors = select_anchor_tracks(con, spec["tags"], taken)
+        anchors = select_anchor_tracks(con, spec["tags"], taken,
+                                      spec.get("exclude", ()))
         taken |= {(a["judge"], a["song_key"]) for a in anchors}
         out.append(anchors)
     return out
 
 
+def _serving_mbids(con: duckdb.DuckDBPyConnection, mbids: list[str],
+                   tags: list[str], tag_cache: dict) -> set[str]:
+    """Which of `mbids` serve `tags`, judged by serving_sql over the candidate
+    tag cache — the one bar every stranger clears, Stage 5's and seeded alike."""
+    con.execute("CREATE OR REPLACE TEMP TABLE _candidate_tags "
+                "(mbid VARCHAR, tag VARCHAR, tag_count INTEGER)")
+    vectors = {(m, t.get("tag"), t.get("count"))
+               for m in mbids for t in (tag_cache.get(m) or {}).get("tags", [])}
+    if vectors:
+        con.executemany("INSERT INTO _candidate_tags VALUES (?, ?, ?)", list(vectors))
+    return {r[0] for r in con.execute(
+        serving_sql("_candidate_tags", "mbid", len(tags)), [*tags, *tags]
+    ).fetchall()}
+
+
 def select_candidates(con: duckdb.DuckDBPyConnection, tags: list[str],
-                      tag_cache: dict) -> list[dict]:
+                      tag_cache: dict, exclude=()) -> list[dict]:
     """Stage 5 candidates whose tag vector serves these genres.
 
     Library artists are excluded by normalised name: the discovery slots are
@@ -296,26 +323,18 @@ def select_candidates(con: duckdb.DuckDBPyConnection, tags: list[str],
     """
     if not tags:
         return []
+    excl = {normalise(n) for n in exclude}
     known = {normalise(r[0]) for r in con.execute(
         "SELECT DISTINCT artist_name FROM plays WHERE artist_name IS NOT NULL"
     ).fetchall()}
     rows = con.execute(
         "SELECT artist_name, mbid, score FROM recommendations ORDER BY score DESC"
     ).fetchall()
-    con.execute("CREATE OR REPLACE TEMP TABLE _candidate_tags "
-                "(mbid VARCHAR, tag VARCHAR, tag_count INTEGER)")
-    vectors = {(mbid, t.get("tag"), t.get("count"))
-               for _, mbid, _ in rows
-               for t in (tag_cache.get(mbid) or {}).get("tags", [])}
-    if vectors:
-        con.executemany("INSERT INTO _candidate_tags VALUES (?, ?, ?)",
-                        list(vectors))
-    serving = {r[0] for r in con.execute(
-        serving_sql("_candidate_tags", "mbid", len(tags)), [*tags, *tags]
-    ).fetchall()}
+    serving = _serving_mbids(con, [m for _, m, _ in rows], tags, tag_cache)
     return [{"artist_name": name, "mbid": mbid, "score": score}
             for name, mbid, score in rows
-            if normalise(name) not in known and mbid in serving]
+            if normalise(name) not in known and normalise(name) not in excl
+            and mbid in serving]
 
 
 def _pipe_list(raw: str | None) -> list[str]:
@@ -456,6 +475,12 @@ def register_song_key(con: duckdb.DuckDBPyConnection) -> None:
     _register_udf(con, "song_key", _title_key)
 
 
+def register_norm_name(con: duckdb.DuckDBPyConnection) -> None:
+    """norm_name(name) in SQL — enrich.normalise itself, so an exclude row
+    matches an artist exactly as every other name comparison here does."""
+    _register_udf(con, "norm_name", normalise)
+
+
 def register_remix_credit(con: duckdb.DuckDBPyConnection) -> None:
     """remix_credit(title, album_artist) in SQL — credits.remix_credit itself,
     so the anchor judge parses a title exactly as Stage 1b does. The album
@@ -569,6 +594,20 @@ def candidate_led(tracks: list[dict], artist: str,
                 or (rc is not None and normalise(rc) == me and pinned_id in ids)):
             out.append(t)
     return out
+
+
+def drop_excluded(tracks: list[dict], exclude) -> list[dict]:
+    """Drop any track whose Spotify credit list names an excluded artist.
+
+    The whole credit list, not just the lead: an exclude row says "not in this
+    playlist", and a Drake feature on someone else's record is still Drake.
+    """
+    excl = {normalise(n) for n in exclude}
+    if not excl:
+        return list(tracks)
+    return [t for t in tracks
+            if not any(normalise(a.get("name") or "") in excl
+                       for a in t.get("artists") or [])]
 
 
 def discovery_eligible(tracks: list[dict], artist: str) -> list[dict]:
@@ -1019,7 +1058,8 @@ def build_selections(con, http, sp) -> list[dict]:
         print(f"  {len(anchors)} anchors from your own listening")
 
         seen_uris = {a["spotify_track_uri"] for a in anchors}
-        candidates = select_candidates(con, tags, tag_cache)
+        candidates = select_candidates(con, tags, tag_cache,
+                                      spec.get("exclude", ()))
         print(f"  {len(candidates)} candidate artists carry these genres")
 
         discovery: list[dict] = []
@@ -1036,8 +1076,9 @@ def build_selections(con, http, sp) -> list[dict]:
                       "searches this run, cached artists only. Re-run once "
                       "the quota has recovered.")
             pinned_id, tracks = pin_artist_id(hits, name)
-            tracks = discovery_eligible(candidate_led(tracks, name, pinned_id),
-                                        name)
+            tracks = drop_excluded(
+                discovery_eligible(candidate_led(tracks, name, pinned_id), name),
+                spec.get("exclude", ()))
             if not tracks:
                 continue
             on_genre = mb_genre_recordings(http, cand["mbid"], tags, genre_rec_cache)
