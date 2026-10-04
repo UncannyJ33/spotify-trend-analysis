@@ -102,7 +102,7 @@ code in either renderer.
 **Five places accept a human answer, and all are files rather than code.** `artist_overrides.csv`
 answers Stage 2's review list (name → MBID, `IGNORE` for things that were never artists, `NONE`
 for a real artist MusicBrainz lacks); `playlist_overrides.csv` answers Stage 8's "which genres
-deserve a playlist"; `consolidate_overrides.csv` answers Stage 9's review list
+deserve a playlist", and optionally per playlist its seeds (artists whose ListenBrainz neighbours feed discovery) and excludes (artists kept out of that playlist); `consolidate_overrides.csv` answers Stage 9's review list
 (`data/consolidate_review.csv` is machine output, regenerated every run — copy a row across, fill in
 `keep` or `drop`, and it stops coming back); `running_overrides.csv` carries Stage 10's pins,
 vetoes, `discover` rows (a scene act MusicBrainz never tagged, offered as new music in the one
@@ -283,6 +283,18 @@ correct.
   The bar judges against the spec as written and cannot repair an adjacent tag in it: with `electro
   house` in the garage spec, four of five garage strangers (Boys Noize, the classic false "speed
   garage") and The Chainsmokers' anchors qualify on electro or tech house alone.
+- **A Stage 8 seed is a direction, not a pass.** `playlist_overrides.csv`'s `seeds` exist because
+  Stage 5 seeds on the whole taste vector, and a genre SJ wants but barely plays (vaporwave, ~0 h)
+  gets no supply from it. `playlists.seed_candidates` pools each seed's ListenBrainz neighbours,
+  normalised per seed, and every one of them, the seed included, clears the same `serving_sql` bar
+  as any stranger. A seed name resolves only on an exact MusicBrainz match (`resolve_seed`); anything
+  else is skipped with a warning and answered as `Name=MBID`, never guessed. `artist_overrides.csv` is
+  read before any cache, as Stage 9 does: a `NONE` there refuses the seed even though Stage 2's raw
+  cache still holds the wrong auto-match. Resolutions are cached in
+  `.cache/playlist_seed_resolution.jsonl`, never in Stage 2's cache, because a seed is not a library
+  artist. `exclude` is per playlist and artist-wide: it tests the anchor's judge and album artist, the
+  candidate, and every Spotify credit on a discovery track. Drake holds most of this library's
+  `alternative r&b` hours and would otherwise anchor vapor soul.
 - **A Stage 8 anchor is judged on the remixer its title names, else the album artist.**
   `credits.remix_credit` is Stage 1b's rule in Python — one definition, which Stage 10 imports too —
   and it reads the TITLE, never `credit_type`, because credits.py types every non-first poller artist
