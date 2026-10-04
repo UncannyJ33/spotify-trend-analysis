@@ -120,6 +120,10 @@ PLAYLIST_SIZE = 25
 ANCHOR_TRACKS = 6          # familiar tracks from library artists serving the gap
 TRACKS_PER_ARTIST = 2      # one act must not own a playlist
 ANCHOR_WINDOW_MONTHS = 18  # anchors ranked on recent listening, like SEED_WINDOW_MONTHS
+# Seeded discovery (playlist_overrides.csv `seeds`): how many pooled ListenBrainz
+# neighbours per playlist get a MusicBrainz genre lookup (1.1 s each, cached)
+# before the share bar. Bounds a first run at ~45 s of tag lookups per playlist.
+PLAYLIST_SEED_CANDIDATES = 40
 
 # Which playlists to build, when the gap ranking is not the right answer. Same
 # split as .env and artist_overrides.csv: the real file is gitignored because it
