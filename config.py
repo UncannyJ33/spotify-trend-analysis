@@ -115,7 +115,7 @@ MIN_SHARE_FOR_TREND = 0.005  # 0.5% of a month's listening
 PLAYLISTS_PARQUET = DATA_DIR / "playlists.parquet"      # archive of every run
 PLAYLIST_STATE_JSON = DATA_DIR / "playlist_state.json"  # gap tag -> playlist id
 
-N_PLAYLISTS = 4            # hard cap agreed with the user: never more than 4
+N_PLAYLISTS = 7            # cap agreed with the user: 4, raised to 7 by SJ on 2026-10-04
 PLAYLIST_SIZE = 25
 ANCHOR_TRACKS = 6          # familiar tracks from library artists serving the gap
 TRACKS_PER_ARTIST = 2      # one act must not own a playlist

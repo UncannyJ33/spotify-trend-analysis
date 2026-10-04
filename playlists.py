@@ -318,6 +318,11 @@ def select_candidates(con: duckdb.DuckDBPyConnection, tags: list[str],
             if normalise(name) not in known and mbid in serving]
 
 
+def _pipe_list(raw: str | None) -> list[str]:
+    """A pipe-separated override cell as a list, trimmed, blanks dropped."""
+    return [t.strip() for t in (raw or "").split("|") if t.strip()]
+
+
 def load_playlist_specs(con: duckdb.DuckDBPyConnection) -> list[dict]:
     """What playlists to build: the override file if present, else the gaps.
 
@@ -332,21 +337,27 @@ def load_playlist_specs(con: duckdb.DuckDBPyConnection) -> list[dict]:
     A label that IS a gap genre keeps its trend numbers and its description;
     one that is not is marked pinned, and says so rather than claiming to be
     rising when the history says it is falling.
+
+    `seeds` names artists whose ListenBrainz neighbours feed this playlist's
+    discovery (seed_candidates); `exclude` keeps artists out of this playlist
+    only — anchors, candidates and any discovery track crediting them.
     """
     gaps = {g["tag"]: g for g in select_gaps(con, limit=None)}
     if not config.PLAYLIST_OVERRIDES_CSV.exists():
-        return [{"label": g["tag"], "tags": [g["tag"]], "pinned": False, "gap": g}
+        return [{"label": g["tag"], "tags": [g["tag"]], "seeds": [], "exclude": [],
+                 "pinned": False, "gap": g}
                 for g in select_gaps(con)]
 
     specs = []
     with config.PLAYLIST_OVERRIDES_CSV.open(encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
             label = (row.get("label") or "").strip()
-            raw = (row.get("tags") or "").strip()
             if not label or label.startswith("#"):
                 continue
-            tags = [t.strip() for t in raw.split("|") if t.strip()] or [label]
+            tags = _pipe_list(row.get("tags")) or [label]
             specs.append({"label": label, "tags": tags,
+                          "seeds": _pipe_list(row.get("seeds")),
+                          "exclude": _pipe_list(row.get("exclude")),
                           "pinned": label not in gaps, "gap": gaps.get(label)})
     if len(specs) > config.N_PLAYLISTS:
         print(f"  ! {config.PLAYLIST_OVERRIDES_CSV.name} lists {len(specs)} "
